@@ -1,6 +1,7 @@
 // Minimal MCP endpoint (Streamable HTTP transport, JSON responses only) served by the memory
-// service on 127.0.0.1. Each injected agent carries an HMAC token bound to its project key, so
-// the service knows which project memory to use and the token survives service restarts.
+// service on 127.0.0.1. Each injected agent carries an HMAC token bound to its project key and a
+// random nonce, so the service knows which project memory to use and which agent made each call,
+// and the token survives service restarts.
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { SERVICE_VERSION } from "./version";
@@ -16,6 +17,8 @@ export interface Caller {
   projectKey: string | null;
   agentId: string | null;
   provider: string | null;
+  // Random per agent.create; agent_links maps it to the Paseo agent id.
+  nonce: string | null;
 }
 
 export interface McpOptions {
@@ -24,6 +27,8 @@ export interface McpOptions {
   tools: ToolDefinition[];
   serverName?: string;
   serverVersion?: string;
+  // Fills in what the token cannot know at signing time, such as the agent id behind a nonce.
+  resolveCaller?: (caller: Caller) => Caller;
 }
 
 interface JsonRpcRequest {
@@ -64,6 +69,7 @@ function parseCaller(payload: string): Caller | null {
       projectKey: text(fields.projectKey),
       agentId: text(fields.agentId),
       provider: text(fields.provider),
+      nonce: text(fields.nonce),
     };
   } catch {
     return null;
@@ -184,8 +190,9 @@ function respond(message: JsonRpcRequest | JsonRpcRequest[], responses: unknown[
 export function createMcpHandler(options: McpOptions): (req: Request) => Promise<Response> {
   const methods = methodTable(options);
   return async (req) => {
-    const caller = preflight(req, options.secret);
-    if (caller instanceof Response) return caller;
+    const verified = preflight(req, options.secret);
+    if (verified instanceof Response) return verified;
+    const caller = options.resolveCaller ? options.resolveCaller(verified) : verified;
     const message = parseBody(await req.text());
     if (message instanceof Response) return message;
     const batch = Array.isArray(message) ? message : [message];

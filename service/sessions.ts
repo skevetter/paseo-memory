@@ -2,6 +2,7 @@
 
 import type { Database } from "bun:sqlite";
 import type { ProjectRef, SearchScope } from "../shared/service-api";
+import { isUsableReply } from "../shared/turns";
 import { redact } from "./redact";
 import { clip, ftsQuery, RRF_K } from "./text";
 
@@ -47,9 +48,11 @@ export interface SessionHit {
   score: number;
 }
 
-export function recordTurn(db: Database, input: TurnInput, ts: string): void {
+// Turns are stored only with a usable reply; see shared/turns.ts.
+export function recordTurn(db: Database, input: TurnInput, ts: string): boolean {
+  if (!isUsableReply(input.assistantText)) return false;
   const userText = input.userText ? clip(redact(input.userText), 1500) : null;
-  const reply = input.assistantText ? clip(redact(input.assistantText), 2500) : null;
+  const reply = clip(redact(input.assistantText), 2500);
   const existing = db.query<SessionRow, [string]>(`SELECT * FROM sessions WHERE id = ?`).get(input.agentId);
   if (!existing) {
     db.query(
@@ -70,7 +73,7 @@ export function recordTurn(db: Database, input: TurnInput, ts: string): void {
       ts,
       ts,
     );
-    return;
+    return true;
   }
   const files = new Set<string>([...(JSON.parse(existing.files) as string[]), ...input.files]);
   db.query(
@@ -86,6 +89,28 @@ export function recordTurn(db: Database, input: TurnInput, ts: string): void {
     input.project?.key ?? null,
     input.agentId,
   );
+  return true;
+}
+
+// Recent sessions for a project, or FTS matches when there is a query.
+export function listSessions(
+  db: Database,
+  input: { projectKey: string | null; query: string; limit: number },
+): SessionRow[] {
+  const fts = ftsQuery(input.query);
+  if (!fts) {
+    return db
+      .query<SessionRow, [string, number]>(
+        `SELECT * FROM sessions WHERE ifnull(project_key, '') = ? ORDER BY updated_at DESC LIMIT ?`,
+      )
+      .all(input.projectKey ?? "", input.limit);
+  }
+  return db
+    .query<SessionRow, [string, string, number]>(
+      `SELECT s.* FROM sessions_fts f JOIN sessions s ON s.rowid = f.rowid
+       WHERE sessions_fts MATCH ? AND ifnull(s.project_key, '') = ? ORDER BY bm25(sessions_fts) LIMIT ?`,
+    )
+    .all(fts, input.projectKey ?? "", input.limit);
 }
 
 export function searchSessions(

@@ -77,6 +77,20 @@ export class VectorIndex {
       .all(blob(vector), k, partition)
       .map((r) => ({ id: Number(r.memory_id), similarity: 1 - r.distance }));
   }
+
+  // The stored vector for a memory, when it matches the memory's current content.
+  vector(id: number, hash: string): Float32Array | null {
+    const current = this.db
+      .query(`SELECT 1 FROM memory_embeddings WHERE memory_id = ? AND model = ? AND content_hash = ?`)
+      .get(id, this.spec.model, hash);
+    if (!current) return null;
+    const row = this.db
+      .query<{ embedding: Uint8Array }, [bigint]>(`SELECT embedding FROM ${this.table} WHERE memory_id = ?`)
+      .get(BigInt(id));
+    if (!row) return null;
+    const bytes = row.embedding;
+    return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
 }
 
 // Removes a memory's vectors from every model's table, not only the active one.

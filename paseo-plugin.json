@@ -1,6 +1,6 @@
 {
   "id": "paseo-memory",
-  "description": "Native memory for Paseo agents: global and project scopes in one SQLite file, sqlite-vec search with local embeddings, injected context and MCP tools.",
+  "description": "Shared memory for Paseo agents, stored locally.",
   "requirements": {
     "paseo": ">=0.11.0-beta.5"
   },

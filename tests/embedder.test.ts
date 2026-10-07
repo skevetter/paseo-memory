@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Embedder, loadEmbedder, TIERS, WordPieceTokenizer } from "../service/embedder";
+import { loadReranker, RERANK_MODEL } from "../service/reranker";
 import { MemoryStore } from "../service/store";
 import { EMBEDDING_TIERS, type EmbeddingTier } from "../shared/service-api";
 import { CALIBRATION } from "./fixtures/calibration";
@@ -82,7 +83,7 @@ for (const tier of EMBEDDING_TIERS) {
       expect(excluded).toBeGreaterThanOrEqual(CALIBRATION.retrieval.length / 2);
     }, 300_000);
 
-    it("finds semantic matches with no keyword overlap and flags near duplicates in the store", async () => {
+    it("finds semantic matches with no keyword overlap and returns near duplicates in the store", async () => {
       const store = new MemoryStore({ path: ":memory:" });
       try {
         store.setEmbedder(await embedderFor(tier));
@@ -100,7 +101,10 @@ for (const tier of EMBEDDING_TIERS) {
           title: "Picked Postgres for the warehouse",
           content: "Why: joins and JSONB support",
         };
-        expect((await store.save(restated)).status).toBe("possible_duplicate");
+        expect(await store.save(restated)).toMatchObject({
+          status: "near_duplicate",
+          id: expect.any(Number),
+        });
         expect((await store.save({ ...restated, force: true })).status).toBe("created");
       } finally {
         store.close();
@@ -116,5 +120,21 @@ describe.skipIf(!available("zero"))("model2vec tokenizer", () => {
     const tokenizer = new WordPieceTokenizer(JSON.parse(readFileSync(join(dir, "tokenizer.json"), "utf8")));
     expect(tokenizer.encode("Hello, world!")).toHaveLength(4);
     expect(tokenizer.encode("unaffable").length).toBeGreaterThan(1);
+  }, 300_000);
+});
+
+const rerankerAvailable =
+  process.env.PASEO_MEMORY_DOWNLOAD_MODELS === "1" ||
+  existsSync(join(modelsDir, RERANK_MODEL, "onnx", "model_quantized.onnx"));
+
+describe.skipIf(!rerankerAvailable)(`re-ranker (${RERANK_MODEL})`, () => {
+  it("scores the relevant memory above the unrelated one for every calibration query", async () => {
+    const reranker = await loadReranker(modelsDir);
+    for (const [query, relevant, unrelated] of CALIBRATION.retrieval) {
+      const [rel = 0, irr = 0] = await reranker.score(query, [relevant, unrelated]);
+      expect(rel).toBeGreaterThan(irr);
+      expect(rel).toBeLessThanOrEqual(1);
+      expect(irr).toBeGreaterThanOrEqual(0);
+    }
   }, 300_000);
 });

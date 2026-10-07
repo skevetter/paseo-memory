@@ -21,7 +21,7 @@ export default function contribute(client: PluginClientContext) {
     client.addAttachmentSource(memoryAttachments),
     client.addSlashCommand({
       name: "remember",
-      description: "Save a note to this project's memory (prefix with 'global:' for global memory)",
+      description: "Saves a note to this project's memory, or to global memory with the global: prefix.",
       argumentHint: "[global:] note text",
       context: "workspace",
       async onSubmit({ args, workspace, rpc, openPanel }) {

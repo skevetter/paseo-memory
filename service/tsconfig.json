@@ -13,5 +13,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["./**/*.ts", "../shared/**/*.ts", "../server/**/*.ts", "../tests/**/*.ts"]
+  "include": ["./**/*.ts", "../shared/**/*.ts", "../server/**/*.ts", "../tests/**/*.ts", "../bench/**/*.ts"]
 }

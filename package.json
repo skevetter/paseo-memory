@@ -1,7 +1,7 @@
 {
   "name": "paseo-memory",
-  "version": "1.0.0",
-  "description": "Lightweight native memory for Paseo agents: one SQLite file, global and project scopes, hybrid search.",
+  "version": "1.1.0",
+  "description": "Shared memory for Paseo agents, stored locally.",
   "license": "MIT",
   "repository": "github:skevetter/paseo-memory",
   "files": [
@@ -17,6 +17,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p service/tsconfig.json",
     "test": "bun test",
+    "bench": "bun bench/retrieval.ts",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write ."

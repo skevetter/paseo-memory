@@ -3,11 +3,13 @@ import { join } from "node:path";
 import { buildContext, buildSystemPrompt } from "../service/context";
 import type { Embedder } from "../service/embedder";
 import { redact } from "../service/redact";
+import { rerankEnabled } from "../service/reranker";
 import { migrate } from "../service/schema";
 import { openDatabase } from "../service/sqlite";
-import { MemoryStore } from "../service/store";
+import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
+import { EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
 import { dataRepo, hashEmbedder, hashSpec, otherRepo, tempDir } from "./helpers";
 
 let store: MemoryStore;
@@ -151,12 +153,22 @@ describe("dedupe and versions", () => {
     expect(await store.search({ query: "redis", project: null })).toHaveLength(0);
   });
 
-  it("reports possible_duplicate from the vector index unless forced or keyed by topic", async () => {
+  it("returns the existing memory for a near duplicate of the same type and scope", async () => {
     store.setEmbedder(switchEmbedder("test/switch", () => true));
     const base = { type: "decision", scope: "project" as const, project: dataRepo };
     const first = await store.save({ ...base, title: "Picked Postgres", content: "joins" });
     const near = await store.save({ ...base, title: "Chose Postgres", content: "JSONB" });
     expect(near).toEqual({
+      status: "near_duplicate",
+      id: first.id as number,
+      title: "Picked Postgres",
+      similarity: 1,
+    });
+    expect(store.stats().memories).toBe(1);
+    // Another type in the same partition is listed for the agent to decide instead.
+    expect(
+      await store.save({ ...base, type: "gotcha", title: "Postgres gotcha", content: "vacuum" }),
+    ).toEqual({
       status: "possible_duplicate",
       id: null,
       candidates: [{ id: first.id as number, title: "Picked Postgres", similarity: 1 }],
@@ -171,6 +183,14 @@ describe("dedupe and versions", () => {
     expect(
       (await store.save({ ...base, project: otherRepo, title: "Picked Postgres", content: "joins" })).status,
     ).toBe("created");
+  });
+
+  it("rejects content over the hard cap on save and update", async () => {
+    const long = "x".repeat(MAX_CONTENT_CHARS + 1);
+    const base = { title: "t", type: "note", scope: "global" as const, project: null };
+    await expect(store.save({ ...base, content: long })).rejects.toThrow(ContentTooLongError);
+    const ok = await store.save({ ...base, content: "x".repeat(MAX_CONTENT_CHARS) });
+    expect(() => store.update(ok.id as number, { content: long })).toThrow(/limit is 4000/);
   });
 });
 
@@ -310,6 +330,33 @@ describe("migration", () => {
       upgraded.close();
     }
   });
+
+  it("upgrades a v2 database: adds usage and merge columns and the audit tables", () => {
+    const path = join(tempDir(), "memory.db");
+    const { db } = openDatabase(path);
+    // A 1.0 database: today's schema minus everything v3 added.
+    migrate(db);
+    db.run(`INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
+        VALUES ('global', 'note', 'From 1.0', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+      ALTER TABLE memories DROP COLUMN use_count;
+      ALTER TABLE memories DROP COLUMN last_used_at;
+      ALTER TABLE memories DROP COLUMN merged_into;
+      DROP TABLE agent_links;
+      DROP TABLE audit_events;
+      PRAGMA user_version = 2;`);
+    db.close();
+    const upgraded = new MemoryStore({ path });
+    try {
+      const [row] = upgraded.get([1]);
+      expect(row).toMatchObject({ title: "From 1.0", use_count: 0, last_used_at: null, merged_into: null });
+      upgraded.markUsed([1]);
+      expect(upgraded.get([1])[0]?.use_count).toBe(1);
+      upgraded.audit.open({ nonce: "n", projectKey: null, provider: "omp" });
+      expect(upgraded.audit.agentFor("n")).toBeNull();
+    } finally {
+      upgraded.close();
+    }
+  });
 });
 
 describe("redaction", () => {
@@ -353,12 +400,13 @@ describe("sessions and context", () => {
       files: ["tests/ingest_test.py"],
     });
     const ctx = buildContext({ store, project: dataRepo, budgetChars: 4000 });
-    expect(ctx).toContain("Pinned convention");
-    expect(ctx).toContain("timezone assumption");
+    expect(ctx.text).toContain("Pinned convention");
+    expect(ctx.text).toContain("timezone assumption");
+    expect(ctx.sessionIds).toEqual(["agent-1"]);
     expect(
-      buildContext({ store, project: dataRepo, budgetChars: 4000, excludeAgentId: "agent-1" }),
+      buildContext({ store, project: dataRepo, budgetChars: 4000, excludeAgentId: "agent-1" }).text,
     ).not.toContain("timezone");
-    const prompt = buildSystemPrompt({ context: ctx, project: dataRepo, hasTools: true });
+    const prompt = buildSystemPrompt({ context: ctx.text, project: dataRepo, hasTools: true });
     expect(prompt.startsWith("<paseo-memory>")).toBe(true);
     expect(prompt).toContain("memory_search");
     const hits = await store.search({ query: "timezone", project: dataRepo, includeSessions: true });
@@ -375,10 +423,64 @@ describe("sessions and context", () => {
         project: dataRepo,
       });
     }
-    expect(buildContext({ store, project: dataRepo, budgetChars: 600 }).length).toBeLessThanOrEqual(600);
+    const ctx = buildContext({ store, project: dataRepo, budgetChars: 600 });
+    expect(ctx.text.length).toBeLessThanOrEqual(600);
+    expect(ctx.memoryIds.length).toBeGreaterThan(0);
+    // Every listed id is in the block, and no line is cut short.
+    for (const id of ctx.memoryIds) expect(ctx.text).toContain(`#${id} [note] Memory number`);
+    for (const line of ctx.text.split("\n").filter((l) => l.startsWith("- "))) {
+      expect(line).toMatch(/about things \(just now\): x+$/);
+    }
+  });
+});
+
+describe("context ranking and session capture", () => {
+  it("orders the block pinned first, then the project's most used memories", async () => {
+    const base = { type: "note", scope: "project" as const, project: dataRepo, content: "body" };
+    const rarely = await store.save({ ...base, title: "Rarely used" });
+    const often = await store.save({ ...base, title: "Often used" });
+    await store.save({ ...base, title: "Pinned one", pinned: true });
+    for (let i = 0; i < 5; i++) store.markUsed([often.id as number]);
+    const text = buildContext({ store, project: dataRepo, budgetChars: 4000 }).text;
+    const at = (title: string) => text.indexOf(title);
+    expect(at("Pinned one")).toBeLessThan(at("Often used"));
+    expect(at("Often used")).toBeLessThan(at("Rarely used"));
+    expect(store.get([rarely.id as number])[0]?.use_count).toBe(0);
   });
 
-  it("prunes session digests past the retention window", () => {
+  it("keeps whole words when clipping long memory text", async () => {
+    const content = `${"alpha beta gamma ".repeat(40)}omega`;
+    await store.save({
+      title: "Long pinned",
+      content,
+      type: "note",
+      scope: "global",
+      project: null,
+      pinned: true,
+    });
+    const line = buildContext({ store, project: null, budgetChars: 4000 }).text.split("\n")[1] ?? "";
+    expect(line).toMatch(/^- #\d+ \[note\] Long pinned: alpha beta gamma .*(alpha|beta|gamma)…$/);
+  });
+
+  it("does not record failed turns", () => {
+    const turn = {
+      agentId: "agent-f",
+      project: dataRepo,
+      provider: "omp",
+      title: null,
+      workspaceDir: null,
+      userText: "do the thing",
+      files: [],
+    };
+    expect(store.recordTurn({ ...turn, assistantText: "[System Error] provider exited" })).toBe(false);
+    expect(store.recordTurn({ ...turn, assistantText: "   " })).toBe(false);
+    expect(store.recordTurn({ ...turn, assistantText: null })).toBe(false);
+    expect(store.recentSessions(dataRepo.key, 10)).toEqual([]);
+    expect(store.recordTurn({ ...turn, assistantText: "Done: added the flag" })).toBe(true);
+    expect(store.recentSessions(dataRepo.key, 10).map((s) => s.last_reply)).toEqual(["Done: added the flag"]);
+  });
+
+  it("prunes session digests and audit events past the retention window", () => {
     let now = new Date("2026-01-01T00:00:00Z");
     const timed = new MemoryStore({ path: ":memory:", now: () => now });
     const turn = {
@@ -391,11 +493,193 @@ describe("sessions and context", () => {
       files: [],
     };
     timed.recordTurn({ ...turn, agentId: "old" });
+    timed.audit.open({ nonce: "n-old", projectKey: null, provider: "omp" });
+    timed.audit.record("n-old", { kind: "get", ids: [1], found: [] });
     now = new Date("2026-03-01T00:00:00Z");
     timed.recordTurn({ ...turn, agentId: "new" });
-    expect(timed.pruneSessions(30)).toBe(1);
+    timed.audit.open({ nonce: "n-new", projectKey: null, provider: "omp" });
+    timed.audit.record("n-new", { kind: "get", ids: [1], found: [] });
+    timed.audit.link({ nonce: "n-old", agentId: "a-old", workspaceId: "w", title: null });
+    timed.audit.link({ nonce: "n-new", agentId: "a-new", workspaceId: "w", title: null });
+    expect(timed.pruneHistory(30)).toEqual({ sessions: 1, audit: 1 });
     expect(timed.recentSessions(dataRepo.key, 10).map((s) => s.id)).toEqual(["new"]);
+    expect(timed.audit.workspaceAgents("w", 10).map((a) => a.agentId)).toEqual(["a-new"]);
     timed.close();
+  });
+});
+
+describe("usage", () => {
+  it("counts agent searches in the top five and fetches, but not UI browsing", async () => {
+    const base = { type: "note", scope: "global" as const, project: null, force: true };
+    const ids: number[] = [];
+    for (let i = 0; i < 7; i++) {
+      ids.push(
+        (await store.save({ ...base, title: `Kafka note ${i}`, content: `kafka ${"retention ".repeat(i)}` }))
+          .id as number,
+      );
+    }
+    await store.search({ query: "kafka", project: null, limit: 10 });
+    expect(store.get(ids).every((r) => r.use_count === 0)).toBe(true);
+    const hits = await store.search({ query: "kafka", project: null, limit: 10, track: true });
+    const used = store
+      .get(ids)
+      .filter((r) => r.use_count === 1)
+      .map((r) => String(r.id));
+    expect(used.sort()).toEqual(
+      hits
+        .slice(0, 5)
+        .map((h) => h.id)
+        .sort(),
+    );
+    store.markUsed([ids[6] as number, ids[6] as number]);
+    expect(store.get([ids[6] as number])[0]).toMatchObject({
+      use_count: 1,
+      last_used_at: expect.any(String),
+    });
+  });
+
+  it("ranks a used memory above an equal unused one", async () => {
+    const base = {
+      type: "note",
+      scope: "global" as const,
+      project: null,
+      content: "grafana dashboards live here",
+    };
+    await store.save({ ...base, title: "Grafana A" });
+    const b = await store.save({ ...base, title: "Grafana B" });
+    for (let i = 0; i < 8; i++) store.markUsed([b.id as number]);
+    expect((await store.search({ query: "grafana dashboards", project: null }))[0]?.id).toBe(String(b.id));
+  });
+
+  it("lists unpinned memories nobody used or edited for 60 days as stale", async () => {
+    let now = new Date("2026-01-01T00:00:00Z");
+    const timed = new MemoryStore({ path: ":memory:", now: () => now });
+    const base = { type: "note", scope: "global" as const, project: null, content: "c" };
+    const old = await timed.save({ ...base, title: "Old" });
+    const usedLater = await timed.save({ ...base, title: "Used later" });
+    await timed.save({ ...base, title: "Pinned old", pinned: true });
+    now = new Date("2026-02-20T00:00:00Z");
+    timed.markUsed([usedLater.id as number]);
+    now = new Date("2026-03-15T00:00:00Z");
+    expect(timed.list({ project: null, stale: true }).map((h) => h.id)).toEqual([String(old.id)]);
+    timed.close();
+  });
+});
+
+describe("re-ranking", () => {
+  const notes = ["Deploy checklist", "Deploy rollback steps", "Deploy freeze dates"];
+  const seed = async () => {
+    for (const title of notes) {
+      await store.save({
+        title,
+        content: "deploy",
+        type: "note",
+        scope: "global",
+        project: null,
+        force: true,
+      });
+    }
+  };
+
+  it("reorders fused candidates by the re-ranker score", async () => {
+    await seed();
+    const fused = titles(await store.search({ query: "deploy", project: null }));
+    const seen: string[][] = [];
+    store.setReranker({
+      model: "test/reranker",
+      async score(_query, docs) {
+        seen.push(docs);
+        return docs.map((d) =>
+          d.startsWith("Deploy freeze") ? 0.9 : d.startsWith("Deploy rollback") ? 0.5 : 0.1,
+        );
+      },
+    });
+    const reranked = titles(await store.search({ query: "deploy", project: null, limit: 2 }));
+    expect(reranked).toEqual(["Deploy freeze dates", "Deploy rollback steps"]);
+    // All three candidates were scored even though only two were returned.
+    expect(seen[0]).toHaveLength(3);
+    store.setReranker(null);
+    expect(titles(await store.search({ query: "deploy", project: null }))).toEqual(fused);
+  });
+
+  it("keeps the fused order when the re-ranker fails", async () => {
+    await seed();
+    const fused = titles(await store.search({ query: "deploy", project: null }));
+    store.setReranker({
+      model: "test/broken",
+      score: async () => {
+        throw new Error("onnx session failed");
+      },
+    });
+    expect(titles(await store.search({ query: "deploy", project: null }))).toEqual(fused);
+  });
+
+  it("is on by default only for the medium and high tiers", () => {
+    expect(EMBEDDING_TIERS.map((tier) => rerankEnabled("auto", tier))).toEqual([false, false, true, true]);
+    expect(rerankEnabled("on", "zero")).toBe(true);
+    expect(rerankEnabled("off", "high")).toBe(false);
+  });
+});
+
+describe("curation", () => {
+  const base = { type: "decision", scope: "project" as const, project: dataRepo };
+
+  it("restores an older version and keeps the replaced text as a version", async () => {
+    const a = await store.save({ ...base, title: "Queue", content: "v1 SQS", topicKey: "queue" });
+    await store.save({ ...base, title: "Queue", content: "v2 Kafka", topicKey: "queue" });
+    const id = a.id as number;
+    expect(store.detail(id).versions.map((v) => v.content)).toEqual(["v1 SQS"]);
+    expect(store.restore(id, 1)).toBe(true);
+    const detail = store.detail(id);
+    expect(detail.memory?.content).toBe("v1 SQS");
+    expect(detail.versions.map((v) => v.content)).toEqual(["v2 Kafka", "v1 SQS"]);
+    expect(store.restore(id, 42)).toBe(false);
+  });
+
+  it("merges a duplicate into its target with a pointer and lists duplicates in detail", async () => {
+    store.setEmbedder(switchEmbedder("test/merge", () => true));
+    const target = (await store.save({ ...base, title: "Picked Postgres", content: "joins" })).id as number;
+    const source = (await store.save({ ...base, title: "Chose Postgres", content: "JSONB", force: true }))
+      .id as number;
+    expect(store.detail(source).duplicates).toEqual([
+      { id: target, title: "Picked Postgres", similarity: 1 },
+    ]);
+    expect(store.merge(source, source).ok).toBe(false);
+    expect(store.merge(source, target)).toEqual({ ok: true, message: `Merged #${source} into #${target}.` });
+    expect(store.detail(source)).toMatchObject({ memory: null, mergedInto: target });
+    expect(store.detail(target).memory?.content).toBe("joins");
+    expect(await store.search({ query: "zzz", project: dataRepo })).toHaveLength(1);
+  });
+
+  it("moves a memory between scopes", async () => {
+    const id = (await store.save({ ...base, title: "Use uv", content: "uv sync" })).id as number;
+    expect(() => store.update(id, { scope: "project", project: null })).not.toThrow();
+    expect(store.update(id, { scope: "global" })).toBe(true);
+    expect(store.list({ project: null, scope: "global" }).map((h) => h.id)).toEqual([String(id)]);
+    expect(() => store.update(id, { scope: "project" })).toThrow(/needs a project/);
+    expect(store.update(id, { scope: "project", project: otherRepo })).toBe(true);
+    expect(store.list({ project: otherRepo, scope: "project" }).map((h) => h.id)).toEqual([String(id)]);
+  });
+});
+
+describe("audit log", () => {
+  it("binds events to the agent only after the nonce is linked", () => {
+    store.audit.open({ nonce: "n1", projectKey: dataRepo.key, provider: "omp" });
+    store.audit.record("n1", {
+      kind: "search",
+      query: "token=supersecretvalue123 deploys",
+      scope: "all",
+      results: [],
+    });
+    store.audit.record(null, { kind: "delete", id: 1, ok: false });
+    expect(store.audit.agent("agent-1")).toMatchObject({ linked: false, events: [] });
+    expect(store.audit.agentFor("n1")).toBeNull();
+    store.audit.link({ nonce: "n1", agentId: "agent-1", workspaceId: "ws", title: null });
+    expect(store.audit.agentFor("n1")).toBe("agent-1");
+    const audit = store.audit.agent("agent-1");
+    expect(audit.events).toHaveLength(1);
+    expect(audit.events[0]).toMatchObject({ kind: "search", summary: "no results" });
+    expect(audit.events[0]?.query).not.toContain("supersecretvalue123");
   });
 });
 

@@ -33,7 +33,7 @@ export class LocateError extends Error {}
 // Setting first, then PATH, then the Homebrew and bun.sh install locations.
 export function findBun(setting: string, sys: LocateEnv = realLocateEnv): string {
   if (setting) {
-    if (!sys.exists(setting)) throw new LocateError(`bunPath ${setting} does not exist`);
+    if (!sys.exists(setting)) throw new LocateError(`bun override ${setting} does not exist.`);
     return setting;
   }
   const fromPath = (sys.env.PATH ?? "")
@@ -42,11 +42,7 @@ export function findBun(setting: string, sys: LocateEnv = realLocateEnv): string
     .map((dir) => join(dir, "bun"));
   const candidates = [...fromPath, "/opt/homebrew/bin/bun", join(sys.home, ".bun", "bin", "bun")];
   const found = candidates.find((path) => sys.exists(path));
-  if (!found) {
-    throw new LocateError(
-      "bun not found on PATH, /opt/homebrew/bin/bun or ~/.bun/bin/bun. Install bun (brew install oven-sh/bun/bun) or set bunPath.",
-    );
-  }
+  if (!found) throw new LocateError("bun not found. Install with `brew install bun`.");
   return found;
 }
 
@@ -68,7 +64,7 @@ export function resolveServicePath(
   const best = matches.find((p) => p.id === PLUGIN_ID) ?? matches[0];
   if (!best) {
     throw new LocateError(
-      `no paseo-memory plugin directory with ${SERVICE_ENTRY} found in ${join(paseoHome, "config.json")}; set servicePath`,
+      `paseo-memory is not listed in ${join(paseoHome, "config.json")}. Set the service directory override.`,
     );
   }
   return {
@@ -80,11 +76,11 @@ export function resolveServicePath(
 
 function locationFromSetting(setting: string, sys: LocateEnv): ServiceLocation {
   if (setting.endsWith(".ts") || setting.endsWith(".js")) {
-    if (!sys.exists(setting)) throw new LocateError(`servicePath ${setting} does not exist`);
+    if (!sys.exists(setting)) throw new LocateError(`Service override ${setting} does not exist.`);
     return { entry: setting, root: join(setting, "..", ".."), source: "servicePath setting" };
   }
   const entry = join(setting, SERVICE_ENTRY);
-  if (!sys.exists(entry)) throw new LocateError(`servicePath ${setting} has no ${SERVICE_ENTRY}`);
+  if (!sys.exists(entry)) throw new LocateError(`Service override ${setting} has no ${SERVICE_ENTRY}.`);
   return { entry, root: setting, source: "servicePath setting" };
 }
 

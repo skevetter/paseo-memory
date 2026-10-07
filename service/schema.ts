@@ -1,9 +1,10 @@
 // Schema and migrations for memory.db. v1 (paseo-memory 0.1) stored vectors as BLOBs keyed by
 // memory alone; v2 keeps vectors only in vec0 tables, one per model, tracked in vec_tables.
+// v3 (1.1) adds usage counters, merge pointers, agent links and audit events.
 
 import type { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
@@ -11,9 +12,43 @@ export function migrate(db: Database): void {
   db.transaction(() => {
     if (current === 1) dropV1Vectors(db);
     db.run(SCHEMA_SQL);
+    addV3Columns(db);
+    db.run(V3_SQL);
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
+
+// CREATE TABLE IF NOT EXISTS keeps older memories tables as they were, so columns are added here.
+function addV3Columns(db: Database): void {
+  const columns = new Set(
+    db
+      .query<{ name: string }, []>(`PRAGMA table_info(memories)`)
+      .all()
+      .map((c) => c.name),
+  );
+  const added: [string, string][] = [
+    ["use_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["last_used_at", "TEXT"],
+    ["merged_into", "INTEGER"],
+  ];
+  for (const [name, type] of added) {
+    if (!columns.has(name)) db.run(`ALTER TABLE memories ADD COLUMN ${name} ${type}`);
+  }
+}
+
+// agent_links maps the nonce in an agent's memory token to its Paseo agent id. audit_events keeps
+// ids and scores only, never memory content.
+const V3_SQL = `
+  CREATE TABLE IF NOT EXISTS agent_links (
+    nonce TEXT PRIMARY KEY, agent_id TEXT, workspace_id TEXT, project_key TEXT, provider TEXT, title TEXT,
+    created_at TEXT NOT NULL, linked_at TEXT);
+  CREATE INDEX IF NOT EXISTS ix_agent_links_agent ON agent_links(agent_id);
+  CREATE INDEX IF NOT EXISTS ix_agent_links_workspace ON agent_links(workspace_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY, nonce TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+  CREATE INDEX IF NOT EXISTS ix_audit_nonce ON audit_events(nonce, id);
+  CREATE INDEX IF NOT EXISTS ix_audit_created ON audit_events(created_at);
+`;
 
 // The background indexer re-embeds every memory after this.
 function dropV1Vectors(db: Database): void {

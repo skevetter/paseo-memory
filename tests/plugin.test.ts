@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { digestLatestTurn } from "../server/capture";
+import { AgentLinks } from "../server/links";
 import { findBun, type LocateEnv, LocateError, resolveServicePath } from "../server/locate";
 import { contributeServer } from "../server/plugin";
 import { type ServiceConfig, ServiceSupervisor, serviceArgs, serviceEnv } from "../server/supervisor";
 import { memorySettings } from "../shared/contracts";
+import { parseLine, silentLogger } from "../shared/log";
+import { isUsableReply } from "../shared/turns";
 import { tempDir } from "./helpers";
 
 const repoRoot = join(import.meta.dir, "..");
@@ -44,6 +47,50 @@ describe("turn digest", () => {
     ] as never);
     expect(d).toEqual({ userText: "new question", assistantText: "final answer", files: ["a.ts"] });
   });
+
+  it("treats failed, empty and error-banner replies as unusable", () => {
+    expect(isUsableReply("Fixed in a.ts")).toBe(true);
+    expect(isUsableReply(null)).toBe(false);
+    expect(isUsableReply("  \n")).toBe(false);
+    expect(isUsableReply("[System Error] provider exited with code 1")).toBe(false);
+    expect(isUsableReply("[error] rate limited")).toBe(false);
+  });
+});
+
+describe("agent links", () => {
+  it("claims a nonce exactly and never re-links a claimed agent by match", () => {
+    const links = new AgentLinks(() => 0);
+    links.add("n1", "/w", "omp");
+    links.add("n2", "/w", "omp");
+    links.claim("n1", "agent-a");
+    expect(links.match("agent-a", "/w", "omp")).toBeNull();
+    expect(links.match("agent-b", "/w", "omp")).toBe("n2");
+    expect(links.match("agent-c", "/w", "omp")).toBeNull();
+  });
+
+  it("matches the oldest nonce with the same cwd and provider inside the window", () => {
+    let now = 0;
+    const links = new AgentLinks(() => now);
+    links.add("old", "/w", "omp");
+    now = 60_000;
+    links.add("other-cwd", "/x", "omp");
+    links.add("other-provider", "/w", "claude");
+    links.add("new", "/w", "omp");
+    expect(links.match("a1", "/w", "omp")).toBe("old");
+    now = 200_000;
+    // "new" is now older than the two-minute window.
+    expect(links.match("a2", "/w", "omp")).toBeNull();
+  });
+});
+
+describe("log lines", () => {
+  it("keeps the service's level and strips its tag", () => {
+    expect(parseLine("warn [paseo-memory-service] embeddings unavailable", "info")).toEqual({
+      level: "warn",
+      message: "embeddings unavailable",
+    });
+    expect(parseLine("Bun panicked", "warn")).toEqual({ level: "warn", message: "Bun panicked" });
+  });
 });
 
 describe("locating bun", () => {
@@ -66,7 +113,7 @@ describe("locating bun", () => {
   });
 
   it("fails with an actionable message when bun is missing", () => {
-    expect(() => findBun("", fakeFs({}))).toThrow(/bun not found.*set bunPath/);
+    expect(() => findBun("", fakeFs({}))).toThrow("bun not found. Install with `brew install bun`.");
     expect(() => findBun("/nope/bun", fakeFs({}))).toThrow(LocateError);
   });
 });
@@ -119,7 +166,7 @@ describe("locating the service", () => {
 
   it("reports a missing install clearly", () => {
     expect(() => resolveServicePath("", "/h", fakeFs({ "/h/config.json": config({}) }))).toThrow(
-      /set servicePath/,
+      /Set the service directory override/,
     );
     expect(() => resolveServicePath("", "/h", fakeFs({}))).toThrow(/cannot read \/h\/config.json/);
   });
@@ -137,6 +184,7 @@ describe("service launch", () => {
       servicePath: "",
       sqlitePath: "/s.dylib",
       tier: "low",
+      rerank: "off",
       port: 7000,
       contextBudgetChars: 900,
       sessionRetentionDays: 7,
@@ -149,6 +197,8 @@ describe("service launch", () => {
       "7000",
       "--tier",
       "low",
+      "--rerank",
+      "off",
       "--context-budget",
       "900",
       "--retention-days",
@@ -160,8 +210,8 @@ describe("service launch", () => {
     ]);
   });
 
-  it("migrates v1 settings to v2", async () => {
-    const migrated = await memorySettings.migrate?.(
+  it("migrates v1 and v2 settings to v3", async () => {
+    const fromV1 = await memorySettings.migrate?.(
       {
         injectContext: false,
         embeddings: "off",
@@ -171,12 +221,19 @@ describe("service launch", () => {
       },
       1,
     );
-    expect(memorySettings.schema.parse(migrated)).toMatchObject({
+    expect(memorySettings.schema.parse(fromV1)).toMatchObject({
       injectContext: false,
       mcpPort: 7001,
       embeddingTier: "medium",
+      rerank: "auto",
     });
-    expect(migrated).not.toHaveProperty("embeddings");
+    expect(fromV1).not.toHaveProperty("embeddings");
+    const fromV2 = await memorySettings.migrate?.({ embeddingTier: "low", bunPath: "/b" }, 2);
+    expect(memorySettings.schema.parse(fromV2)).toMatchObject({
+      embeddingTier: "low",
+      bunPath: "/b",
+      rerank: "auto",
+    });
   });
 });
 
@@ -194,12 +251,13 @@ describe("supervisor", () => {
     const models = process.env.PASEO_MEMORY_TEST_MODELS ?? join(tmpdir(), "paseo-memory-test-models");
     mkdirSync(models, { recursive: true });
     symlinkSync(models, join(dataDir, "models"));
-    supervisor = new ServiceSupervisor({ dataDir, paseoHome: dataDir, log: () => undefined });
+    supervisor = new ServiceSupervisor({ dataDir, paseoHome: dataDir, log: silentLogger });
     const config: ServiceConfig = {
       bunPath: process.execPath,
       servicePath: repoRoot,
       sqlitePath: "",
       tier: "zero",
+      rerank: "off",
       port: 40000 + Math.floor(Math.random() * 20000),
       contextBudgetChars: 6000,
       sessionRetentionDays: 30,
@@ -234,14 +292,15 @@ describe("supervisor", () => {
   it("reports a fatal state when the service refuses to start", async () => {
     const { supervisor: s } = start({ sqlitePath: "/nonexistent/libsqlite3.dylib" });
     await waitFor(() => s.snapshot().state === "fatal");
-    expect(s.snapshot().detail).toContain("sqlitePath /nonexistent/libsqlite3.dylib does not exist");
+    expect(s.snapshot().detail).toContain("SQLite override /nonexistent/libsqlite3.dylib does not exist");
     await expect(s.call("status", {}, 500)).rejects.toThrow(/memory service is fatal/);
   }, 30_000);
 
   it("reports a fatal state when bun is missing", async () => {
     const { supervisor: s } = start({ bunPath: "/nonexistent/bun" });
     await waitFor(() => s.snapshot().state === "fatal");
-    expect(s.snapshot().detail).toContain("bunPath /nonexistent/bun does not exist");
+    expect(s.snapshot().detail).toContain("bun override /nonexistent/bun does not exist");
+    expect(s.paths().bun).toEqual({ value: null, source: "override" });
   });
 });
 

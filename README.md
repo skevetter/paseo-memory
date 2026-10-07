@@ -1,13 +1,15 @@
 # paseo-memory
 
-Local memory for Paseo agents. One SQLite file holds global and project memory. Search combines FTS5 keywords with sqlite-vec vectors from a local embedding model. A small Bun service does the storage and embedding work, and the Paseo plugin supervises it.
+Shared memory for Paseo agents, stored locally. One SQLite file holds global and project memory. Search combines FTS5 keywords with sqlite-vec vectors from a local embedding model, and an optional local cross-encoder re-ranks the best matches. A small Bun service does the storage and model work, and the Paseo plugin supervises it.
 
 ## What it does
 
-- **Recall at agent start.** `before("agent.create")` appends a `<paseo-memory>` block to the agent's system prompt. The block holds pinned global memories, pinned project memories, recent agent sessions for the project, and a one-line index of recent memories. The default budget is 6,000 characters.
+- **Recall at agent start.** `before("agent.create")` appends a `<paseo-memory>` block to the agent's system prompt. The block lists pinned memories first, then the project's most used and recently touched memories, then recent agent sessions, then global memory. Titles are never cut and text ends at a word boundary. The default budget is 6,000 characters.
 - **Memory tools for every agent.** The service hosts an MCP server on `127.0.0.1:6797`, and the plugin injects it into each new agent as the `memory` server. Tools: `memory_search`, `memory_get`, `memory_save`, `memory_update`, `memory_delete`, `memory_context`.
-- **Session digests.** `on("agent.turn_ended")` records the latest user prompt, the final assistant reply and the edited file paths for each agent. Tool output and reasoning are not stored. New agents in the same project see recent sessions in their context.
-- **App UI.** A Memory workspace panel (search, pin, delete, add), a `/remember` slash command, a Memory attachment source for the composer, and a settings screen with service status.
+- **Session digests.** `on("agent.turn_ended")` records the latest user prompt, the final assistant reply and the edited file paths for each agent. Failed turns (an error outcome, an empty reply, or a `[System Error]` banner) are skipped. Tool output and reasoning are not stored.
+- **Audit per agent.** Each agent's injected memories and sessions, and every memory tool call with its results (ids, scores, statuses), are recorded under the agent's Paseo id. Content is not copied into the audit log.
+- **Usage signals.** A memory counts as used when it is injected, appears in the top 5 of an agent's search, or is fetched with `memory_get`. Use count and last use give a small ranking boost and drive the stale list.
+- **App UI.** A Memory workspace panel with three tabs: Memories (search, stale list, add), This agent (what the agent was given and every tool call), and Sessions. Clicking a memory opens its detail view: full content, metadata, usage, version history with restore, edit in place, delete, and "Merge into #n" for close duplicates. Also a `/remember` slash command, a Memory attachment source for the composer, and a settings screen with service status.
 
 ## Requirements
 
@@ -22,7 +24,8 @@ Local memory for Paseo agents. One SQLite file holds global and project memory. 
 - **Memory service.** `service/main.ts` runs under Bun as a child process of the plugin. It owns the SQLite database, sqlite-vec, the embedding model, the MCP endpoint and a small internal HTTP API. Both endpoints listen on one loopback port.
 - **Supervision.** The plugin finds `bun` (setting `bunPath`, then `PATH`, `/opt/homebrew/bin/bun`, `~/.bun/bin/bun`), starts the service with `ELECTRON_RUN_AS_NODE` removed from the environment, restarts it with backoff when it exits, and stops it on plugin cleanup. The service exits when the plugin closes its stdin or its parent process disappears.
 - **Service path.** The plugin bundle cannot see its own directory. The plugin reads `$PASEO_HOME/config.json`, finds the plugin entry whose directory has a `paseo-plugin.json` with id `paseo-memory`, and runs `<that directory>/service/main.ts`. The `servicePath` setting overrides this.
-- **Failure handling.** Every hook and RPC calls the service with a short timeout. `before("agent.create")` has a 1.8 second budget and returns the request unchanged on any failure. A missing bun, a missing SQLite build or a sqlite-vec load failure puts the service in the `fatal` state; the settings screen shows the cause, and the plugin retries every 60 seconds.
+- **Failure handling.** Every hook and RPC calls the service with a short timeout. `before("agent.create")` has a 1.8 second budget and returns the request unchanged on any failure. A missing bun, a missing SQLite build, a sqlite-vec load failure or a port held by another program puts the service in the `fatal` state; the settings screen shows the cause, and the plugin retries every 60 seconds.
+- **Logs.** Info lines go to stdout, warnings and errors to stderr, each prefixed with `info`, `warn` or `error`. `paseo plugin logs paseo-memory` shows startup lines on the stdout stream.
 
 ## Scopes
 
@@ -34,17 +37,20 @@ Local memory for Paseo agents. One SQLite file holds global and project memory. 
 
 `$PASEO_HOME/plugin-data/paseo-memory/memory.db` (WAL). Override the directory with `PASEO_MEMORY_DIR`.
 
-Tables: `memories`, `memory_versions`, `memory_embeddings`, `vec_tables`, `projects`, `project_aliases`, `sessions`, FTS5 indexes `memories_fts` and `sessions_fts`, and one sqlite-vec `vec0` table per embedding model (for example `vec_alibaba_nlp_gte_modernbert_base_768`). Each `vec0` table partitions vectors by `scope_key` (`global` or `project:<hash>`) and uses cosine distance.
+Tables: `memories`, `memory_versions`, `memory_embeddings`, `vec_tables`, `projects`, `project_aliases`, `sessions`, `agent_links`, `audit_events`, FTS5 indexes `memories_fts` and `sessions_fts`, and one sqlite-vec `vec0` table per embedding model (for example `vec_alibaba_nlp_gte_modernbert_base_768`). Each `vec0` table partitions vectors by `scope_key` (`global` or `project:<hash>`) and uses cosine distance.
 
 sqlite-vec is required. The service refuses to start when it cannot load the extension.
 
 Write path:
-1. Strip `<private>...</private>` and redact common secret formats (AWS keys, GitHub and GitLab tokens, Slack tokens, JWTs, bearer tokens, `password=` style pairs).
-2. A `topic_key` match in the same scope updates the existing memory and keeps the old text in `memory_versions`.
-3. An exact content match increments `duplicate_count`.
-4. A near duplicate by cosine similarity in the same scope partition returns `possible_duplicate` with candidates. The agent updates one of them or retries with `force`. The threshold depends on the embedding tier.
+1. Content over 4,000 characters is rejected with a tool error. Agents are asked to stay under about 800.
+2. Strip `<private>...</private>` and redact common secret formats (AWS keys, GitHub and GitLab tokens, Slack tokens, JWTs, bearer tokens, `password=` style pairs).
+3. A `topic_key` match in the same scope updates the existing memory and keeps the old text in `memory_versions`.
+4. An exact content match increments `duplicate_count`.
+5. A near duplicate by cosine similarity in the same scope partition with the same type returns `near_duplicate` with the existing id, and nothing is saved; the agent calls `memory_update` instead. Close matches of another type return `possible_duplicate` with candidates. `force` saves anyway. The threshold depends on the embedding tier.
 
-Search: FTS5 BM25 (title weighted 5, topic key 3, content 1) fused with vec0 KNN by reciprocal rank fusion (k = 60), then boosted for pinned, recent and project-scoped memories. Vector hits enter fusion only above the tier's search floor.
+Search: FTS5 BM25 (title weighted 5, topic key 3, content 1) fused with vec0 KNN by reciprocal rank fusion (k = 60), then boosted for pinned, recent, used and project-scoped memories. Vector hits enter fusion only above the tier's search floor. With re-ranking on, the top 30 fused candidates are rescored by the cross-encoder (each keeps its boost) and the top k return. A re-ranker that fails to load or score leaves the fused order.
+
+Merging a duplicate keeps the target unchanged and soft-deletes the source with a `merged_into` pointer; `memory_get` on the old id names the target.
 
 ## Embeddings
 
@@ -59,7 +65,7 @@ The `embeddingTier` setting picks the model. All tiers run locally in the servic
 
 The `low` and `high` tiers prefix queries with `Represent this sentence for searching relevant passages: `. Stored memories get no prefix.
 
-Measured under Bun on an Apple Silicon Mac with 15 questions against 16 project notes:
+Measured under Bun on an Apple Silicon Mac in 1.0 with 15 questions against 16 project notes:
 
 | Tier | Top-1 | MRR | Per embed | RSS |
 | --- | --- | --- | --- | --- |
@@ -71,6 +77,25 @@ Measured under Bun on an Apple Silicon Mac with 15 questions against 16 project 
 Each embedding row records its model, dimensions and content hash. Changing the tier restarts the service, creates the new model's `vec0` table, and re-embeds memories that lack a current vector for that model in the background, 16 at a time. Vectors for other models stay, so switching back costs nothing.
 
 Duplicate thresholds and search floors are per tier and live in the `TIERS` table in `service/embedder.ts`, the only place a model is defined. `tests/embedder.test.ts` calibrates them against `tests/fixtures/calibration.ts`.
+
+## Re-ranking
+
+The `rerank` setting controls `Alibaba-NLP/gte-reranker-modernbert-base` (q8, 150 MB, transformers.js `AutoModelForSequenceClassification`). `auto` turns it on for the medium and high tiers and off for zero and low, so the zero tier never loads the ONNX runtime. `on` and `off` override that.
+
+`npm run bench` runs the store's full search path on `BENCHMARK` in `tests/fixtures/calibration.ts`: 39 queries (13 paraphrases, 13 with no shared content words, 13 near misses next to keyword-heavy distractors) over 50 memories. Results from an Apple Silicon Mac, top 10 per search:
+
+| Tier | Top-1 | MRR | Top-1 (paraphrase / no overlap / near miss) | ms per search | Added by re-rank |
+| --- | --- | --- | --- | --- | --- |
+| zero | 21/39 | 0.675 | 7 / 4 / 10 | 0.2 | |
+| zero + re-rank | 35/39 | 0.923 | 12 / 10 / 13 | 61.8 | +61.5 ms |
+| low | 29/39 | 0.825 | 10 / 6 / 13 | 3.4 | |
+| low + re-rank | 36/39 | 0.923 | 12 / 11 / 13 | 38.8 | +35.4 ms |
+| medium | 32/39 | 0.887 | 12 / 7 / 13 | 5.2 | |
+| medium + re-rank | 37/39 | 0.974 | 12 / 12 / 13 | 40.2 | +35.0 ms |
+| high | 34/39 | 0.911 | 12 / 9 / 13 | 12.1 | |
+| high + re-rank | 35/39 | 0.936 | 13 / 9 / 13 | 41.8 | +29.8 ms |
+
+Re-ranking improves every tier, mostly on queries that share no words with the answer. It costs 30 to 60 ms per search and about 150 MB of memory.
 
 ## Provider support
 
@@ -105,25 +130,27 @@ npm test            # bun test
 
 `npm run lint:fix` applies safe fixes and `npm run format` formats the tree.
 
-The embedding tests load models from `PASEO_MEMORY_TEST_MODELS` (default: a directory in the system temp dir). The `zero` tier downloads its model there when missing; set `PASEO_MEMORY_SKIP_MODEL=1` to skip it. The `low`, `medium` and `high` tiers are skipped when their model files are absent from that directory; set `PASEO_MEMORY_DOWNLOAD_MODELS=1` to download them instead. The directory uses the transformers.js cache layout (`<org>/<model>/onnx/model_quantized.onnx`).
+The embedding tests load models from `PASEO_MEMORY_TEST_MODELS` (default: a directory in the system temp dir). The `zero` tier downloads its model there when missing; set `PASEO_MEMORY_SKIP_MODEL=1` to skip it. The `low`, `medium` and `high` tiers and the re-ranker are skipped when their model files are absent from that directory; set `PASEO_MEMORY_DOWNLOAD_MODELS=1` to download them instead. The directory uses the transformers.js cache layout (`<org>/<model>/onnx/model_quantized.onnx`). `npm run bench` reads the same directory.
 
 Run the service by hand:
 
 ```bash
-bun service/main.ts --data-dir /tmp/pm --port 6797 --tier zero
+bun service/main.ts --data-dir /tmp/pm --port 6797 --tier zero --rerank off
 ```
 
 To test against a real daemon without touching the main one, run a scratch daemon with its own home and port:
 
 ```bash
 H=$TMPDIR/pm-daemon/.paseo; mkdir -p $H
-echo '{"version":1,"pluginsEnabled":true,"daemon":{"listen":"127.0.0.1:6899","relay":{"enabled":false},"mcp":{"injectIntoAgents":false}}}' > $H/config.json
+echo '{"version":1,"pluginsEnabled":true,"daemon":{"listen":"127.0.0.1:6899","relay":{"enabled":false},"mcp":{"injectIntoAgents":false}},"agents":{"providers":{"omp":{"enabled":true}}}}' > $H/config.json
 paseo daemon run --home $H &
 paseo plugin install . --home $H
 paseo plugin logs paseo-memory --home $H
 paseo run --home $H --provider omp "save a project memory ..."
 paseo daemon stop --home $H
 ```
+
+The scratch daemon's memory service needs its own port while another daemon's service holds 6797. Write `mcpPort` through the `settings.memory.write` plugin RPC (for example from a small `DaemonClient` script); until then the scratch service reports that the port is in use and stays stopped.
 
 ## Settings
 
@@ -133,16 +160,19 @@ paseo daemon stop --home $H
 | injectMcp | true | Inject the `memory` MCP server |
 | autoCapture | true | Record per-agent session digests |
 | embeddingTier | medium | `zero`, `low`, `medium` or `high` (see Embeddings) |
+| rerank | auto | `auto`, `on` or `off` (see Re-ranking) |
 | mcpPort | 6797 | Loopback port for the service (MCP and internal API) |
 | contextBudgetChars | 6000 | Size cap for the injected block |
-| sessionRetentionDays | 30 | Session digests older than this are pruned |
+| sessionRetentionDays | 30 | Session digests and audit events older than this are pruned |
 | mcpDenyProviders | ["pi"] | Providers that do not get the MCP server |
 | bunPath | (auto) | Path to `bun` |
 | sqlitePath | (auto) | macOS SQLite library with extension loading |
 | servicePath | (auto) | Plugin directory or `service/main.ts` |
 
-Settings from v0.1 migrate automatically. `embeddings`, `duplicateThreshold` and `sqliteVecPath` are gone: thresholds are per tier and sqlite-vec always loads from its npm package.
+The settings screen keeps the three paths in a collapsed Advanced section that shows the path in use and whether it was detected or overridden.
 
-## Not in 1.0
+Settings migrate automatically: v1 keys (`embeddings`, `duplicateThreshold`, `sqliteVecPath`) are dropped, and v2 settings gain `rerank` with its default.
 
-LLM-based extraction or consolidation, reranking, graph memory, cross-host sync, export, a per-agent private scope, and remote embedding backends. See `docs/DESIGN.md`.
+## Not in 1.1
+
+LLM-based extraction or consolidation, graph memory, cross-host sync, export, a per-agent private scope, and remote embedding backends. See `docs/DESIGN.md`.

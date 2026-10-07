@@ -22,15 +22,12 @@ export function resolveSqliteLibrary(
 ): string | null {
   if (platform !== "darwin") return null;
   if (setting) {
-    if (!exists(setting)) throw new FatalError(`sqlitePath ${setting} does not exist`);
+    if (!exists(setting)) throw new FatalError(`SQLite override ${setting} does not exist.`);
     return setting;
   }
   const found = MAC_SQLITE_CANDIDATES.find((path) => exists(path));
   if (!found) {
-    throw new FatalError(
-      `no extension-capable SQLite found (tried ${MAC_SQLITE_CANDIDATES.join(", ")}). ` +
-        "Run `brew install sqlite` or set sqlitePath.",
-    );
+    throw new FatalError("SQLite with extension support not found. Install with `brew install sqlite`.");
   }
   return found;
 }

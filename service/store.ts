@@ -1,12 +1,28 @@
 // Single-file SQLite memory store: memories (global and project scope), versions, session
-// digests, FTS5 keyword search, sqlite-vec KNN per embedding model, and reciprocal rank fusion.
+// digests, FTS5 keyword search, sqlite-vec KNN per embedding model, reciprocal rank fusion, an
+// optional cross-encoder re-ranker, usage counters and the per-agent audit log.
 
 import type { Database } from "bun:sqlite";
-import type { ProjectRef, SearchScope } from "../shared/service-api";
+import { type Logger, silentLogger } from "../shared/log";
+import {
+  MAX_CONTENT_CHARS,
+  type MemoryDetail,
+  type ProjectRef,
+  type SearchScope,
+} from "../shared/service-api";
+import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { redact } from "./redact";
+import { RERANK_CANDIDATES, type Reranker } from "./reranker";
 import { migrate } from "./schema";
-import { recordTurn, type SessionHit, type SessionRow, searchSessions, type TurnInput } from "./sessions";
+import {
+  listSessions,
+  recordTurn,
+  type SessionHit,
+  type SessionRow,
+  searchSessions,
+  type TurnInput,
+} from "./sessions";
 import { errorText, openDatabase } from "./sqlite";
 import { clip, ftsQuery, RRF_K, sha256 } from "./text";
 import { dropVectors, type Neighbor, scopeKey, VectorIndex, type VectorTarget, vecTables } from "./vectors";
@@ -14,6 +30,20 @@ import { dropVectors, type Neighbor, scopeKey, VectorIndex, type VectorTarget, v
 export type { ProjectRef, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
 export type Scope = "global" | "project";
+
+// Memories nobody used or edited for this long show up in the stale list.
+export const STALE_DAYS = 60;
+// Search results this high up count as a use when an agent searches.
+const USED_TOP_N = 5;
+
+export class ContentTooLongError extends Error {
+  constructor(length: number) {
+    super(
+      `Content is ${length} characters and the limit is ${MAX_CONTENT_CHARS}. Save one durable fact in ` +
+        "under 800 characters, or split it into separate memories.",
+    );
+  }
+}
 
 export interface MemoryRow {
   id: number;
@@ -35,6 +65,10 @@ export interface MemoryRow {
   created_at: string;
   updated_at: string;
   last_seen_at: string | null;
+  use_count: number;
+  last_used_at: string | null;
+  merged_into: number | null;
+  deleted_at: string | null;
 }
 
 export type MemoryWithProject = MemoryRow & { project_name: string | null };
@@ -56,6 +90,8 @@ export interface SaveInput {
 
 export type SaveResult =
   | { status: "created" | "updated" | "duplicate"; id: number }
+  // Same type and scope as an existing memory and close enough to restate it; nothing was saved.
+  | { status: "near_duplicate"; id: number; title: string; similarity: number }
   | {
       status: "possible_duplicate";
       id: null;
@@ -73,6 +109,8 @@ export interface MemoryHit {
   preview: string;
   pinned: boolean;
   updatedAt: string;
+  useCount: number;
+  lastUsedAt: string | null;
   score: number;
 }
 
@@ -85,6 +123,8 @@ export interface SearchInput {
   type?: string;
   limit?: number;
   includeSessions?: boolean;
+  // Agent searches count their top results as uses; UI browsing does not.
+  track?: boolean;
 }
 
 export interface MemoryPatch {
@@ -93,13 +133,23 @@ export interface MemoryPatch {
   type?: string;
   pinned?: boolean;
   topicKey?: string | null;
+  // Moving to project scope needs the project.
+  scope?: Scope;
+  project?: ProjectRef | null;
+}
+
+// A ranked hit plus the text the re-ranker reads and the boost it keeps after re-ranking.
+interface Candidate {
+  hit: SearchHit;
+  text: string;
+  weight: number;
 }
 
 export interface StoreOptions {
   path: string;
   sqlitePath?: string | null;
   now?: () => Date;
-  log?: (message: string) => void;
+  log?: Logger;
 }
 
 // A save after redaction, with its resolved scope, content hash and (optional) vector.
@@ -129,11 +179,13 @@ export class MemoryStore {
   readonly sqliteLibrary: string | null;
   readonly sqliteVersion: string;
   readonly sqliteVecVersion: string;
+  readonly audit: AuditLog;
   private readonly db: Database;
   private readonly now: () => Date;
-  private readonly log: (message: string) => void;
+  private readonly log: Logger;
   private embedder: Embedder | null = null;
   private vectors: VectorIndex | null = null;
+  private reranker: Reranker | null = null;
   private indexing: Promise<void> | null = null;
   private indexAgain = false;
   private closed = false;
@@ -141,13 +193,14 @@ export class MemoryStore {
   constructor(options: StoreOptions) {
     this.path = options.path;
     this.now = options.now ?? (() => new Date());
-    this.log = options.log ?? (() => undefined);
+    this.log = options.log ?? silentLogger;
     const opened = openDatabase(options.path, options.sqlitePath ?? null);
     this.db = opened.db;
     this.sqliteLibrary = opened.sqliteLibrary;
     this.sqliteVersion = opened.sqliteVersion;
     this.sqliteVecVersion = opened.sqliteVecVersion;
     migrate(this.db);
+    this.audit = new AuditLog(this.db, () => this.ts());
   }
 
   close(): void {
@@ -168,6 +221,11 @@ export class MemoryStore {
     this.setMeta("embedding_model", embedder.spec.model);
     this.setMeta("embedding_dims", String(embedder.spec.dims));
     this.scheduleIndex();
+  }
+
+  // Null keeps the fused order.
+  setReranker(reranker: Reranker | null): void {
+    this.reranker = reranker;
   }
 
   // ---------- projects ----------
@@ -212,6 +270,7 @@ export class MemoryStore {
   // ---------- memories ----------
 
   async save(input: SaveInput): Promise<SaveResult> {
+    if (input.content.length > MAX_CONTENT_CHARS) throw new ContentTooLongError(input.content.length);
     const title = redact(input.title).trim().slice(0, 200);
     const content = redact(input.content).trim();
     if (!title || !content) throw new Error("title and content are required");
@@ -233,31 +292,52 @@ export class MemoryStore {
 
   get(ids: number[]): MemoryWithProject[] {
     if (ids.length === 0) return [];
-    const rows = this.db
+    return this.db
       .prepare<MemoryWithProject, number[]>(
         `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
          WHERE m.id IN (${ids.map(() => "?").join(",")}) AND m.deleted_at IS NULL`,
       )
       .all(...ids);
-    const ts = this.ts();
-    const touch = this.db.query(`UPDATE memories SET last_seen_at = ? WHERE id = ?`);
-    for (const row of rows) touch.run(ts, row.id);
-    return rows;
   }
 
-  // Text changes drop the memory's vectors; the background indexer embeds the new text.
+  // Injected into an agent, in an agent's top search results, or fetched by an agent.
+  markUsed(ids: number[]): void {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return;
+    this.db
+      .prepare(
+        `UPDATE memories SET use_count = use_count + 1, last_used_at = ?
+         WHERE deleted_at IS NULL AND id IN (${unique.map(() => "?").join(",")})`,
+      )
+      .run(this.ts(), ...unique);
+  }
+
+  // The memory a deleted id was merged into, if any.
+  mergedInto(id: number): number | null {
+    return (
+      this.db
+        .query<{ merged_into: number | null }, [number]>(`SELECT merged_into FROM memories WHERE id = ?`)
+        .get(id)?.merged_into ?? null
+    );
+  }
+
+  // Text and scope changes drop the memory's vectors; the background indexer embeds it again.
   update(id: number, patch: MemoryPatch): boolean {
+    if (patch.content !== undefined && patch.content.length > MAX_CONTENT_CHARS) {
+      throw new ContentTooLongError(patch.content.length);
+    }
     const existing = this.db
       .query<MemoryRow, [number]>(`SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL`)
       .get(id);
     if (!existing) return false;
-    const textChanged = patch.title !== undefined || patch.content !== undefined;
-    if (textChanged) this.snapshot(existing);
     const next = patched(existing, patch);
+    const textChanged = next.title !== existing.title || next.content !== existing.content;
+    if (textChanged) this.snapshot(existing);
+    if (next.project) this.upsertProject(next.project);
     this.db
       .query(
         `UPDATE memories SET title = ?, content = ?, type = ?, pinned = ?, topic_key = ?, content_hash = ?,
-         revision_count = revision_count + ?, updated_at = ? WHERE id = ?`,
+         scope = ?, project_key = ?, revision_count = revision_count + ?, updated_at = ? WHERE id = ?`,
       )
       .run(
         next.title,
@@ -266,11 +346,13 @@ export class MemoryStore {
         next.pinned,
         next.topicKey,
         next.hash,
+        next.scope,
+        next.projectKey,
         textChanged ? 1 : 0,
         this.ts(),
         id,
       );
-    if (next.hash !== existing.content_hash) {
+    if (next.hash !== existing.content_hash || next.projectKey !== existing.project_key) {
       dropVectors(this.db, id);
       this.scheduleIndex();
     }
@@ -287,25 +369,70 @@ export class MemoryStore {
     return changed > 0;
   }
 
+  // Restores an older version's title and content; the current text becomes a version too.
+  restore(id: number, version: number): boolean {
+    const old = this.db
+      .query<{ title: string; content: string }, [number, number]>(
+        `SELECT title, content FROM memory_versions WHERE memory_id = ? AND version = ?`,
+      )
+      .get(id, version);
+    return old ? this.update(id, { title: old.title, content: old.content }) : false;
+  }
+
+  // Keeps the target unchanged and soft-deletes the source with a pointer to the target.
+  merge(sourceId: number, targetId: number): { ok: boolean; message: string } {
+    if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
+    const live = this.get([sourceId, targetId]);
+    if (live.length < 2) return { ok: false, message: "Both memories must exist." };
+    this.db
+      .query(`UPDATE memories SET deleted_at = ?, merged_into = ? WHERE id = ?`)
+      .run(this.ts(), targetId, sourceId);
+    dropVectors(this.db, sourceId);
+    return { ok: true, message: `Merged #${sourceId} into #${targetId}.` };
+  }
+
+  detail(id: number): MemoryDetail {
+    const row = this.get([id])[0];
+    const versions = this.db
+      .query<{ version: number; title: string; content: string; created_at: string }, [number]>(
+        `SELECT version, title, content, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version DESC`,
+      )
+      .all(id)
+      .map((v) => ({ version: v.version, title: v.title, content: v.content, createdAt: v.created_at }));
+    return {
+      memory: row ? memoryDetail(row) : null,
+      mergedInto: row ? null : this.mergedInto(id),
+      versions,
+      duplicates: row ? this.similarTo(row) : [],
+    };
+  }
+
   list(input: {
     project: ProjectRef | null;
     scope?: SearchScope;
     limit?: number;
     pinnedOnly?: boolean;
+    // Unpinned memories not used or edited for STALE_DAYS, least recently touched first.
+    stale?: boolean;
   }): MemoryHit[] {
     const filter = scopeFilter(input.scope ?? "all", input.project);
-    const pinned = input.pinnedOnly ? " AND m.pinned = 1" : "";
+    const touched = "max(m.updated_at, ifnull(m.last_used_at, ''))";
+    const cutoff = new Date(this.now().getTime() - STALE_DAYS * 86_400_000).toISOString();
+    const where = [filter.where];
+    if (input.pinnedOnly) where.push("m.pinned = 1");
+    if (input.stale) where.push(`m.pinned = 0 AND ${touched} < ?`);
+    const order = input.stale ? `${touched} ASC` : "m.pinned DESC, m.updated_at DESC";
     return this.db
       .query<MemoryWithProject, (string | number)[]>(
         `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
-         WHERE ${filter.where}${pinned} ORDER BY m.pinned DESC, m.updated_at DESC LIMIT ?`,
+         WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ?`,
       )
-      .all(...filter.params, input.limit ?? 50)
+      .all(...filter.params, ...(input.stale ? [cutoff] : []), input.limit ?? 50)
       .map((row) => memoryHit(row, 0));
   }
 
-  // FTS5 BM25 and vector KNN fused by reciprocal rank, then boosted for pinned, recent and
-  // project-scoped memories.
+  // FTS5 BM25 and vector KNN fused by reciprocal rank, boosted for pinned, recent, used and
+  // project-scoped memories, then re-ranked by the cross-encoder when one is active.
   async search(input: SearchInput): Promise<SearchHit[]> {
     const scope = input.scope ?? "all";
     const limit = input.limit ?? 8;
@@ -320,18 +447,29 @@ export class MemoryStore {
     if (query.length < 3 || ranks.size === 0) addRanks(ranks, this.likeIds(query, filter));
     if (queryVector) addRanks(ranks, this.vectorIds(queryVector, { ...input, scope }));
 
-    const hits: SearchHit[] = this.boostedHits(ranks);
+    const candidates = this.boostedHits(ranks);
     if (input.includeSessions) {
-      hits.push(...searchSessions(this.db, { query, project: input.project, scope, limit }));
+      const sessions = searchSessions(this.db, { query, project: input.project, scope, limit });
+      candidates.push(...sessions.map((hit) => ({ hit, text: `${hit.title}\n${hit.preview}`, weight: 0.9 })));
     }
-    return hits.sort((a, b) => b.score - a.score).slice(0, limit);
+    const hits = await this.rerank(query, candidates, limit);
+    if (input.track && !this.closed) {
+      this.markUsed(hits.slice(0, USED_TOP_N).flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
+    }
+    return hits;
   }
 
   // ---------- sessions ----------
 
-  recordTurn(input: TurnInput): void {
+  // Failed turns (no assistant reply) are not recorded. Returns whether the turn was stored.
+  recordTurn(input: TurnInput): boolean {
     if (input.project) this.upsertProject(input.project);
-    recordTurn(this.db, input, this.ts());
+    this.audit.retitle(input.agentId, input.title);
+    return recordTurn(this.db, input, this.ts());
+  }
+
+  sessions(input: { projectKey: string | null; query: string; limit: number }): SessionRow[] {
+    return listSessions(this.db, input);
   }
 
   endSession(agentId: string): void {
@@ -348,10 +486,14 @@ export class MemoryStore {
       .all(projectKey ?? "", excludeAgentId ?? "", limit);
   }
 
-  pruneSessions(retentionDays: number): number {
+  // Session digests and audit events share one retention window.
+  pruneHistory(retentionDays: number): { sessions: number; audit: number } {
     const cutoff = new Date(this.now().getTime() - retentionDays * 86_400_000).toISOString();
     // bun:sqlite `changes` includes rows the FTS triggers touch, so count the deleted ids instead.
-    return this.db.query(`DELETE FROM sessions WHERE updated_at < ? RETURNING id`).all(cutoff).length;
+    const sessions = this.db
+      .query(`DELETE FROM sessions WHERE updated_at < ? RETURNING id`)
+      .all(cutoff).length;
+    return { sessions, audit: this.audit.prune(cutoff) };
   }
 
   // ---------- status ----------
@@ -454,21 +596,52 @@ export class MemoryStore {
     return { status: "duplicate", id: same.id };
   }
 
+  // A close match with the same type restates an existing memory: return it instead of saving.
+  // Close matches of another type are listed for the agent to decide.
   private nearDuplicates(draft: SaveDraft): SaveResult | null {
     if (!draft.vector || !this.vectors || draft.input.force || draft.topicKey) return null;
+    const candidates = this.closeMatches(draft.vector, scopeKey(draft.scope, draft.projectKey));
+    const same = candidates.find((c) => c.type === draft.input.type);
+    if (same)
+      return { status: "near_duplicate", id: same.id, title: same.title, similarity: same.similarity };
+    if (candidates.length === 0) return null;
+    return {
+      status: "possible_duplicate",
+      id: null,
+      candidates: candidates.map(({ id, title, similarity }) => ({ id, title, similarity })),
+    };
+  }
+
+  // Live memories in one partition at or above the tier's duplicate threshold, closest first.
+  private closeMatches(
+    vector: Float32Array,
+    partition: string,
+    excludeId?: number,
+  ): { id: number; title: string; type: string; similarity: number }[] {
+    if (!this.vectors) return [];
     const threshold = this.vectors.spec.duplicateThreshold;
     const near = this.vectors
-      .knn(draft.vector, scopeKey(draft.scope, draft.projectKey), 3)
-      .filter((n) => n.similarity >= threshold);
-    const titles = this.titles(near.map((n) => n.id));
-    const candidates = near
-      .filter((n) => titles.has(n.id))
-      .map((n) => ({
-        id: n.id,
-        title: titles.get(n.id) ?? "",
-        similarity: Math.round(n.similarity * 1000) / 1000,
-      }));
-    return candidates.length > 0 ? { status: "possible_duplicate", id: null, candidates } : null;
+      .knn(vector, partition, 4)
+      .filter((n) => n.id !== excludeId && n.similarity >= threshold);
+    const rows = new Map(this.get(near.map((n) => n.id)).map((r) => [r.id, r]));
+    return near.flatMap((n) => {
+      const row = rows.get(n.id);
+      if (!row) return [];
+      return [
+        { id: n.id, title: row.title, type: row.type, similarity: Math.round(n.similarity * 1000) / 1000 },
+      ];
+    });
+  }
+
+  private similarTo(row: MemoryRow): MemoryDetail["duplicates"] {
+    const partition = scopeKey(row.scope, row.project_key);
+    const vector = this.vectors?.vector(row.id, row.content_hash);
+    if (!vector) return [];
+    return this.closeMatches(vector, partition, row.id).map(({ id, title, similarity }) => ({
+      id,
+      title,
+      similarity,
+    }));
   }
 
   private insert(draft: SaveDraft): SaveResult {
@@ -530,7 +703,7 @@ export class MemoryStore {
       // A model switch while embedding makes the vector useless for the new tables.
       return this.embedder === embedder ? (vector ?? null) : null;
     } catch (error) {
-      this.log(`${kind} embedding failed, continuing without a vector: ${errorText(error)}`);
+      this.log.warn(`${kind} embedding failed, continuing without a vector: ${errorText(error)}`);
       return null;
     }
   }
@@ -593,7 +766,7 @@ export class MemoryStore {
     return near.filter((n) => live.has(n.id)).sort((a, b) => b.similarity - a.similarity);
   }
 
-  private boostedHits(ranks: Map<number, number>): MemoryHit[] {
+  private boostedHits(ranks: Map<number, number>): Candidate[] {
     const ids = [...ranks.keys()];
     if (ids.length === 0) return [];
     const rows = this.db
@@ -603,17 +776,36 @@ export class MemoryStore {
       )
       .all(...ids);
     const nowMs = this.now().getTime();
-    return rows.map((row) => memoryHit(row, (ranks.get(row.id) ?? 0) * boost(row, nowMs)));
+    return rows.map((row) => {
+      const weight = boost(row, nowMs);
+      return {
+        hit: memoryHit(row, (ranks.get(row.id) ?? 0) * weight),
+        text: `${row.title}\n${row.content}`,
+        weight,
+      };
+    });
   }
 
-  private titles(ids: number[]): Map<number, string> {
-    if (ids.length === 0) return new Map();
-    const rows = this.db
-      .prepare<{ id: number; title: string }, number[]>(
-        `SELECT id, title FROM memories WHERE deleted_at IS NULL AND id IN (${ids.map(() => "?").join(",")})`,
-      )
-      .all(...ids);
-    return new Map(rows.map((r) => [r.id, r.title]));
+  // Rescores the top fused candidates with the cross-encoder, keeping each one's boost. Any
+  // re-ranker failure keeps the fused order.
+  private async rerank(query: string, candidates: Candidate[], limit: number): Promise<SearchHit[]> {
+    const fused = candidates.sort((a, b) => b.hit.score - a.hit.score);
+    const reranker = this.reranker;
+    if (!reranker || fused.length < 2) return fused.slice(0, limit).map((c) => c.hit);
+    const head = fused.slice(0, RERANK_CANDIDATES);
+    try {
+      const scores = await reranker.score(
+        query,
+        head.map((c) => c.text),
+      );
+      return head
+        .map((c, i) => ({ ...c.hit, score: (scores[i] ?? 0) * c.weight }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+    } catch (error) {
+      this.log.warn(`re-ranking failed, using fused order: ${errorText(error)}`);
+      return fused.slice(0, limit).map((c) => c.hit);
+    }
   }
 
   // ---------- background indexing ----------
@@ -625,7 +817,7 @@ export class MemoryStore {
       return;
     }
     this.indexing = this.runIndex()
-      .catch((error: unknown) => this.log(`background embedding failed: ${errorText(error)}`))
+      .catch((error: unknown) => this.log.warn(`background embedding failed: ${errorText(error)}`))
       .finally(() => {
         this.indexing = null;
         if (!this.indexAgain) return;
@@ -647,13 +839,13 @@ export class MemoryStore {
       if (vectors && active()) done += this.writeBatch(rows, vectors);
       rows = active() ? this.pendingBatch(model, rows.at(-1)?.id ?? Number.MAX_SAFE_INTEGER) : [];
     }
-    if (done > 0) this.log(`embedded ${done} memories with ${model}`);
+    if (done > 0) this.log.info(`embedded ${done} memories with ${model}`);
   }
 
   private embedBatch(embedder: Embedder, rows: IndexRow[]): Promise<Float32Array[] | null> {
     const texts = rows.map((r) => `${r.title}\n${r.content}`);
     return embedder.embed(texts, "document").catch((error: unknown) => {
-      this.log(`embedding batch ending at #${rows.at(-1)?.id} failed, skipped: ${errorText(error)}`);
+      this.log.warn(`embedding batch ending at #${rows.at(-1)?.id} failed, skipped: ${errorText(error)}`);
       return null;
     });
   }
@@ -716,7 +908,21 @@ function patched(existing: MemoryRow, patch: MemoryPatch) {
     pinned: pinnedFlag,
     topicKey: patch.topicKey === undefined ? existing.topic_key : patch.topicKey,
     hash: sha256(`${type}\n${title}\n${content}`),
+    ...patchedScope(existing, patch),
   };
+}
+
+function patchedScope(
+  existing: MemoryRow,
+  patch: MemoryPatch,
+): { scope: Scope; projectKey: string | null; project: ProjectRef | null } {
+  if (patch.scope === undefined)
+    return { scope: existing.scope, projectKey: existing.project_key, project: null };
+  if (patch.scope === "global") return { scope: "global", projectKey: null, project: null };
+  const project = patch.project ?? null;
+  const projectKey = project?.key ?? (existing.scope === "project" ? existing.project_key : null);
+  if (!projectKey) throw new Error("Moving a memory to project scope needs a project.");
+  return { scope: "project", projectKey, project };
 }
 
 function scopeFilter(scope: SearchScope, project: ProjectRef | null, type?: string): SqlFilter {
@@ -741,11 +947,13 @@ function addRanks(ranks: Map<number, number>, ids: number[]): void {
   for (const [index, id] of ids.entries()) ranks.set(id, (ranks.get(id) ?? 0) + 1 / (RRF_K + index + 1));
 }
 
-// Pinned +10%, recency up to +6% (half-life about a month), project scope +5%.
+// Pinned +10%, recency up to +6% (half-life about a month), project scope +5%, use up to +4%
+// (full at 31 uses). A memory counts as recent when it was edited or used recently.
 function boost(row: MemoryRow, nowMs: number): number {
-  const ageDays = (nowMs - Date.parse(row.last_seen_at ?? row.updated_at)) / 86_400_000;
-  const recency = 0.06 / (1 + Math.max(0, ageDays) / 30);
-  return 1 + 0.1 * row.pinned + recency + (row.scope === "project" ? 0.05 : 0);
+  const touched = Math.max(Date.parse(row.updated_at), row.last_used_at ? Date.parse(row.last_used_at) : 0);
+  const recency = 0.06 / (1 + Math.max(0, (nowMs - touched) / 86_400_000) / 30);
+  const usage = 0.04 * Math.min(1, Math.log2(1 + row.use_count) / 5);
+  return 1 + 0.1 * row.pinned + recency + (row.scope === "project" ? 0.05 : 0) + usage;
 }
 
 function memoryHit(row: MemoryWithProject, score: number): MemoryHit {
@@ -760,6 +968,29 @@ function memoryHit(row: MemoryWithProject, score: number): MemoryHit {
     preview: clip(row.content, 240),
     pinned: row.pinned === 1,
     updatedAt: row.updated_at,
+    useCount: row.use_count,
+    lastUsedAt: row.last_used_at,
     score,
+  };
+}
+
+function memoryDetail(row: MemoryWithProject): NonNullable<MemoryDetail["memory"]> {
+  return {
+    id: row.id,
+    title: row.title,
+    content: row.content,
+    type: row.type,
+    scope: row.scope,
+    projectName: row.project_name,
+    topicKey: row.topic_key,
+    pinned: row.pinned === 1,
+    source: row.source,
+    agentId: row.agent_id,
+    provider: row.provider,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    useCount: row.use_count,
+    lastUsedAt: row.last_used_at,
+    revisionCount: row.revision_count,
   };
 }

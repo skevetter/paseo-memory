@@ -8,9 +8,11 @@ import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 import type { MemoryStatus } from "../shared/contracts";
+import { type Logger, parseLine } from "../shared/log";
 import {
   type EmbeddingTier,
   FATAL_EXIT_CODE,
+  type RerankMode,
   SERVICE_EVENT_PREFIX,
   SERVICE_KEY_HEADER,
   SERVICE_KEY_LABEL,
@@ -27,6 +29,7 @@ export interface ServiceConfig {
   servicePath: string;
   sqlitePath: string;
   tier: EmbeddingTier;
+  rerank: RerankMode;
   port: number;
   contextBudgetChars: number;
   sessionRetentionDays: number;
@@ -35,7 +38,7 @@ export interface ServiceConfig {
 export interface SupervisorOptions {
   dataDir: string;
   paseoHome: string;
-  log: (message: string) => void;
+  log: Logger;
   locateEnv?: LocateEnv;
 }
 
@@ -74,6 +77,8 @@ export function serviceArgs(
     String(config.port),
     "--tier",
     config.tier,
+    "--rerank",
+    config.rerank,
   ];
   args.push("--context-budget", String(config.contextBudgetChars));
   args.push("--retention-days", String(config.sessionRetentionDays), "--parent-pid", String(input.parentPid));
@@ -174,6 +179,18 @@ export class ServiceSupervisor {
     return this.live;
   }
 
+  // The paths in use and whether they came from an override setting or detection.
+  paths(): MemoryStatus["paths"] {
+    const config = this.config;
+    const source = (setting: string | undefined): "override" | "detected" =>
+      setting ? "override" : "detected";
+    return {
+      bun: { value: this.bunPath, source: source(config?.bunPath) },
+      sqlite: { value: this.live?.sqliteLibrary ?? null, source: source(config?.sqlitePath) },
+      service: { value: this.location?.root ?? null, source: source(config?.servicePath) },
+    };
+  }
+
   private launch(): void {
     this.clearTimer();
     const config = this.config;
@@ -192,7 +209,7 @@ export class ServiceSupervisor {
       dataDir: this.options.dataDir,
       parentPid: process.pid,
     });
-    this.options.log(`starting service: ${this.bunPath} ${args.join(" ")}`);
+    this.options.log.info(`starting service: ${this.bunPath} ${args.join(" ")}`);
     const child = spawn(this.bunPath, args, {
       cwd: this.location.root,
       env: serviceEnv(process.env),
@@ -206,29 +223,29 @@ export class ServiceSupervisor {
     this.live = null;
     this.startedAt = Date.now();
     if (child.stdout) forEachLine(child.stdout, (line) => this.onStdout(child, line));
-    if (child.stderr) forEachLine(child.stderr, (line) => this.options.log(line));
+    if (child.stderr) forEachLine(child.stderr, (line) => this.forward(line, "warn"));
     child.on("error", (error) => {
-      this.options.log(`service process error: ${error.message}`);
+      this.options.log.error(`service process error: ${error.message}`);
       this.onExit(child, null);
     });
     child.on("exit", (code) => this.onExit(child, code));
     this.timer = setTimeout(() => {
       if (this.child !== child || this.live) return;
-      this.options.log(`service did not report ready within ${READY_TIMEOUT_MS} ms; restarting`);
+      this.options.log.warn(`service did not report ready within ${READY_TIMEOUT_MS} ms; restarting`);
       child.kill("SIGKILL");
     }, READY_TIMEOUT_MS);
   }
 
   private onStdout(child: ChildProcess, line: string): void {
     if (!line.startsWith(SERVICE_EVENT_PREFIX)) {
-      this.options.log(line);
+      this.forward(line, "info");
       return;
     }
     let event: ServiceEvent;
     try {
       event = JSON.parse(line.slice(SERVICE_EVENT_PREFIX.length));
     } catch {
-      this.options.log(`unparseable service event: ${line}`);
+      this.options.log.warn(`unparseable service event: ${line}`);
       return;
     }
     if (this.child !== child) return;
@@ -255,14 +272,14 @@ export class ServiceSupervisor {
     this.failures = Date.now() - this.startedAt > HEALTHY_RUN_MS ? 1 : this.failures + 1;
     const delay = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** (this.failures - 1));
     this.detail = `exited with code ${code ?? "signal"}; restarting in ${delay} ms`;
-    this.options.log(`service ${this.detail}`);
+    this.options.log.warn(`service ${this.detail}`);
     this.scheduleLaunch(delay, "restarting");
   }
 
   // Fatal causes (no bun, no SQLite build, sqlite-vec failure) need a fix on the host, so retry slowly.
   private markFatal(detail: string): void {
     this.detail = detail;
-    this.options.log(`service unavailable: ${detail} (retrying in ${FATAL_RETRY_MS / 1000} s)`);
+    this.options.log.error(`service unavailable: ${detail} (retrying in ${FATAL_RETRY_MS / 1000} s)`);
     this.scheduleLaunch(FATAL_RETRY_MS, "fatal");
   }
 
@@ -283,8 +300,16 @@ export class ServiceSupervisor {
       this.bunVersion = stdout.trim();
     } catch (error) {
       this.bunVersion = null;
-      this.options.log(`bun --version failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.options.log.warn(
+        `bun --version failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
+  }
+
+  // Service lines keep their level; unprefixed stdout is info and unprefixed stderr a warning.
+  private forward(line: string, fallback: "info" | "warn"): void {
+    const { level, message } = parseLine(line, fallback);
+    this.options.log[level](`service: ${message}`);
   }
 
   private clearTimer(): void {
