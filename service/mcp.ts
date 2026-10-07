@@ -3,6 +3,7 @@
 // the service knows which project memory to use and the token survives service restarts.
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { SERVICE_VERSION } from "./version";
 
 export interface ToolDefinition {
   name: string;
@@ -84,7 +85,10 @@ function methodTable(options: McpOptions): Record<string, MethodHandler> {
       return rpcResult(message.id ?? null, {
         protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: options.serverName ?? "paseo-memory", version: options.serverVersion ?? "0.2.0" },
+        serverInfo: {
+          name: options.serverName ?? "paseo-memory",
+          version: options.serverVersion ?? SERVICE_VERSION,
+        },
         instructions: options.instructions,
       });
     },

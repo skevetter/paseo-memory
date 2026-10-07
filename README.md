@@ -143,6 +143,6 @@ paseo daemon stop --home $H
 
 Settings from v0.1 migrate automatically. `embeddings`, `duplicateThreshold` and `sqliteVecPath` are gone: thresholds are per tier and sqlite-vec always loads from its npm package.
 
-## Not in v0.2
+## Not in 1.0
 
 LLM-based extraction or consolidation, reranking, graph memory, cross-host sync, export, a per-agent private scope, and remote embedding backends. See `docs/DESIGN.md`.

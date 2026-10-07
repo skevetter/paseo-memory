@@ -22,7 +22,10 @@ import { errorText } from "./sqlite";
 import { MemoryStore } from "./store";
 import { createTools, MCP_INSTRUCTIONS } from "./tools";
 
-export const SERVICE_VERSION = "0.2.0";
+import { SERVICE_VERSION } from "./version";
+
+export { SERVICE_VERSION };
+
 const PRUNE_INTERVAL_MS = 12 * 3_600_000;
 
 export interface ServiceOptions {

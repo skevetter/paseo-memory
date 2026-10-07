@@ -1,6 +1,6 @@
 {
   "name": "paseo-memory",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Lightweight native memory for Paseo agents: one SQLite file, global and project scopes, hybrid search.",
   "license": "MIT",
   "repository": "github:skevetter/paseo-memory",

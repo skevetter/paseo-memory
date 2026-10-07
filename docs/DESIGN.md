@@ -32,7 +32,7 @@ Decisions that the code does not explain on its own. Research sources are listed
 
 ## Why sqlite-vec is required
 
-- v0.1 scored BLOB vectors by brute-force cosine because the plugin process could not load extensions. The service can, so v0.2 drops the BLOB path rather than carry two vector implementations.
+- v0.1 scored BLOB vectors by brute-force cosine because the plugin process could not load extensions. The service can, so 1.0 drops the BLOB path rather than carry two vector implementations.
 - One `vec0` table exists per model and dimension count. `scope_key` is a partition key (`global` or `project:<16 hex of sha256(projectKey)>`), so KNN for a project reads only that project's and the global partition, and dedupe reads only the memory's own partition.
 - `memory_embeddings` records `(memory_id, model, dims, content_hash)`. A missing row or a hash mismatch marks a memory as pending for that model. Edits drop the memory's vectors from every model's table.
 - Bun's `changes` count includes rows that the FTS triggers touch, so session pruning counts `RETURNING` rows instead.
