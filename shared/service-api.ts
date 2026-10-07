@@ -14,6 +14,50 @@ export type EmbeddingTier = (typeof EMBEDDING_TIERS)[number];
 export const RERANK_MODES = ["auto", "on", "off"] as const;
 export type RerankMode = (typeof RERANK_MODES)[number];
 
+export const STRICTNESS_LEVELS = ["low", "medium", "high"] as const;
+export type Strictness = (typeof STRICTNESS_LEVELS)[number];
+
+export const DETAIL_LEVELS = ["titles", "summaries"] as const;
+export const MERGE_MODES = ["off", "suggest", "auto"] as const;
+export const REVIEW_TRIGGERS = ["idle", "turns"] as const;
+export const TASK_SOURCES = ["prompt", "names"] as const;
+export type TaskSource = (typeof TASK_SOURCES)[number];
+export const REVIEW_DISPLAYS = ["collapsed", "full", "hidden"] as const;
+export type ReviewDisplay = (typeof REVIEW_DISPLAYS)[number];
+
+export const RuntimeConfigSchema = z.object({
+  contextBudgetChars: z.number().int().min(500),
+  maxPinned: z.number().int().min(0),
+  taskMatches: z.number().int().min(0),
+  taskStrictness: z.enum(STRICTNESS_LEVELS),
+  projectMemories: z.number().int().min(0),
+  globalMemories: z.number().int().min(0),
+  recentSessions: z.number().int().min(0),
+  detailLevel: z.enum(DETAIL_LEVELS),
+  extraInstructions: z.string(),
+  reviewMaxMemories: z.number().int().min(0),
+  duplicateMerge: z.enum(MERGE_MODES),
+  staleDays: z.number().int().min(1),
+  usageRanking: z.boolean(),
+});
+export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
+
+export const DEFAULT_RUNTIME: RuntimeConfig = {
+  contextBudgetChars: 6000,
+  maxPinned: 10,
+  taskMatches: 5,
+  taskStrictness: "medium",
+  projectMemories: 15,
+  globalMemories: 8,
+  recentSessions: 3,
+  detailLevel: "titles",
+  extraInstructions: "",
+  reviewMaxMemories: 3,
+  duplicateMerge: "suggest",
+  staleDays: 60,
+  usageRanking: true,
+};
+
 export const MEMORY_TYPES = [
   "decision",
   "bugfix",
@@ -41,11 +85,17 @@ const MemoryScope = z.enum(["global", "project"]);
 
 export const serviceInputs = {
   status: z.object({}),
+  configure: RuntimeConfigSchema,
   "agent-context": z.object({
     project: ProjectRefSchema.nullable(),
     provider: z.string(),
     includeContext: z.boolean(),
     includeTools: z.boolean(),
+    task: z
+      .object({ query: z.string().min(1), source: z.enum(TASK_SOURCES) })
+      .nullable()
+      .default(null),
+    taskBudgetMs: z.number().int().min(0).default(0),
   }),
   "link-agent": z.object({
     nonce: z.string().min(1),
@@ -71,8 +121,23 @@ export const serviceInputs = {
     paseoProjectId: z.string().nullable(),
     scope: SearchScopeSchema,
     limit: z.number().int().min(1).max(50),
-    stale: z.boolean().default(false),
   }),
+  "review-start": z.object({ agentId: z.string().min(1), trigger: z.enum(REVIEW_TRIGGERS) }),
+  "review-end": z.object({
+    agentId: z.string().min(1),
+    reply: z.string().nullable(),
+    failed: z.boolean(),
+  }),
+  "review-skip": z.object({
+    agentId: z.string().min(1),
+    trigger: z.enum(REVIEW_TRIGGERS),
+    reason: z.string().min(1),
+  }),
+  "upkeep-list": z.object({ paseoProjectId: z.string().nullable() }),
+  "upkeep-run": z.object({}),
+  keep: z.object({ id: z.number().int() }),
+  archive: z.object({ id: z.number().int() }),
+  "dismiss-pair": z.object({ a: z.number().int(), b: z.number().int() }),
   save: z.object({
     title: z.string().min(1),
     content: z.string().min(1),
@@ -142,11 +207,14 @@ export const MemoryDetailSchema = z.object({
       createdAt: z.string(),
       updatedAt: z.string(),
       useCount: z.number(),
+      shownCount: z.number(),
+      openedCount: z.number(),
       lastUsedAt: z.string().nullable(),
       revisionCount: z.number(),
     })
     .nullable(),
   mergedInto: z.number().nullable(),
+  archived: z.boolean(),
   versions: z.array(
     z.object({ version: z.number(), title: z.string(), content: z.string(), createdAt: z.string() }),
   ),
@@ -164,10 +232,23 @@ export const SessionItemSchema = z.object({
   files: z.array(z.string()),
   updatedAt: z.string(),
   endedAt: z.string().nullable(),
+  summary: z.string().nullable(),
+  outcomes: z.string().nullable(),
+  reviewedAt: z.string().nullable(),
 });
 export type SessionItem = z.infer<typeof SessionItemSchema>;
 
-export const AUDIT_KINDS = ["inject", "context", "search", "get", "save", "update", "delete"] as const;
+export const AUDIT_KINDS = [
+  "inject",
+  "context",
+  "search",
+  "get",
+  "save",
+  "update",
+  "delete",
+  "review",
+  "merge",
+] as const;
 export type AuditKind = (typeof AUDIT_KINDS)[number];
 
 // The title is read at view time; null means the memory was deleted.
@@ -185,6 +266,7 @@ export const AuditEventSchema = z.object({
   at: z.string(),
   query: z.string().nullable(),
   summary: z.string(),
+  text: z.string().nullable(),
   memories: z.array(AuditMemorySchema),
   sessions: z.array(AuditSessionSchema),
 });
@@ -203,11 +285,55 @@ export const AgentAuditSchema = z.object({
       sessions: z.array(AuditSessionSchema),
       chars: z.number(),
       budget: z.number(),
+      task: z
+        .object({
+          query: z.string(),
+          source: z.enum(TASK_SOURCES),
+          memories: z.array(AuditMemorySchema),
+          note: z.string().nullable(),
+        })
+        .nullable(),
     })
     .nullable(),
   events: z.array(AuditEventSchema),
 });
 export type AgentAudit = z.infer<typeof AgentAuditSchema>;
+
+const PairMemorySchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  type: z.string(),
+  scope: MemoryScope,
+  preview: z.string(),
+  updatedAt: z.string(),
+  useCount: z.number(),
+});
+
+export const UpkeepListSchema = z.object({
+  mode: z.enum(MERGE_MODES),
+  staleDays: z.number(),
+  lastRunAt: z.string().nullable(),
+  duplicates: z.array(
+    z.object({
+      a: PairMemorySchema,
+      b: PairMemorySchema,
+      similarity: z.number().nullable(),
+      sameTopic: z.boolean(),
+      targetId: z.number(),
+    }),
+  ),
+  contradictions: z.array(
+    z.object({
+      a: PairMemorySchema,
+      b: PairMemorySchema,
+      similarity: z.number().nullable(),
+      sameTopic: z.boolean(),
+      values: z.object({ a: z.array(z.string()), b: z.array(z.string()) }),
+    }),
+  ),
+  stale: z.array(MemoryItemSchema),
+});
+export type UpkeepList = z.infer<typeof UpkeepListSchema>;
 
 export const WorkspaceAgentSchema = z.object({
   agentId: z.string(),
@@ -262,6 +388,7 @@ export type SaveStatus =
 
 export interface ServiceOutputs {
   status: ServiceStatus;
+  configure: { ok: true };
   "agent-context": {
     systemPrompt: string | null;
     mcpServer: { url: string; headers: Record<string, string> } | null;
@@ -280,6 +407,14 @@ export interface ServiceOutputs {
   restore: { ok: boolean };
   merge: { ok: boolean; message: string };
   sessions: { items: SessionItem[] };
+  "review-start": { ok: boolean; reason: string | null; cap: number };
+  "review-end": { ok: boolean; saved: number[]; updated: number[]; summary: string | null };
+  "review-skip": { ok: true };
+  "upkeep-list": UpkeepList;
+  "upkeep-run": { merged: number; duplicates: number; contradictions: number; stale: number };
+  keep: { ok: boolean };
+  archive: { ok: boolean };
+  "dismiss-pair": { ok: true };
   "agent-audit": AgentAudit;
   "workspace-agents": { agents: WorkspaceAgent[] };
   attachments: {

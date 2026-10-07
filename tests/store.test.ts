@@ -9,7 +9,7 @@ import { openDatabase } from "../service/sqlite";
 import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
-import { EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
+import { DEFAULT_RUNTIME, EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
 import { dataRepo, hashEmbedder, hashSpec, otherRepo, tempDir } from "./helpers";
 
 let store: MemoryStore;
@@ -346,8 +346,46 @@ describe("migration", () => {
       expect(row).toMatchObject({ title: "From 1.0", use_count: 0, last_used_at: null, merged_into: null });
       upgraded.markUsed([1]);
       expect(upgraded.get([1])[0]?.use_count).toBe(1);
-      upgraded.audit.open({ nonce: "n", projectKey: null, provider: "omp" });
+      upgraded.audit.open({ nonce: "n", projectKey: null, provider: "omp", tools: true });
       expect(upgraded.audit.agentFor("n")).toBeNull();
+    } finally {
+      upgraded.close();
+    }
+  });
+
+  it("upgrades a v3 database: adds review and usage columns and re-indexes session digests", () => {
+    const path = join(tempDir(), "memory.db");
+    const { db } = openDatabase(path);
+    // A 1.1 database: today's schema minus everything v4 added, with the 1.1 sessions index.
+    migrate(db);
+    db.run(`DROP TRIGGER sessions_ai; DROP TRIGGER sessions_ad; DROP TRIGGER sessions_au; DROP TABLE sessions_fts;
+      DROP TABLE upkeep_dismissed;
+      ALTER TABLE memories DROP COLUMN shown_count; ALTER TABLE memories DROP COLUMN opened_count;
+      ALTER TABLE memories DROP COLUMN kept_at; ALTER TABLE memories DROP COLUMN archived_at;
+      ALTER TABLE sessions DROP COLUMN summary; ALTER TABLE sessions DROP COLUMN outcomes;
+      ALTER TABLE sessions DROP COLUMN reviewed_at; ALTER TABLE agent_links DROP COLUMN tools;
+      CREATE VIRTUAL TABLE sessions_fts USING fts5(title, first_prompt, last_prompt, last_reply,
+        content = 'sessions', content_rowid = 'rowid', tokenize = "porter unicode61 tokenchars '_-./'");
+      INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
+        VALUES ('global', 'note', 'From 1.1', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+      INSERT INTO sessions (id, agent_id, last_reply, turns, started_at, updated_at)
+        VALUES ('a1', 'a1', 'Fixed the flaky test.', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+      INSERT INTO agent_links (nonce, agent_id, created_at) VALUES ('n1', 'a1', '2026-01-01T00:00:00Z');
+      PRAGMA user_version = 3;`);
+    db.close();
+    const upgraded = new MemoryStore({ path });
+    try {
+      expect(upgraded.get([1])[0]).toMatchObject({ shown_count: 0, opened_count: 0, kept_at: null });
+      expect(upgraded.sessions({ projectKey: null, query: "test", limit: 5 }).map((s) => s.id)).toEqual([
+        "a1",
+      ]);
+      expect(upgraded.audit.toolNonceFor("a1")).toBe("n1");
+      expect(
+        upgraded.storeReview({ agentId: "a1", summary: "Pinned the clock in tests.", outcomes: null }),
+      ).toBe(true);
+      expect(upgraded.sessions({ projectKey: null, query: "clock", limit: 5 })[0]?.summary).toBe(
+        "Pinned the clock in tests.",
+      );
     } finally {
       upgraded.close();
     }
@@ -394,13 +432,13 @@ describe("sessions and context", () => {
       assistantText: "Root cause was a timezone assumption; fixed in tests/ingest_test.py",
       files: ["tests/ingest_test.py"],
     });
-    const ctx = buildContext({ store, project: dataRepo, budgetChars: 4000 });
+    const ctx = buildContext({ store, project: dataRepo });
     expect(ctx.text).toContain("Pinned convention");
     expect(ctx.text).toContain("timezone assumption");
     expect(ctx.sessionIds).toEqual(["agent-1"]);
-    expect(
-      buildContext({ store, project: dataRepo, budgetChars: 4000, excludeAgentId: "agent-1" }).text,
-    ).not.toContain("timezone");
+    expect(buildContext({ store, project: dataRepo, excludeAgentId: "agent-1" }).text).not.toContain(
+      "timezone",
+    );
     const prompt = buildSystemPrompt({ context: ctx.text, project: dataRepo, hasTools: true });
     expect(prompt.startsWith("<paseo-memory>")).toBe(true);
     expect(prompt).toContain("memory_search");
@@ -418,7 +456,8 @@ describe("sessions and context", () => {
         project: dataRepo,
       });
     }
-    const ctx = buildContext({ store, project: dataRepo, budgetChars: 600 });
+    store.configure({ ...DEFAULT_RUNTIME, contextBudgetChars: 600, detailLevel: "summaries" });
+    const ctx = buildContext({ store, project: dataRepo });
     expect(ctx.text.length).toBeLessThanOrEqual(600);
     expect(ctx.memoryIds.length).toBeGreaterThan(0);
     for (const id of ctx.memoryIds) expect(ctx.text).toContain(`#${id} [note] Memory number`);
@@ -435,7 +474,7 @@ describe("context ranking and session capture", () => {
     const often = await store.save({ ...base, title: "Often used" });
     await store.save({ ...base, title: "Pinned one", pinned: true });
     for (let i = 0; i < 5; i++) store.markUsed([often.id as number]);
-    const text = buildContext({ store, project: dataRepo, budgetChars: 4000 }).text;
+    const text = buildContext({ store, project: dataRepo }).text;
     const at = (title: string) => text.indexOf(title);
     expect(at("Pinned one")).toBeLessThan(at("Often used"));
     expect(at("Often used")).toBeLessThan(at("Rarely used"));
@@ -452,7 +491,7 @@ describe("context ranking and session capture", () => {
       project: null,
       pinned: true,
     });
-    const line = buildContext({ store, project: null, budgetChars: 4000 }).text.split("\n")[1] ?? "";
+    const line = buildContext({ store, project: null }).text.split("\n")[1] ?? "";
     expect(line).toMatch(/^- #\d+ \[note\] Long pinned: alpha beta gamma .*(alpha|beta|gamma)…$/);
   });
 
@@ -487,11 +526,11 @@ describe("context ranking and session capture", () => {
       files: [],
     };
     timed.recordTurn({ ...turn, agentId: "old" });
-    timed.audit.open({ nonce: "n-old", projectKey: null, provider: "omp" });
+    timed.audit.open({ nonce: "n-old", projectKey: null, provider: "omp", tools: true });
     timed.audit.record("n-old", { kind: "get", ids: [1], found: [] });
     now = new Date("2026-03-01T00:00:00Z");
     timed.recordTurn({ ...turn, agentId: "new" });
-    timed.audit.open({ nonce: "n-new", projectKey: null, provider: "omp" });
+    timed.audit.open({ nonce: "n-new", projectKey: null, provider: "omp", tools: true });
     timed.audit.record("n-new", { kind: "get", ids: [1], found: [] });
     timed.audit.link({ nonce: "n-old", agentId: "a-old", workspaceId: "w", title: null });
     timed.audit.link({ nonce: "n-new", agentId: "a-new", workspaceId: "w", title: null });
@@ -657,7 +696,7 @@ describe("curation", () => {
 
 describe("audit log", () => {
   it("binds events to the agent only after the nonce is linked", () => {
-    store.audit.open({ nonce: "n1", projectKey: dataRepo.key, provider: "omp" });
+    store.audit.open({ nonce: "n1", projectKey: dataRepo.key, provider: "omp", tools: true });
     store.audit.record("n1", {
       kind: "search",
       query: "token=supersecretvalue123 deploys",

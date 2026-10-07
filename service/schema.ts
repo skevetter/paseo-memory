@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
@@ -8,27 +8,45 @@ export function migrate(db: Database): void {
   db.transaction(() => {
     if (current === 1) dropV1Vectors(db);
     db.run(SCHEMA_SQL);
-    addV3Columns(db);
+    addColumns(db, "memories", V3_MEMORY_COLUMNS);
     db.run(V3_SQL);
+    addColumns(db, "memories", V4_MEMORY_COLUMNS);
+    addColumns(db, "sessions", V4_SESSION_COLUMNS);
+    addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
+    db.run(V4_SQL);
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
 
-// CREATE TABLE IF NOT EXISTS keeps older memories tables as they were, so columns are added here.
-function addV3Columns(db: Database): void {
+const V3_MEMORY_COLUMNS: [string, string][] = [
+  ["use_count", "INTEGER NOT NULL DEFAULT 0"],
+  ["last_used_at", "TEXT"],
+  ["merged_into", "INTEGER"],
+];
+
+const V4_MEMORY_COLUMNS: [string, string][] = [
+  ["shown_count", "INTEGER NOT NULL DEFAULT 0"],
+  ["opened_count", "INTEGER NOT NULL DEFAULT 0"],
+  ["kept_at", "TEXT"],
+  ["archived_at", "TEXT"],
+];
+
+const V4_SESSION_COLUMNS: [string, string][] = [
+  ["summary", "TEXT"],
+  ["outcomes", "TEXT"],
+  ["reviewed_at", "TEXT"],
+];
+
+// CREATE TABLE IF NOT EXISTS keeps older tables as they were, so columns are added here.
+function addColumns(db: Database, table: string, added: [string, string][]): void {
   const columns = new Set(
     db
-      .query<{ name: string }, []>(`PRAGMA table_info(memories)`)
+      .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
       .all()
       .map((c) => c.name),
   );
-  const added: [string, string][] = [
-    ["use_count", "INTEGER NOT NULL DEFAULT 0"],
-    ["last_used_at", "TEXT"],
-    ["merged_into", "INTEGER"],
-  ];
   for (const [name, type] of added) {
-    if (!columns.has(name)) db.run(`ALTER TABLE memories ADD COLUMN ${name} ${type}`);
+    if (!columns.has(name)) db.run(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
   }
 }
 
@@ -42,6 +60,34 @@ const V3_SQL = `
     id INTEGER PRIMARY KEY, nonce TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS ix_audit_nonce ON audit_events(nonce, id);
   CREATE INDEX IF NOT EXISTS ix_audit_created ON audit_events(created_at);
+`;
+
+// v4 rebuilds the sessions index with summaries; "." is no longer a token character, so "done." matches "done".
+const V4_SQL = `
+  DROP TRIGGER IF EXISTS sessions_ai;
+  DROP TRIGGER IF EXISTS sessions_ad;
+  DROP TRIGGER IF EXISTS sessions_au;
+  DROP TABLE IF EXISTS sessions_fts;
+  CREATE VIRTUAL TABLE sessions_fts USING fts5(
+    title, first_prompt, last_prompt, last_reply, summary, outcomes, content = 'sessions', content_rowid = 'rowid',
+    tokenize = "porter unicode61 tokenchars '_-/'");
+  CREATE TRIGGER sessions_ai AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply, summary, outcomes)
+      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply, new.summary, new.outcomes);
+  END;
+  CREATE TRIGGER sessions_ad AFTER DELETE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply, summary, outcomes)
+      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply, old.summary, old.outcomes);
+  END;
+  CREATE TRIGGER sessions_au AFTER UPDATE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply, summary, outcomes)
+      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply, old.summary, old.outcomes);
+    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply, summary, outcomes)
+      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply, new.summary, new.outcomes);
+  END;
+  INSERT INTO sessions_fts(sessions_fts) VALUES ('rebuild');
+  CREATE TABLE IF NOT EXISTS upkeep_dismissed (
+    low_id INTEGER NOT NULL, high_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (low_id, high_id));
 `;
 
 function dropV1Vectors(db: Database): void {
@@ -112,21 +158,4 @@ const SCHEMA_SQL = `
     first_prompt TEXT, last_prompt TEXT, last_reply TEXT, files TEXT NOT NULL DEFAULT '[]',
     turns INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT);
   CREATE INDEX IF NOT EXISTS ix_sessions_project ON sessions(project_key, updated_at DESC);
-  CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-    title, first_prompt, last_prompt, last_reply, content = 'sessions', content_rowid = 'rowid',
-    tokenize = "porter unicode61 tokenchars '_-./'");
-  CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
-    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply)
-      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply);
-  END;
-  CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
-    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply)
-      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply);
-  END;
-  CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
-    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply)
-      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply);
-    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply)
-      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply);
-  END;
 `;

@@ -1,6 +1,7 @@
 import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
 import { buildContext } from "./context";
 import type { Caller, ToolDefinition } from "./mcp";
+import type { ReviewWindows } from "./review";
 import type { MemoryStore, ProjectRef, SaveInput, SaveResult, SearchHit, SearchScope } from "./store";
 import { age } from "./text";
 
@@ -19,8 +20,8 @@ export const MCP_INSTRUCTIONS = [
 
 export interface ToolContext {
   store: MemoryStore;
+  windows: ReviewWindows;
   resolveProject(caller: Caller): ProjectRef | null;
-  contextBudget(): number;
 }
 
 export function createTools(ctx: ToolContext): ToolDefinition[] {
@@ -90,6 +91,8 @@ function getTool(ctx: ToolContext): ToolDefinition {
       const ids = Array.isArray(args.ids) ? args.ids.map(Number).filter(Number.isInteger) : [];
       const rows = ctx.store.get(ids);
       ctx.store.markUsed(rows.map((r) => r.id));
+      const shown = caller.nonce ? ctx.store.audit.shownTo(caller.nonce) : new Set<number>();
+      ctx.store.markOpened(rows.map((r) => r.id).filter((id) => shown.has(id)));
       ctx.store.audit.record(caller.nonce, { kind: "get", ids, found: rows.map((r) => r.id) });
       const found = new Set(rows.map((r) => r.id));
       const merged = ids.flatMap((id) => {
@@ -136,7 +139,9 @@ function saveTool(ctx: ToolContext): ToolDefinition {
       if (scope === "project" && !project) {
         return "This agent is not attached to a Paseo project, so project memory is unavailable. Use scope=global or skip.";
       }
+      ctx.windows.checkSave(caller.nonce);
       const result = await ctx.store.save(saveInput(args, { scope, project, caller }));
+      ctx.windows.countSave(caller.nonce, result.status);
       const candidates = result.status === "possible_duplicate" ? result.candidates.map((c) => c.id) : [];
       ctx.store.audit.record(caller.nonce, {
         kind: "save",
@@ -241,20 +246,18 @@ function contextTool(ctx: ToolContext): ToolDefinition {
       "unfamiliar work.",
     inputSchema: { type: "object", properties: {} },
     handler(_args, caller) {
-      const budget = ctx.contextBudget();
       const context = buildContext({
         store: ctx.store,
         project: ctx.resolveProject(caller),
-        budgetChars: budget,
         excludeAgentId: caller.agentId,
       });
-      ctx.store.markUsed(context.memoryIds);
+      ctx.store.markShown(context.memoryIds);
       ctx.store.audit.record(caller.nonce, {
         kind: "context",
         memories: context.memoryIds,
         sessions: context.sessionIds,
         chars: context.text.length,
-        budget,
+        budget: ctx.store.config.contextBudgetChars,
       });
       return context.text;
     },

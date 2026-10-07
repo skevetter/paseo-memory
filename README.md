@@ -4,12 +4,14 @@ Shared memory for Paseo agents, stored locally. One SQLite file holds global and
 
 ## What it does
 
-- **Recall at agent start.** `before("agent.create")` appends a `<paseo-memory>` block to the agent's system prompt. The block lists pinned memories first, then the project's most used and recently touched memories, then recent agent sessions, then global memory. Titles are never cut and text ends at a word boundary. The default budget is 6,000 characters.
+- **Recall at agent start.** `before("agent.create")` appends a `<paseo-memory>` block to the agent's system prompt. It opens with "Relevant to this task": memories that match the agent's first message, or its title, branch and folder when there is no first message. Then come pinned memories, the project's most used and recently touched memories, recent agent sessions with their review summaries, and global memory. Each list has its own count, the whole block has a character budget (6,000 by default), and the lists show titles only unless the detail setting asks for short summaries.
 - **Memory tools for every agent.** The service hosts an MCP server on `127.0.0.1:6797`, and the plugin injects it into each new agent as the `memory` server. Tools: `memory_search`, `memory_get`, `memory_save`, `memory_update`, `memory_delete`, `memory_context`.
 - **Session digests.** `on("agent.turn_ended")` records the latest user prompt, the final assistant reply and the edited file paths for each agent. Failed turns (an error outcome, an empty reply, or a `[System Error]` banner) are skipped. Tool output and reasoning are not stored.
-- **Audit per agent.** Each agent's injected memories and sessions, and every memory tool call with its results (ids, scores, statuses), are recorded under the agent's Paseo id. Content is not copied into the audit log.
-- **Usage signals.** A memory counts as used when it is injected, appears in the top 5 of an agent's search, or is fetched with `memory_get`. Use count and last use give a small ranking boost and drive the stale list.
-- **App UI.** A Memory workspace panel with three tabs: Memories (search, stale list, add), This agent (what the agent was given and every tool call), and Sessions. Clicking a memory opens its detail view: full content, metadata, usage, version history with restore, edit in place, delete, and "Merge into #n" for close duplicates. Also a `/remember` slash command, a Memory attachment source for the composer, and a settings screen with service status.
+- **Background session review.** After an agent with at least 2 completed turns has been idle for the idle time (10 minutes by default), or after every N turns, the plugin sends it one review message. The agent searches memory, saves or updates up to 3 durable memories, and replies with a session summary. The summary and the saved and updated memories are stored on the session digest and used in later agents' Recent sessions. In the chat the review collapses to one line by default.
+- **Upkeep.** A daily job, also run from the panel, finds likely duplicates (same type and scope above the tier's duplicate threshold, or the same `topic_key`) and possible contradictions (the same pair, but with differing numbers or values). Duplicates are suggested for merging, or merged automatically if you choose. Contradictions are only flagged. Memories that nobody used, edited or kept for 60 days are listed as stale.
+- **Audit per agent.** Each agent's injected memories and sessions, its task query and task matches, every memory tool call with its results (ids, scores, statuses), and its reviews are recorded under the agent's Paseo id. Memory content is not copied into the audit log.
+- **Usage signals.** A memory counts as shown when it is injected or appears in the top 5 of an agent's search, and as opened when the agent then fetches it with `memory_get`. Memories that agents open rank a little higher; memories shown 10 times and never opened rank a little lower. Use count and last use also give a small ranking boost and drive the stale list.
+- **App UI.** A Memory workspace panel with four tabs: Memories (search, add), This agent (what the agent was given, its task matches, every tool call and review), Sessions (with review summaries), and Review (duplicates, contradictions and stale memories, with Merge, Keep both, Keep and Archive). Clicking a memory opens its detail view: full content, metadata, usage, version history with restore, edit in place, delete, and "Merge into #n" for close duplicates. Also a `/remember` slash command, a Memory attachment source for the composer, timeline rows for reviews, and a settings screen with service status.
 
 ## Requirements
 
@@ -20,11 +22,11 @@ Shared memory for Paseo agents, stored locally. One SQLite file holds global and
 
 ## Architecture
 
-- **Plugin process.** Paseo runs plugin server code inside Paseo Helper. On macOS that process has the hardened runtime without `disable-library-validation`, so it cannot load sqlite-vec, onnxruntime-node or any other third-party native library. The plugin therefore stays thin: it resolves Paseo projects, injects context and the MCP server into new agents, records turn digests, and forwards UI RPCs.
+- **Plugin process.** Paseo runs plugin server code inside Paseo Helper. On macOS that process has the hardened runtime without `disable-library-validation`, so it cannot load sqlite-vec, onnxruntime-node or any other third-party native library. The plugin therefore stays thin: it resolves Paseo projects, keeps first messages from new workspaces, injects context and the MCP server into new agents, records turn digests, schedules session reviews, and forwards UI RPCs.
 - **Memory service.** `service/main.ts` runs under Bun as a child process of the plugin. It owns the SQLite database, sqlite-vec, the embedding model, the MCP endpoint and a small internal HTTP API. Both endpoints listen on one loopback port.
 - **Supervision.** The plugin finds `bun` (setting `bunPath`, then `PATH`, `/opt/homebrew/bin/bun`, `~/.bun/bin/bun`), starts the service with `ELECTRON_RUN_AS_NODE` removed from the environment, restarts it with backoff when it exits, and stops it on plugin cleanup. The service exits when the plugin closes its stdin or its parent process disappears.
 - **Service path.** The plugin bundle cannot see its own directory. The plugin reads `$PASEO_HOME/config.json`, finds the plugin entry whose directory has a `paseo-plugin.json` with id `paseo-memory`, and runs `<that directory>/service/main.ts`. The `servicePath` setting overrides this.
-- **Failure handling.** Every hook and RPC calls the service with a short timeout. `before("agent.create")` has a 1.8 second budget and returns the request unchanged on any failure. A missing bun, a missing SQLite build, a sqlite-vec load failure or a port held by another program puts the service in the `fatal` state; the settings screen shows the cause, and the plugin retries every 60 seconds.
+- **Failure handling.** Every hook and RPC calls the service with a short timeout. `before("agent.create")` has a 1.8 second budget and returns the request unchanged on any failure; a task search that would exceed the budget is dropped and the block keeps its general lists. A missing bun, a missing SQLite build, a sqlite-vec load failure or a port held by another program puts the service in the `fatal` state; the settings screen shows the cause, and the plugin retries every 60 seconds.
 - **Logs.** Info lines go to stdout, warnings and errors to stderr, each prefixed with `info`, `warn` or `error`. `paseo plugin logs paseo-memory` shows startup lines on the stdout stream.
 
 ## Scopes
@@ -37,7 +39,7 @@ Shared memory for Paseo agents, stored locally. One SQLite file holds global and
 
 `$PASEO_HOME/plugin-data/paseo-memory/memory.db` (WAL). Override the directory with `PASEO_MEMORY_DIR`.
 
-Tables: `memories`, `memory_versions`, `memory_embeddings`, `vec_tables`, `projects`, `project_aliases`, `sessions`, `agent_links`, `audit_events`, FTS5 indexes `memories_fts` and `sessions_fts`, and one sqlite-vec `vec0` table per embedding model (for example `vec_alibaba_nlp_gte_modernbert_base_768`). Each `vec0` table partitions vectors by `scope_key` (`global` or `project:<hash>`) and uses cosine distance.
+Tables: `memories`, `memory_versions`, `memory_embeddings`, `vec_tables`, `projects`, `project_aliases`, `sessions`, `agent_links`, `audit_events`, `upkeep_dismissed`, FTS5 indexes `memories_fts` and `sessions_fts` (sessions include the review summary and outcomes), and one sqlite-vec `vec0` table per embedding model (for example `vec_alibaba_nlp_gte_modernbert_base_768`). Each `vec0` table partitions vectors by `scope_key` (`global` or `project:<hash>`) and uses cosine distance.
 
 sqlite-vec is required. The service refuses to start when it cannot load the extension.
 
@@ -48,7 +50,7 @@ Write path:
 4. An exact content match increments `duplicate_count`.
 5. A near duplicate by cosine similarity in the same scope partition with the same type returns `near_duplicate` with the existing id, and nothing is saved; the agent calls `memory_update` instead. Close matches of another type return `possible_duplicate` with candidates. `force` saves anyway. The threshold depends on the embedding tier.
 
-Search: FTS5 BM25 (title weighted 5, topic key 3, content 1) fused with vec0 KNN by reciprocal rank fusion (k = 60), then boosted for pinned, recent, used and project-scoped memories. Vector hits enter fusion only above the tier's search floor. With re-ranking on, the top 30 fused candidates are rescored by the cross-encoder (each keeps its boost) and the top k return. A re-ranker that fails to load or score leaves the fused order.
+Search: FTS5 BM25 (title weighted 5, topic key 3, content 1) fused with vec0 KNN by reciprocal rank fusion (k = 60), then boosted for pinned, recent, used and project-scoped memories, and with usage ranking on, for how often agents open a memory they were shown. Vector hits enter fusion only above the tier's search floor. With re-ranking on, the top 30 fused candidates are rescored by the cross-encoder (each keeps its boost) and the top k return. A re-ranker that fails to load or score leaves the fused order.
 
 Merging a duplicate keeps the target unchanged and soft-deletes the source with a `merged_into` pointer; `memory_get` on the old id names the target.
 
@@ -152,27 +154,45 @@ paseo daemon stop --home $H
 
 The scratch daemon's memory service needs its own port while another daemon's service holds 6797. Write `mcpPort` through the `settings.memory.write` plugin RPC (for example from a small `DaemonClient` script); until then the scratch service reports that the port is in use and stays stopped.
 
+To exercise the first-message match, create the workspace with a first agent through `DaemonClient.createWorkspace({ source, agent: { provider, cwd, initialPrompt } })`. `paseo run --new-workspace` creates the workspace without the prompt, so its agents match by title, branch and folder.
+
 ## Settings
+
+Counts, the budget and the review, upkeep and ranking settings take effect for the next agent without a service restart. The settings screen groups them as Starting memory, Session review, Search and Upkeep, with the service paths, port and retention in a collapsed Advanced section.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| injectContext | true | Append the memory block to new agents' system prompts |
+| injectContext | true | Inject the memory block into new agents' system prompts |
+| contextBudgetChars | 6000 | Size cap for the injected block (500 to 20,000) |
+| maxPinned | 10 | Pinned memories in the block (0 to 50) |
+| taskMatches | 5 | Memories in "Relevant to this task" (0 to 50) |
+| taskStrictness | medium | `low`, `medium` or `high`; picks the per-tier task floors |
+| projectMemories | 15 | Project memories in the block (0 to 50) |
+| globalMemories | 8 | Global memories in the block (0 to 50) |
+| recentSessions | 3 | Recent sessions in the block (0 to 20) |
+| detailLevel | titles | `titles` or `summaries`; pinned memories always include their text |
+| extraInstructions | (empty) | Text appended to the memory instructions, up to 2,000 characters |
 | injectMcp | true | Inject the `memory` MCP server |
 | autoCapture | true | Record per-agent session digests |
+| reviewTrigger | idle | `off`, `idle` or `turns` |
+| reviewIdleMinutes | 10 | Idle time before a review (1 to 240) |
+| reviewEveryTurns | 8 | Turns between reviews in `turns` mode (2 to 100) |
+| reviewMaxMemories | 3 | Saves allowed in one review, enforced by the service (0 to 10) |
+| reviewDisplay | collapsed | `collapsed`, `full` or `hidden`; how a review shows in the chat |
+| duplicateMerge | suggest | `off`, `suggest` or `auto` |
+| staleDays | 60 | Days without use, edit or Keep before a memory is stale (7 to 365) |
+| usageRanking | true | Rank by how often agents open the memories they are shown |
 | embeddingTier | medium | `zero`, `low`, `medium` or `high` (see Embeddings) |
 | rerank | auto | `auto`, `on` or `off` (see Re-ranking) |
 | mcpPort | 6797 | Loopback port for the service (MCP and internal API) |
-| contextBudgetChars | 6000 | Size cap for the injected block |
 | sessionRetentionDays | 30 | Session digests and audit events older than this are pruned |
-| mcpDenyProviders | ["pi"] | Providers that do not get the MCP server |
+| mcpDenyProviders | ["pi"] | Providers that do not get the MCP server and are never reviewed |
 | bunPath | (auto) | Path to `bun` |
 | sqlitePath | (auto) | macOS SQLite library with extension loading |
 | servicePath | (auto) | Plugin directory or `service/main.ts` |
 
-The settings screen keeps the three paths in a collapsed Advanced section that shows the path in use and whether it was detected or overridden.
+Settings migrate automatically: v1 keys (`embeddings`, `duplicateThreshold`, `sqliteVecPath`) are dropped, v2 settings gain `rerank`, and v3 settings keep their values and gain the 1.2 settings with their defaults. The database moves to schema v4 on first start: new usage, review and archive columns, and a rebuilt `sessions_fts`.
 
-Settings migrate automatically: v1 keys (`embeddings`, `duplicateThreshold`, `sqliteVecPath`) are dropped, and v2 settings gain `rerank` with its default.
+## Not in 1.2
 
-## Not in 1.1
-
-LLM-based extraction or consolidation, graph memory, cross-host sync, export, a per-agent private scope, and remote embedding backends. See `docs/DESIGN.md`.
+Recall for each new user message (no Paseo hook can change a message before the agent reads it), graph memory, cross-host sync, export, a per-agent private scope, and remote embedding backends. See `docs/DESIGN.md`.

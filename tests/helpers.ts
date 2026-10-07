@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Embedder, TierSpec } from "../service/embedder";
@@ -19,8 +19,16 @@ export const otherRepo: ProjectRef = {
   paseoProjectId: "prj_bbbb",
 };
 
+const created: string[] = [];
+
+export function removeTempDirs(): void {
+  for (const dir of created.splice(0)) rmSync(dir, { recursive: true, force: true });
+}
+
 export function tempDir(prefix = "pm-test-"): string {
-  return mkdtempSync(join(tmpdir(), prefix));
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  created.push(dir);
+  return dir;
 }
 
 export function hashSpec(model: string, dims: number): TierSpec {
@@ -35,6 +43,7 @@ export function hashSpec(model: string, dims: number): TierSpec {
     documentPrefix: "",
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.2, relative: 0.5 },
+    taskFloor: { low: 0.2, medium: 0.4, high: 0.6 },
   };
 }
 

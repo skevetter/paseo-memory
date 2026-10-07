@@ -3,16 +3,18 @@ import { useRpc, useSettings } from "@getpaseo/plugin/client";
 import { SettingsCard, SettingsSection, SettingsSelect, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { Text } from "react-native";
-import { type MemorySettings, memorySettings, statusRpc } from "../shared/contracts";
+import { memorySettings, statusRpc } from "../shared/contracts";
 import { AdvancedSection } from "./settings-advanced";
-import { type Save, TIER_OPTIONS } from "./settings-options";
+import { SessionReviewSection, StartingMemorySection } from "./settings-memory";
+import {
+  MERGE_OPTIONS,
+  RERANK_OPTIONS,
+  type Save,
+  type SectionProps,
+  TIER_OPTIONS,
+} from "./settings-options";
 import { StatusSection } from "./settings-status";
-
-const RERANK_OPTIONS = [
-  { label: "Automatic (on for Medium and High)", value: "auto" },
-  { label: "On", value: "on" },
-  { label: "Off", value: "off" },
-] as const;
+import { SettingsStepper } from "./settings-stepper";
 
 export function MemorySettingsScreen({ theme }: PluginSurfaceProps) {
   const settings = useSettings(memorySettings);
@@ -30,45 +32,21 @@ export function MemorySettingsScreen({ theme }: PluginSurfaceProps) {
   }
   const values = settings.values;
   const save: Save = (patch) => void settings.save({ ...values, ...patch }, settings.revision);
+  const section: SectionProps = { values, save, theme };
 
   return (
     <>
-      <AgentsSection values={values} save={save} />
-      <SearchSection values={values} save={save} />
+      <StartingMemorySection {...section} />
+      <SessionReviewSection {...section} />
+      <SearchSection {...section} />
+      <UpkeepSection {...section} />
       <StatusSection status={info.data ?? null} error={info.error ? String(info.error) : null} />
-      <AdvancedSection values={values} status={info.data ?? null} save={save} theme={theme} />
+      <AdvancedSection {...section} status={info.data ?? null} />
     </>
   );
 }
 
-function AgentsSection({ values, save }: { values: MemorySettings; save: Save }) {
-  return (
-    <SettingsSection title="Agents">
-      <SettingsCard>
-        <SettingsSwitch
-          label="Add memory to new agents"
-          hint="New agents start with pinned and recent memories for this project."
-          value={values.injectContext}
-          onValueChange={(injectContext) => save({ injectContext })}
-        />
-        <SettingsSwitch
-          label="Memory tools"
-          hint="Lets agents search and save memories during a chat."
-          value={values.injectMcp}
-          onValueChange={(injectMcp) => save({ injectMcp })}
-        />
-        <SettingsSwitch
-          label="Record session summaries"
-          hint="Keeps each agent's last request and reply so later agents see recent work."
-          value={values.autoCapture}
-          onValueChange={(autoCapture) => save({ autoCapture })}
-        />
-      </SettingsCard>
-    </SettingsSection>
-  );
-}
-
-function SearchSection({ values, save }: { values: MemorySettings; save: Save }) {
+function SearchSection({ values, save }: SectionProps) {
   return (
     <SettingsSection title="Search">
       <SettingsCard>
@@ -85,6 +63,36 @@ function SearchSection({ values, save }: { values: MemorySettings; save: Save })
           value={values.rerank}
           options={RERANK_OPTIONS}
           onValueChange={(rerank) => save({ rerank })}
+        />
+        <SettingsSwitch
+          label="Rank by use"
+          hint="Memories agents open rank higher. Memories shown often and never opened rank a little lower."
+          value={values.usageRanking}
+          onValueChange={(usageRanking) => save({ usageRanking })}
+        />
+      </SettingsCard>
+    </SettingsSection>
+  );
+}
+
+function UpkeepSection({ values, save, theme }: SectionProps) {
+  return (
+    <SettingsSection title="Upkeep">
+      <SettingsCard>
+        <SettingsSelect
+          label="Duplicates"
+          hint="Finds memories that say the same thing. Suggestions appear in the Review tab of the Memory panel."
+          value={values.duplicateMerge}
+          options={MERGE_OPTIONS}
+          onValueChange={(duplicateMerge) => save({ duplicateMerge })}
+        />
+        <SettingsStepper
+          setting="staleDays"
+          label="Days until stale"
+          hint="Memories nobody used or edited for this many days appear in the Review tab. Pinned memories never go stale."
+          values={values}
+          save={save}
+          theme={theme}
         />
       </SettingsCard>
     </SettingsSection>

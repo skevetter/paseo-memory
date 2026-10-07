@@ -26,11 +26,10 @@ interface MemoriesTabProps {
 export function MemoriesTab({ projectId, projectName, onOpenMemory, s }: MemoriesTabProps) {
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<Scope>("all");
-  const [stale, setStale] = useState(false);
   const search = useRpc(searchMemoriesRpc);
   const results = useQuery({
-    queryKey: [QUERY_ROOT, "search", projectId, scope, stale, query],
-    queryFn: () => search({ query, paseoProjectId: projectId, scope, stale, limit: 30 }),
+    queryKey: [QUERY_ROOT, "search", projectId, scope, query],
+    queryFn: () => search({ query, paseoProjectId: projectId, scope, limit: 30 }),
   });
   const items = results.data?.items ?? [];
   return (
@@ -58,19 +57,12 @@ export function MemoriesTab({ projectId, projectName, onOpenMemory, s }: Memorie
             s={s}
           />
         ))}
-        <Chip
-          label="Stale"
-          active={stale}
-          onPress={() => setStale(!stale)}
-          accessibilityLabel="Show memories nobody used or edited recently"
-          s={s}
-        />
       </View>
       <QueryState
         loading={results.isLoading}
         error={results.error}
         empty={items.length === 0}
-        emptyText={stale ? "No stale memories." : "No memories."}
+        emptyText="No memories."
         s={s}
       />
       {items.map((item) => (
@@ -81,7 +73,7 @@ export function MemoriesTab({ projectId, projectName, onOpenMemory, s }: Memorie
   );
 }
 
-function cardMeta(item: MemoryItem): string {
+export function cardMeta(item: MemoryItem): string {
   const where = item.scope === "global" ? "global" : (item.projectName ?? "project");
   const label = item.kind === "session" ? "session" : `#${item.id} · ${item.type}`;
   const parts = [label, where, formatDate(item.updatedAt)];

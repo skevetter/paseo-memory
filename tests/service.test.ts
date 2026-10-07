@@ -304,3 +304,160 @@ describe("agent audit", () => {
     expect(agents).toMatchObject({ agents: [{ agentId: "agent-x", title: "Deploys", events: 5 }] });
   });
 });
+
+const ContextOutput = z.object({
+  nonce: z.string(),
+  systemPrompt: z.string(),
+  mcpServer: z.object({ headers: z.record(z.string(), z.string()) }),
+});
+
+async function startAgent(agentId: string, task: { query: string; source: "prompt" | "names" } | null) {
+  const created = await internal("agent-context", {
+    project: dataRepo,
+    provider: "omp",
+    includeContext: true,
+    includeTools: true,
+    task,
+    taskBudgetMs: 1000,
+  });
+  const ctx = ContextOutput.parse(created.json);
+  await internal("link-agent", { nonce: ctx.nonce, agentId, workspaceId: "ws-2", title: null });
+  let id = 100;
+  const call = async (name: string, args: Record<string, unknown>) =>
+    ToolResult.parse(
+      (
+        await mcp(
+          { jsonrpc: "2.0", id: id++, method: "tools/call", params: { name, arguments: args } },
+          ctx.mcpServer.headers,
+        )
+      ).json,
+    ).result;
+  return { ...ctx, call };
+}
+
+const savedId = (result: { content: { text: string }[] }) =>
+  Number(/#(\d+)/.exec(result.content[0]?.text ?? "")?.[1]);
+
+describe("task-aware start", () => {
+  it("injects task matches above the general lists and records the query and matches", async () => {
+    const saved = await internal("save", {
+      title: "Gateway limits",
+      content: "Payment retries stop after three attempts because the gateway rate limits us",
+      type: "config",
+      scope: "project",
+      paseoProjectId: null,
+      project: dataRepo,
+      pinned: false,
+    });
+    const id = Number(saved.json.id);
+    const agent = await startAgent("agent-task", {
+      query: "why do payment retries stop after three attempts",
+      source: "prompt",
+    });
+    const block = agent.systemPrompt.split("\n");
+    const heading = block.indexOf("## Relevant to this task");
+    expect(heading).toBeGreaterThan(0);
+    expect(block[heading + 1]).toContain(`#${id} [config] Gateway limits`);
+    expect(heading).toBeLessThan(block.findIndex((l) => l.startsWith("## Pinned")));
+    const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId: "agent-task" })).json);
+    expect(audit.injected?.task).toMatchObject({
+      query: "why do payment retries stop after three attempts",
+      source: "prompt",
+      memories: [{ id, title: "Gateway limits", score: expect.any(Number) }],
+      note: null,
+    });
+
+    await agent.call("memory_get", { ids: [id] });
+    const other = await internal("save", {
+      title: "Unseen note",
+      content: "never shown to the agent",
+      type: "note",
+      scope: "global",
+      paseoProjectId: null,
+      project: null,
+      pinned: false,
+    });
+    await agent.call("memory_get", { ids: [Number(other.json.id)] });
+    expect((await internal("detail", { id })).json).toMatchObject({ memory: { openedCount: 1 } });
+    expect((await internal("detail", { id: Number(other.json.id) })).json).toMatchObject({
+      memory: { openedCount: 0, useCount: 1 },
+    });
+  });
+});
+
+describe("session review", () => {
+  it("caps saves inside a review, stores the summary and outcomes, and records the review", async () => {
+    const agentId = "agent-review";
+    const agent = await startAgent(agentId, null);
+    const turn = {
+      agentId,
+      project: dataRepo,
+      provider: "omp",
+      title: "Retries",
+      workspaceDir: null,
+      files: [],
+    };
+    await internal("record-turn", { ...turn, userText: "make retries safer", assistantText: "Done." });
+    expect((await internal("review-start", { agentId, trigger: "idle" })).json).toEqual({
+      ok: true,
+      reason: null,
+      cap: 3,
+    });
+    const ids: number[] = [];
+    for (const n of [1, 2, 3]) {
+      ids.push(
+        savedId(await agent.call("memory_save", { title: `Review fact ${n}`, content: `fact number ${n}` })),
+      );
+    }
+    const fourth = await agent.call("memory_save", { title: "Review fact 4", content: "one too many" });
+    expect(fourth.isError).toBe(true);
+    expect(fourth.content[0]?.text).toContain("already saved 3 memories, the limit for one review");
+    const reply = `[paseo-memory:review-reply v1 collapsed]\nSummary: Capped retries at three and kept backoff.\nSaved: #${ids.join(", #")}\nUpdated: none`;
+    const ended = await internal("review-end", { agentId, reply, failed: false });
+    expect(ended.json).toEqual({
+      ok: true,
+      saved: ids,
+      updated: [],
+      summary: "Capped retries at three and kept backoff.",
+    });
+    expect(
+      (await agent.call("memory_save", { title: "After review", content: "normal save again" })).isError,
+    ).toBe(false);
+
+    const sessions = z
+      .object({
+        items: z.array(
+          z.object({ agentId: z.string(), summary: z.string().nullable(), outcomes: z.string().nullable() }),
+        ),
+      })
+      .parse(
+        (await internal("sessions", { query: "backoff", paseoProjectId: dataRepo.paseoProjectId, limit: 5 }))
+          .json,
+      );
+    expect(sessions.items.find((s) => s.agentId === agentId)).toEqual({
+      agentId,
+      summary: "Capped retries at three and kept backoff.",
+      outcomes: `Saved #${ids[0]}: Review fact 1\nSaved #${ids[1]}: Review fact 2\nSaved #${ids[2]}: Review fact 3`,
+    });
+    const next = await startAgent("agent-next", null);
+    expect(next.systemPrompt).toContain("→ Capped retries at three and kept backoff.");
+    const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId })).json);
+    const review = audit.events.find((e) => e.kind === "review");
+    expect(review).toMatchObject({ text: "Capped retries at three and kept backoff." });
+    expect(review?.summary).toMatch(/^saved #\d+, #\d+, #\d+ in \d+ s \(idle\)$/);
+    expect(review?.memories.map((m) => m.status)).toEqual(["saved", "saved", "saved"]);
+  });
+
+  it("declines agents without memory tools and records skipped reviews", async () => {
+    expect(
+      (await internal("review-start", { agentId: "agent-unknown", trigger: "idle" })).json,
+    ).toMatchObject({
+      ok: false,
+      reason: "This agent has no memory tools.",
+    });
+    await startAgent("agent-busy", null);
+    await internal("review-skip", { agentId: "agent-busy", trigger: "turns", reason: "The agent is busy." });
+    const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId: "agent-busy" })).json);
+    expect(audit.events.map((e) => e.summary)).toEqual(["skipped (turns): The agent is busy."]);
+  });
+});

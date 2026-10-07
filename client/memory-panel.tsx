@@ -7,14 +7,16 @@ import { MemoriesTab } from "./memories-tab";
 import { MemoryDetailView } from "./memory-detail";
 import { panelStyles, type Styles } from "./panel-styles";
 import { Chip } from "./panel-ui";
+import { ReviewTab } from "./review-tab";
 import { SessionsTab } from "./sessions-tab";
 
-type Tab = "memories" | "agent" | "sessions";
+type Tab = "memories" | "agent" | "sessions" | "review";
 
 const TABS: readonly { value: Tab; label: string }[] = [
   { value: "memories", label: "Memories" },
   { value: "agent", label: "This agent" },
   { value: "sessions", label: "Sessions" },
+  { value: "review", label: "Review" },
 ];
 
 interface Navigation {
@@ -85,6 +87,7 @@ function PanelBody({ workspaceId, projectId, projectName, nav, setNav, s }: Body
     );
   }
   if (nav.tab === "sessions") return <SessionsTab projectId={projectId} onOpenAgent={selectAgent} s={s} />;
+  if (nav.tab === "review") return <ReviewTab projectId={projectId} onOpenMemory={openMemory} s={s} />;
   return <MemoriesTab projectId={projectId} projectName={projectName} onOpenMemory={openMemory} s={s} />;
 }
 

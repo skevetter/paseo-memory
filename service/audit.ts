@@ -1,13 +1,31 @@
 import type { Database } from "bun:sqlite";
-import type { AgentAudit, AuditEvent, AuditKind, WorkspaceAgent } from "../shared/service-api";
+import type { AgentAudit, AuditEvent, AuditKind, TaskSource, WorkspaceAgent } from "../shared/service-api";
 import { redact } from "./redact";
 import { clip } from "./text";
+
+export interface TaskAudit {
+  query: string;
+  source: TaskSource;
+  matches: { id: number; score: number }[];
+  note: string | null;
+}
 
 export interface Injection {
   memories: number[];
   sessions: string[];
   chars: number;
   budget: number;
+  task?: TaskAudit | null;
+}
+
+export interface ReviewAudit {
+  trigger: string;
+  status: "done" | "skipped" | "failed";
+  reason: string | null;
+  saved: number[];
+  updated: number[];
+  durationMs: number | null;
+  summary: string | null;
 }
 
 // Search results are memory ids ("12") or session ids ("session:<agent id>").
@@ -16,7 +34,9 @@ export type AuditDetail =
   | { kind: "search"; query: string; scope: string; results: { id: string; score: number }[] }
   | { kind: "get"; ids: number[]; found: number[] }
   | { kind: "save"; id: number | null; status: string; candidates: number[] }
-  | { kind: "update" | "delete"; id: number; ok: boolean };
+  | { kind: "update" | "delete"; id: number; ok: boolean }
+  | ({ kind: "review" } & ReviewAudit)
+  | { kind: "merge"; source: number; target: number; similarity: number | null; sameTopic: boolean };
 
 interface LinkRow {
   nonce: string;
@@ -46,12 +66,12 @@ export class AuditLog {
     this.now = now;
   }
 
-  open(input: { nonce: string; projectKey: string | null; provider: string | null }): void {
+  open(input: { nonce: string; projectKey: string | null; provider: string | null; tools: boolean }): void {
     this.db
       .query(
-        `INSERT OR IGNORE INTO agent_links (nonce, project_key, provider, created_at) VALUES (?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO agent_links (nonce, project_key, provider, tools, created_at) VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(input.nonce, input.projectKey, input.provider, this.now());
+      .run(input.nonce, input.projectKey, input.provider, input.tools ? 1 : 0, this.now());
   }
 
   link(input: { nonce: string; agentId: string; workspaceId: string | null; title: string | null }): void {
@@ -73,6 +93,51 @@ export class AuditLog {
         .query<{ agent_id: string | null }, [string]>(`SELECT agent_id FROM agent_links WHERE nonce = ?`)
         .get(nonce)?.agent_id ?? null
     );
+  }
+
+  toolNonceFor(agentId: string): string | null {
+    return (
+      this.db
+        .query<{ nonce: string }, [string]>(
+          `SELECT nonce FROM agent_links WHERE agent_id = ? AND tools = 1 ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(agentId)?.nonce ?? null
+    );
+  }
+
+  nonceFor(agentId: string): string | null {
+    return (
+      this.db
+        .query<{ nonce: string }, [string]>(
+          `SELECT nonce FROM agent_links WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(agentId)?.nonce ?? null
+    );
+  }
+
+  // Memories this agent was given or found in a search's top five; memory_get on these counts as an open.
+  shownTo(nonce: string): Set<number> {
+    const rows = this.db
+      .query<{ kind: AuditKind; detail: string }, [string]>(
+        `SELECT kind, detail FROM audit_events WHERE nonce = ? AND kind IN ('inject', 'context', 'search')`,
+      )
+      .all(nonce);
+    const shown = new Set<number>();
+    for (const row of rows) {
+      const detail = { kind: row.kind, ...JSON.parse(row.detail) } as AuditDetail;
+      const ids = detail.kind === "search" ? memoryIds(detail).slice(0, 5) : memoryIds(detail);
+      for (const id of ids) shown.add(id);
+    }
+    return shown;
+  }
+
+  eventsSince(nonce: string, since: string): AuditDetail[] {
+    return this.db
+      .query<{ kind: AuditKind; detail: string }, [string, string]>(
+        `SELECT kind, detail FROM audit_events WHERE nonce = ? AND created_at >= ? ORDER BY id`,
+      )
+      .all(nonce, since)
+      .map((row) => ({ kind: row.kind, ...JSON.parse(row.detail) }) as AuditDetail);
   }
 
   retitle(agentId: string, title: string | null): void {
@@ -176,17 +241,32 @@ class AuditViews {
 
   injection(row: EventRow): NonNullable<AgentAudit["injected"]> {
     const detail = JSON.parse(row.detail) as Injection;
+    const task = detail.task ?? null;
     return {
       memories: detail.memories.map((id) => this.memory(id, null, null)),
       sessions: detail.sessions.map((id) => this.session(id)),
       chars: detail.chars,
       budget: detail.budget,
+      task: task && {
+        query: task.query,
+        source: task.source,
+        memories: task.matches.map((m) => this.memory(m.id, m.score, null)),
+        note: task.note,
+      },
     };
   }
 
   event(row: EventRow): AuditEvent {
     const detail = { kind: row.kind, ...JSON.parse(row.detail) } as AuditDetail;
-    const base = { id: row.id, kind: row.kind, at: row.created_at, query: null, memories: [], sessions: [] };
+    const base = {
+      id: row.id,
+      kind: row.kind,
+      at: row.created_at,
+      query: null,
+      text: null,
+      memories: [],
+      sessions: [],
+    };
     return { ...base, ...this.describe(detail) };
   }
 
@@ -208,12 +288,45 @@ class AuditViews {
         };
       case "save":
         return this.saveView(d);
+      case "review":
+        return this.reviewView(d);
+      case "merge":
+        return {
+          summary: `merged #${d.source} into #${d.target}${d.sameTopic ? " (same topic)" : ""}`,
+          memories: [this.memory(d.target, d.similarity, "kept")],
+        };
       default:
         return {
           summary: `${d.ok ? `${d.kind}d` : "not found"} #${d.id}`,
           memories: [this.memory(d.id, null, d.ok ? `${d.kind}d` : "missing")],
         };
     }
+  }
+
+  private reviewView(d: Extract<AuditDetail, { kind: "review" }>): Partial<AuditEvent> & { summary: string } {
+    const seconds = d.durationMs === null ? "" : ` in ${Math.round(d.durationMs / 1000)} s`;
+    const outcome =
+      d.saved.length + d.updated.length === 0
+        ? "nothing new"
+        : [
+            d.saved.length > 0 ? `saved ${d.saved.map((id) => `#${id}`).join(", ")}` : "",
+            d.updated.length > 0 ? `updated ${d.updated.map((id) => `#${id}`).join(", ")}` : "",
+          ]
+            .filter(Boolean)
+            .join(", ");
+    const summaries = {
+      done: `${outcome}${seconds} (${d.trigger})`,
+      skipped: `skipped (${d.trigger}): ${d.reason ?? "no reason"}`,
+      failed: `failed (${d.trigger}): ${d.reason ?? "no reply"}`,
+    };
+    return {
+      summary: summaries[d.status],
+      text: d.summary,
+      memories: [
+        ...d.saved.map((id) => this.memory(id, null, "saved")),
+        ...d.updated.map((id) => this.memory(id, null, "updated")),
+      ],
+    };
   }
 
   private saveView(d: Extract<AuditDetail, { kind: "save" }>): Partial<AuditEvent> & { summary: string } {
@@ -280,6 +393,10 @@ function memoryIds(d: AuditDetail): number[] {
       return d.ids;
     case "save":
       return [...(d.id === null ? [] : [d.id]), ...d.candidates];
+    case "review":
+      return [...d.saved, ...d.updated];
+    case "merge":
+      return [d.source, d.target];
     default:
       return [d.id];
   }

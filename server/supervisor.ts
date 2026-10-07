@@ -28,7 +28,6 @@ export interface ServiceConfig {
   tier: EmbeddingTier;
   rerank: RerankMode;
   port: number;
-  contextBudgetChars: number;
   sessionRetentionDays: number;
 }
 
@@ -37,6 +36,7 @@ export interface SupervisorOptions {
   paseoHome: string;
   log: Logger;
   locateEnv?: LocateEnv;
+  onReady?: () => void;
 }
 
 type SupervisorState = MemoryStatus["service"]["state"];
@@ -77,7 +77,6 @@ export function serviceArgs(
     "--rerank",
     config.rerank,
   ];
-  args.push("--context-budget", String(config.contextBudgetChars));
   args.push("--retention-days", String(config.sessionRetentionDays), "--parent-pid", String(input.parentPid));
   if (config.sqlitePath) args.push("--sqlite-path", config.sqlitePath);
   return args;
@@ -249,6 +248,7 @@ export class ServiceSupervisor {
       this.live = event.status;
       this.state = "running";
       this.detail = null;
+      this.options.onReady?.();
     } else {
       this.detail = event.error;
     }

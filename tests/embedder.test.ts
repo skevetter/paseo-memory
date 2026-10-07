@@ -3,10 +3,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Embedder, loadEmbedder, TIERS, WordPieceTokenizer } from "../service/embedder";
-import { loadReranker, RERANK_MODEL } from "../service/reranker";
+import { loadReranker, RERANK_MODEL, RERANK_TASK_FLOOR } from "../service/reranker";
 import { MemoryStore } from "../service/store";
 import { EMBEDDING_TIERS, type EmbeddingTier } from "../shared/service-api";
-import { CALIBRATION } from "./fixtures/calibration";
+import { BENCHMARK, CALIBRATION } from "./fixtures/calibration";
 import { dataRepo } from "./helpers";
 
 const modelsDir = process.env.PASEO_MEMORY_TEST_MODELS ?? join(tmpdir(), "paseo-memory-test-models");
@@ -30,6 +30,29 @@ function embedderFor(tier: EmbeddingTier): Promise<Embedder> {
 }
 
 const dot = (a: Float32Array, b: Float32Array) => a.reduce((sum, value, i) => sum + value * (b[i] ?? 0), 0);
+
+async function taskScores(score: (query: string, docs: string[]) => Promise<number[]>) {
+  const docs = BENCHMARK.corpus.map((c) => c.text);
+  const rows: { relevant: number; typical: number }[] = [];
+  for (const q of BENCHMARK.queries) {
+    const scores = await score(q.query, docs);
+    const index = BENCHMARK.corpus.findIndex((c) => c.key === q.relevant);
+    const others = scores.filter((_, i) => i !== index).sort((a, b) => a - b);
+    rows.push({ relevant: scores[index] ?? 0, typical: others[Math.floor(others.length / 2)] ?? 0 });
+  }
+  return rows;
+}
+
+function expectTaskFloor(
+  rows: { relevant: number; typical: number }[],
+  floor: { low: number; medium: number },
+) {
+  const share = (pass: (row: { relevant: number; typical: number }) => boolean) =>
+    rows.filter(pass).length / rows.length;
+  expect(share((r) => r.relevant >= floor.low)).toBeGreaterThanOrEqual(0.9);
+  expect(share((r) => r.relevant >= floor.medium)).toBeGreaterThanOrEqual(0.8);
+  expect(share((r) => r.typical < floor.medium)).toBeGreaterThanOrEqual(0.9);
+}
 
 async function similarity(embedder: Embedder, a: string, b: string): Promise<number> {
   const [x, y] = await embedder.embed([a, b], "document");
@@ -76,6 +99,19 @@ for (const tier of EMBEDDING_TIERS) {
       // Static embeddings miss one paraphrase that every transformer tier gets right.
       expect(ranked).toBeGreaterThanOrEqual(spec.backend === "model2vec" ? 3 : CALIBRATION.retrieval.length);
       expect(excluded).toBeGreaterThanOrEqual(CALIBRATION.retrieval.length / 2);
+    }, 300_000);
+
+    it("tier calibration: task floors keep most relevant memories and drop typical unrelated ones", async () => {
+      const embedder = await embedderFor(tier);
+      const docs = await embedder.embed(
+        BENCHMARK.corpus.map((c) => c.text),
+        "document",
+      );
+      const rows = await taskScores(async (query) => {
+        const [q] = await embedder.embed([query], "query");
+        return docs.map((d) => (q ? dot(q, d) : Number.NaN));
+      });
+      expectTaskFloor(rows, spec.taskFloor);
     }, 300_000);
 
     it("finds semantic matches with no keyword overlap and returns near duplicates in the store", async () => {
@@ -131,5 +167,10 @@ describe.skipIf(!rerankerAvailable)(`re-ranker (${RERANK_MODEL})`, () => {
       expect(rel).toBeLessThanOrEqual(1);
       expect(irr).toBeGreaterThanOrEqual(0);
     }
+  }, 300_000);
+
+  it("task floors keep most relevant memories and drop typical unrelated ones", async () => {
+    const reranker = await loadReranker(modelsDir);
+    expectTaskFloor(await taskScores((query, docs) => reranker.score(query, docs)), RERANK_TASK_FLOOR);
   }, 300_000);
 });

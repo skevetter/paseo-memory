@@ -60,7 +60,7 @@ export function MemoryDetailView({ id, projectId, onBack, onOpenMemory, s }: Det
 
 function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
   const { s, onOpenMemory } = props;
-  const { memory, mergedInto } = data;
+  const { memory, mergedInto, archived } = data;
   if (memory) {
     return (
       <>
@@ -71,6 +71,7 @@ function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
       </>
     );
   }
+  if (archived) return <Text style={s.muted}>This memory was archived.</Text>;
   if (mergedInto === null) return <Text style={s.muted}>This memory was deleted.</Text>;
   return (
     <>
@@ -226,6 +227,7 @@ function memoryFacts(memory: Memory): string[] {
     `Created ${formatDateTime(memory.createdAt)} · Updated ${formatDateTime(memory.updatedAt)}`,
     origin ? `Saved by ${origin}` : null,
     `Used ${plural(memory.useCount, "time", "times")}${lastUsed}`,
+    `Shown ${plural(memory.shownCount, "time", "times")} · opened ${plural(memory.openedCount, "time", "times")}`,
     plural(memory.revisionCount, "revision", "revisions"),
   ].filter((line): line is string => line !== null);
 }

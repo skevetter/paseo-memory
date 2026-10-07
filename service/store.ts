@@ -1,9 +1,11 @@
 import type { Database } from "bun:sqlite";
 import { type Logger, silentLogger } from "../shared/log";
 import {
+  DEFAULT_RUNTIME,
   MAX_CONTENT_CHARS,
   type MemoryDetail,
   type ProjectRef,
+  type RuntimeConfig,
   type SearchScope,
 } from "../shared/service-api";
 import { AuditLog } from "./audit";
@@ -15,8 +17,10 @@ import {
   listSessions,
   recordTurn,
   type SessionHit,
+  type SessionReview,
   type SessionRow,
   searchSessions,
+  storeReview,
   type TurnInput,
 } from "./sessions";
 import { errorText, openDatabase } from "./sqlite";
@@ -27,7 +31,6 @@ export type { ProjectRef, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
 export type Scope = "global" | "project";
 
-export const STALE_DAYS = 60;
 const USED_TOP_N = 5;
 const PINNED_BOOST = 0.1;
 const PROJECT_BOOST = 0.05;
@@ -35,6 +38,15 @@ const MAX_RECENCY_BOOST = 0.06;
 const RECENCY_HALF_LIFE_DAYS = 30;
 const MAX_USAGE_BOOST = 0.04;
 const FULL_USAGE_BOOST_USES = 31;
+const MAX_OPEN_BOOST = 0.06;
+const NEVER_OPENED_AFTER_SHOWN = 10;
+const NEVER_OPENED_FACTOR = 0.95;
+
+export function usageFactor(counts: { shown: number; opened: number }): number {
+  if (counts.shown >= NEVER_OPENED_AFTER_SHOWN && counts.opened === 0) return NEVER_OPENED_FACTOR;
+  if (counts.shown === 0) return 1;
+  return 1 + MAX_OPEN_BOOST * Math.min(1, counts.opened / counts.shown);
+}
 
 export class ContentTooLongError extends Error {
   constructor(length: number) {
@@ -67,6 +79,10 @@ export interface MemoryRow {
   last_seen_at: string | null;
   use_count: number;
   last_used_at: string | null;
+  shown_count: number;
+  opened_count: number;
+  kept_at: string | null;
+  archived_at: string | null;
   merged_into: number | null;
   deleted_at: string | null;
 }
@@ -109,8 +125,13 @@ export interface MemoryHit {
   pinned: boolean;
   updatedAt: string;
   useCount: number;
+  shownCount: number;
+  openedCount: number;
   lastUsedAt: string | null;
+  topicKey: string | null;
   score: number;
+  similarity: number | null;
+  relevance: number | null;
 }
 
 export type SearchHit = MemoryHit | SessionHit;
@@ -184,6 +205,7 @@ export class MemoryStore {
   private indexing: Promise<void> | null = null;
   private indexAgain = false;
   private closed = false;
+  config: RuntimeConfig = DEFAULT_RUNTIME;
 
   constructor(options: StoreOptions) {
     this.path = options.path;
@@ -218,6 +240,10 @@ export class MemoryStore {
 
   setReranker(reranker: Reranker | null): void {
     this.reranker = reranker;
+  }
+
+  configure(config: RuntimeConfig): void {
+    this.config = config;
   }
 
   upsertProject(project: ProjectRef): void {
@@ -289,22 +315,35 @@ export class MemoryStore {
   }
 
   markUsed(ids: number[]): void {
-    const unique = [...new Set(ids)];
-    if (unique.length === 0) return;
-    this.db
-      .prepare(
-        `UPDATE memories SET use_count = use_count + 1, last_used_at = ?
-         WHERE deleted_at IS NULL AND id IN (${unique.map(() => "?").join(",")})`,
-      )
-      .run(this.ts(), ...unique);
+    this.bump(ids, "use_count = use_count + 1, last_used_at = ?", [this.ts()]);
+  }
+
+  markShown(ids: number[]): void {
+    this.bump(ids, "use_count = use_count + 1, shown_count = shown_count + 1, last_used_at = ?", [this.ts()]);
+  }
+
+  markOpened(ids: number[]): void {
+    this.bump(ids, "opened_count = opened_count + 1", []);
+  }
+
+  keep(id: number): boolean {
+    return (
+      this.db.query(`UPDATE memories SET kept_at = ? WHERE id = ? AND deleted_at IS NULL`).run(this.ts(), id)
+        .changes > 0
+    );
+  }
+
+  archive(id: number): boolean {
+    const ts = this.ts();
+    const changed = this.db
+      .query(`UPDATE memories SET deleted_at = ?, archived_at = ? WHERE id = ? AND deleted_at IS NULL`)
+      .run(ts, ts, id).changes;
+    if (changed) dropVectors(this.db, id);
+    return changed > 0;
   }
 
   mergedInto(id: number): number | null {
-    return (
-      this.db
-        .query<{ merged_into: number | null }, [number]>(`SELECT merged_into FROM memories WHERE id = ?`)
-        .get(id)?.merged_into ?? null
-    );
+    return this.removed(id)?.merged_into ?? null;
   }
 
   update(id: number, patch: MemoryPatch): boolean {
@@ -382,9 +421,11 @@ export class MemoryStore {
       )
       .all(id)
       .map((v) => ({ version: v.version, title: v.title, content: v.content, createdAt: v.created_at }));
+    const removed = row ? null : this.removed(id);
     return {
       memory: row ? memoryDetail(row) : null,
-      mergedInto: row ? null : this.mergedInto(id),
+      mergedInto: removed?.merged_into ?? null,
+      archived: Boolean(removed?.archived_at),
       versions,
       duplicates: row ? this.similarTo(row) : [],
     };
@@ -398,8 +439,8 @@ export class MemoryStore {
     stale?: boolean;
   }): MemoryHit[] {
     const filter = scopeFilter(input.scope ?? "all", input.project);
-    const touched = "max(m.updated_at, ifnull(m.last_used_at, ''))";
-    const cutoff = new Date(this.now().getTime() - STALE_DAYS * 86_400_000).toISOString();
+    const touched = "max(m.updated_at, ifnull(m.last_used_at, ''), ifnull(m.kept_at, ''))";
+    const cutoff = new Date(this.now().getTime() - this.config.staleDays * 86_400_000).toISOString();
     const where = [filter.where];
     if (input.pinnedOnly) where.push("m.pinned = 1");
     if (input.stale) where.push(`m.pinned = 0 AND ${touched} < ?`);
@@ -410,7 +451,7 @@ export class MemoryStore {
          WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ?`,
       )
       .all(...filter.params, ...(input.stale ? [cutoff] : []), input.limit ?? 50)
-      .map((row) => memoryHit(row, 0));
+      .map((row) => memoryHit(row, { score: 0 }));
   }
 
   async search(input: SearchInput): Promise<SearchHit[]> {
@@ -425,16 +466,20 @@ export class MemoryStore {
     const ranks = new Map<number, number>();
     addRanks(ranks, this.keywordIds(query, filter));
     if (query.length < 3 || ranks.size === 0) addRanks(ranks, this.likeIds(query, filter));
-    if (queryVector) addRanks(ranks, this.vectorIds(queryVector, { ...input, scope }));
+    const near = queryVector ? this.vectorNeighbors(queryVector, { ...input, scope }) : [];
+    addRanks(
+      ranks,
+      near.map((n) => n.id),
+    );
 
-    const candidates = this.boostedHits(ranks);
+    const candidates = this.boostedHits(ranks, new Map(near.map((n) => [n.id, n.similarity])));
     if (input.includeSessions) {
       const sessions = searchSessions(this.db, { query, project: input.project, scope, limit });
       candidates.push(...sessions.map((hit) => ({ hit, text: `${hit.title}\n${hit.preview}`, weight: 0.9 })));
     }
     const hits = await this.rerank(query, candidates, limit);
     if (input.track && !this.closed) {
-      this.markUsed(hits.slice(0, USED_TOP_N).flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
+      this.markShown(hits.slice(0, USED_TOP_N).flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
     }
     return hits;
   }
@@ -447,6 +492,10 @@ export class MemoryStore {
 
   sessions(input: { projectKey: string | null; query: string; limit: number }): SessionRow[] {
     return listSessions(this.db, input);
+  }
+
+  storeReview(review: SessionReview): boolean {
+    return storeReview(this.db, review, this.ts());
   }
 
   endSession(agentId: string): void {
@@ -611,6 +660,44 @@ export class MemoryStore {
     }));
   }
 
+  liveRows(): MemoryWithProject[] {
+    return this.db
+      .query<MemoryWithProject, []>(
+        `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
+         WHERE m.deleted_at IS NULL ORDER BY m.id`,
+      )
+      .all();
+  }
+
+  nearDuplicatesOf(row: MemoryRow): Neighbor[] {
+    const vector = this.vectors?.vector(row.id, row.content_hash);
+    if (!vector || !this.vectors) return [];
+    const threshold = this.vectors.spec.duplicateThreshold;
+    return this.vectors
+      .knn(vector, scopeKey(row.scope, row.project_key), 6)
+      .filter((n) => n.id !== row.id && n.similarity >= threshold);
+  }
+
+  dismissedPairs(): Set<string> {
+    const rows = this.db
+      .query<{ low_id: number; high_id: number }, []>(`SELECT low_id, high_id FROM upkeep_dismissed`)
+      .all();
+    return new Set(rows.map((r) => `${r.low_id}:${r.high_id}`));
+  }
+
+  dismissPair(a: number, b: number): void {
+    this.db
+      .query(`INSERT OR IGNORE INTO upkeep_dismissed (low_id, high_id, created_at) VALUES (?, ?, ?)`)
+      .run(Math.min(a, b), Math.max(a, b), this.ts());
+  }
+
+  getMeta(key: string): string | null {
+    return (
+      this.db.query<{ value: string }, [string]>(`SELECT value FROM meta WHERE key = ?`).get(key)?.value ??
+      null
+    );
+  }
+
   private insert(draft: SaveDraft): SaveResult {
     const { input } = draft;
     const ts = this.ts();
@@ -696,7 +783,7 @@ export class MemoryStore {
       .map((r) => r.id);
   }
 
-  private vectorIds(vector: Float32Array, input: SearchInput & { scope: SearchScope }): number[] {
+  private vectorNeighbors(vector: Float32Array, input: SearchInput & { scope: SearchScope }): Neighbor[] {
     const vectors = this.vectors;
     if (!vectors) return [];
     const partitions: string[] = [];
@@ -708,10 +795,7 @@ export class MemoryStore {
     );
     const { min, relative } = vectors.spec.searchFloor;
     const floor = Math.max(min, (near[0]?.similarity ?? 0) * relative);
-    return near
-      .filter((n) => n.similarity >= floor)
-      .slice(0, 20)
-      .map((n) => n.id);
+    return near.filter((n) => n.similarity >= floor).slice(0, 20);
   }
 
   private liveNeighbors(near: Neighbor[], type?: string): Neighbor[] {
@@ -728,7 +812,7 @@ export class MemoryStore {
     return near.filter((n) => live.has(n.id)).sort((a, b) => b.similarity - a.similarity);
   }
 
-  private boostedHits(ranks: Map<number, number>): Candidate[] {
+  private boostedHits(ranks: Map<number, number>, similarities: Map<number, number>): Candidate[] {
     const ids = [...ranks.keys()];
     if (ids.length === 0) return [];
     const rows = this.db
@@ -739,9 +823,10 @@ export class MemoryStore {
       .all(...ids);
     const nowMs = this.now().getTime();
     return rows.map((row) => {
-      const weight = boost(row, nowMs);
+      const weight = boost(row, nowMs, this.config.usageRanking);
+      const score = (ranks.get(row.id) ?? 0) * weight;
       return {
-        hit: memoryHit(row, (ranks.get(row.id) ?? 0) * weight),
+        hit: memoryHit(row, { score, similarity: similarities.get(row.id) ?? null }),
         text: `${row.title}\n${row.content}`,
         weight,
       };
@@ -759,7 +844,11 @@ export class MemoryStore {
         head.map((c) => c.text),
       );
       return head
-        .map((c, i) => ({ ...c.hit, score: (scores[i] ?? 0) * c.weight }))
+        .map((c, i): SearchHit => {
+          const relevance = scores[i] ?? 0;
+          const score = relevance * c.weight;
+          return c.hit.kind === "memory" ? { ...c.hit, score, relevance } : { ...c.hit, score };
+        })
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
     } catch (error) {
@@ -838,7 +927,25 @@ export class MemoryStore {
     return written;
   }
 
-  private setMeta(key: string, value: string): void {
+  private bump(ids: number[], set: string, params: string[]): void {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return;
+    this.db
+      .prepare(
+        `UPDATE memories SET ${set} WHERE deleted_at IS NULL AND id IN (${unique.map(() => "?").join(",")})`,
+      )
+      .run(...params, ...unique);
+  }
+
+  private removed(id: number): { merged_into: number | null; archived_at: string | null } | null {
+    return this.db
+      .query<{ merged_into: number | null; archived_at: string | null }, [number]>(
+        `SELECT merged_into, archived_at FROM memories WHERE id = ?`,
+      )
+      .get(id);
+  }
+
+  setMeta(key: string, value: string): void {
     this.db
       .query(
         `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -902,16 +1009,21 @@ function addRanks(ranks: Map<number, number>, ids: number[]): void {
   for (const [index, id] of ids.entries()) ranks.set(id, (ranks.get(id) ?? 0) + 1 / (RRF_K + index + 1));
 }
 
-function boost(row: MemoryRow, nowMs: number): number {
+function boost(row: MemoryRow, nowMs: number, usageRanking: boolean): number {
   const touched = Math.max(Date.parse(row.updated_at), row.last_used_at ? Date.parse(row.last_used_at) : 0);
   const ageDays = Math.max(0, (nowMs - touched) / 86_400_000);
   const recency = MAX_RECENCY_BOOST / (1 + ageDays / RECENCY_HALF_LIFE_DAYS);
   const usageShare = Math.log2(1 + row.use_count) / Math.log2(1 + FULL_USAGE_BOOST_USES);
   const usage = MAX_USAGE_BOOST * Math.min(1, usageShare);
-  return 1 + PINNED_BOOST * row.pinned + recency + (row.scope === "project" ? PROJECT_BOOST : 0) + usage;
+  const base =
+    1 + PINNED_BOOST * row.pinned + recency + (row.scope === "project" ? PROJECT_BOOST : 0) + usage;
+  return usageRanking ? base * usageFactor({ shown: row.shown_count, opened: row.opened_count }) : base;
 }
 
-function memoryHit(row: MemoryWithProject, score: number): MemoryHit {
+function memoryHit(
+  row: MemoryWithProject,
+  ranking: { score: number; similarity?: number | null },
+): MemoryHit {
   return {
     kind: "memory",
     id: String(row.id),
@@ -924,8 +1036,13 @@ function memoryHit(row: MemoryWithProject, score: number): MemoryHit {
     pinned: row.pinned === 1,
     updatedAt: row.updated_at,
     useCount: row.use_count,
+    shownCount: row.shown_count,
+    openedCount: row.opened_count,
     lastUsedAt: row.last_used_at,
-    score,
+    topicKey: row.topic_key,
+    score: ranking.score,
+    similarity: ranking.similarity ?? null,
+    relevance: null,
   };
 }
 
@@ -945,6 +1062,8 @@ function memoryDetail(row: MemoryWithProject): NonNullable<MemoryDetail["memory"
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     useCount: row.use_count,
+    shownCount: row.shown_count,
+    openedCount: row.opened_count,
     lastUsedAt: row.last_used_at,
     revisionCount: row.revision_count,
   };

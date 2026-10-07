@@ -18,15 +18,18 @@ import {
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
 import { type Caller, createMcpHandler } from "./mcp";
 import { loadReranker, RERANK_MODEL, type Reranker, rerankEnabled } from "./reranker";
+import { ReviewWindows } from "./review";
 import { createRoutes, type Routes } from "./routes";
 import { errorText, FatalError } from "./sqlite";
 import { MemoryStore } from "./store";
 import { createTools, MCP_INSTRUCTIONS } from "./tools";
+import { runUpkeep } from "./upkeep";
 import { SERVICE_VERSION } from "./version";
 
 export { SERVICE_VERSION };
 
 const PRUNE_INTERVAL_MS = 12 * 3_600_000;
+const UPKEEP_INTERVAL_MS = 24 * 3_600_000;
 
 export interface ServiceOptions {
   dataDir: string;
@@ -35,7 +38,6 @@ export interface ServiceOptions {
   rerank?: RerankMode;
   sqlitePath?: string | null;
   modelsDir?: string;
-  contextBudgetChars?: number;
   sessionRetentionDays?: number;
   log?: Logger;
   loadEmbedder?: (tier: EmbeddingTier, modelsDir: string) => Promise<Embedder>;
@@ -78,12 +80,12 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     sqlitePath: options.sqlitePath,
     log,
   });
-  const contextBudget = options.contextBudgetChars ?? 6000;
   const models = initialStates(options);
+  const windows = new ReviewWindows(store);
 
   let mcpUrl = "";
   const status = (): ServiceStatus => serviceStatus(store, models, mcpUrl);
-  const routes = createRoutes({ store, secret, contextBudget, status, mcpUrl: () => mcpUrl });
+  const routes = createRoutes({ store, windows, secret, status, mcpUrl: () => mcpUrl });
   const mcp = createMcpHandler({
     secret,
     instructions: MCP_INSTRUCTIONS,
@@ -91,8 +93,8 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     resolveCaller: (caller) => resolveCaller(store, caller),
     tools: createTools({
       store,
+      windows,
       resolveProject: (caller) => callerProject(store, caller.projectKey),
-      contextBudget: () => contextBudget,
     }),
   });
   const internal = createInternalHandler(routes, serviceKey(secret), log);
@@ -105,6 +107,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
   const modelsLoaded = activateEmbedder({ store, models, options, log }).then(() =>
     activateReranker({ store, models, options, log }),
   );
+  const upkeepTimer = startUpkeep(store, modelsLoaded, log);
 
   return {
     store,
@@ -115,6 +118,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     modelsReady: () => modelsLoaded,
     async stop() {
       clearInterval(pruneTimer);
+      clearInterval(upkeepTimer);
       await server.stop(true);
       await modelsLoaded;
       store.close();
@@ -246,6 +250,20 @@ function startPruning(store: MemoryStore, retentionDays: number, log: Logger): T
   };
   prune();
   return setInterval(prune, PRUNE_INTERVAL_MS);
+}
+
+// Duplicate checks need vectors, so the first run waits for the embedding model.
+function startUpkeep(store: MemoryStore, modelsLoaded: Promise<void>, log: Logger): Timer {
+  const run = () => {
+    try {
+      const result = runUpkeep(store, new Date().toISOString());
+      if (result.merged) log.info(`upkeep merged ${result.merged} duplicate memories`);
+    } catch (error) {
+      log.warn(`upkeep failed: ${errorText(error)}`);
+    }
+  };
+  void modelsLoaded.then(() => store.indexPending()).then(run);
+  return setInterval(run, UPKEEP_INTERVAL_MS);
 }
 
 interface Activation {

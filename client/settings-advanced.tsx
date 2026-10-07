@@ -1,4 +1,3 @@
-import type { PluginTheme } from "@getpaseo/plugin";
 import {
   SettingsAction,
   SettingsCard,
@@ -9,7 +8,8 @@ import {
 import { useState } from "react";
 import { Pressable, Text } from "react-native";
 import type { MemorySettings, MemoryStatus } from "../shared/contracts";
-import type { Save } from "./settings-options";
+import type { Save, SectionProps } from "./settings-options";
+import { SettingsStepper } from "./settings-stepper";
 
 type PathKey = keyof MemoryStatus["paths"];
 type PathSetting = "bunPath" | "sqlitePath" | "servicePath";
@@ -21,6 +21,8 @@ const PATHS: readonly { key: PathKey; setting: PathSetting; label: string }[] = 
   { key: "service", setting: "servicePath", label: "Service directory" },
 ];
 
+const PORT_RANGE = { min: 1024, max: 65535 };
+
 function resolvedText(key: PathKey, status: MemoryStatus | null): string {
   const waiting = "Shown when the service is running";
   if (!status) return waiting;
@@ -30,11 +32,8 @@ function resolvedText(key: PathKey, status: MemoryStatus | null): string {
   return resolvesInsideService && status.service.state !== "running" ? waiting : "Not found";
 }
 
-interface AdvancedProps {
-  values: MemorySettings;
+interface AdvancedProps extends SectionProps {
   status: MemoryStatus | null;
-  save: Save;
-  theme: PluginTheme;
 }
 
 export function AdvancedSection({ values, status, save, theme }: AdvancedProps) {
@@ -45,6 +44,7 @@ export function AdvancedSection({ values, status, save, theme }: AdvancedProps) 
     sqlitePath: values.sqlitePath,
     servicePath: values.servicePath,
   });
+  const [port, setPort] = useState(String(values.mcpPort));
   const toggle = (
     <Pressable
       onPress={() => setOpen(!open)}
@@ -57,9 +57,54 @@ export function AdvancedSection({ values, status, save, theme }: AdvancedProps) 
   return (
     <SettingsSection title="Advanced" trailing={toggle}>
       {open ? (
-        <PathOverrides values={values} status={status} save={save} draft={draft} setDraft={setDraft} />
+        <>
+          <ServiceOptions section={{ values, save, theme }} port={port} setPort={setPort} />
+          <PathOverrides values={values} status={status} save={save} draft={draft} setDraft={setDraft} />
+        </>
       ) : null}
     </SettingsSection>
+  );
+}
+
+interface ServiceOptionsProps {
+  section: SectionProps;
+  port: string;
+  setPort: (port: string) => void;
+}
+
+function parsePort(text: string): number | null {
+  const value = Number(text.trim());
+  return Number.isInteger(value) && value >= PORT_RANGE.min && value <= PORT_RANGE.max ? value : null;
+}
+
+// The port is a draft until applied, because each change restarts the service.
+function ServiceOptions({ section, port, setPort }: ServiceOptionsProps) {
+  const parsed = parsePort(port);
+  return (
+    <SettingsCard>
+      <SettingsStepper
+        setting="sessionRetentionDays"
+        label="Keep session history"
+        hint="Days to keep session summaries and agent activity. Changing this restarts the memory service."
+        {...section}
+      />
+      <SettingsInput
+        label="Memory tools port"
+        hint="The local port agents use to reach the memory tools."
+        error={parsed === null ? `Use a whole number from ${PORT_RANGE.min} to ${PORT_RANGE.max}.` : null}
+        initialValue={port}
+        onChangeText={setPort}
+      />
+      <SettingsAction
+        label="Apply port"
+        hint="Restarts the memory service."
+        actionLabel="Apply"
+        disabled={parsed === null || parsed === section.values.mcpPort}
+        onPress={() => {
+          if (parsed !== null) section.save({ mcpPort: parsed });
+        }}
+      />
+    </SettingsCard>
   );
 }
 

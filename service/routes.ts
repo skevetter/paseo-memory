@@ -10,14 +10,19 @@ import type {
 } from "../shared/service-api";
 import { buildContext, buildSystemPrompt } from "./context";
 import { signCaller } from "./mcp";
+import { redact } from "./redact";
+import { finishReview, type ReviewWindows } from "./review";
 import { errorText } from "./sqlite";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
+import { findTaskMatches, type TaskMatches } from "./task";
+import { clip } from "./text";
+import { lastUpkeepRun, runUpkeep, upkeepPairs } from "./upkeep";
 
 export interface RouteContext {
   store: MemoryStore;
+  windows: ReviewWindows;
   secret: string;
   mcpUrl(): string;
-  contextBudget: number;
   status(): ServiceStatus;
 }
 
@@ -31,6 +36,10 @@ export function createRoutes(ctx: RouteContext): Routes {
     paseoProjectId ? store.projectByPaseoId(paseoProjectId) : null;
   return {
     status: () => ctx.status(),
+    configure: (input) => {
+      store.configure(input);
+      return { ok: true };
+    },
     "agent-context": (input) => agentContext(ctx, input),
     "link-agent": (input) => {
       store.audit.link(input);
@@ -48,11 +57,16 @@ export function createRoutes(ctx: RouteContext): Routes {
     "project-known": (input) => ({ known: store.projectByPaseoId(input.paseoProjectId) !== null }),
     search: async (input) => {
       const project = projectOf(input.paseoProjectId);
-      const hits = input.stale
-        ? store.list({ project, scope: input.scope, limit: input.limit, stale: true })
-        : await store.search({ query: input.query, project, scope: input.scope, limit: input.limit });
+      const hits = await store.search({
+        query: input.query,
+        project,
+        scope: input.scope,
+        limit: input.limit,
+      });
       return { items: hits.map(toItem) };
     },
+    ...reviewRoutes(ctx),
+    ...upkeepRoutes(store, projectOf),
     save: (input) => saveFromUi(store, input),
     update: (input) => updateFromUi(store, input),
     delete: (input) => ({ ok: store.delete(input.id) }),
@@ -69,26 +83,90 @@ export function createRoutes(ctx: RouteContext): Routes {
   };
 }
 
-function agentContext(
+function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-end" | "review-skip"> {
+  const { store, windows } = ctx;
+  return {
+    "review-start": (input) => {
+      const cap = store.config.reviewMaxMemories;
+      const nonce = store.audit.toolNonceFor(input.agentId);
+      if (!nonce) return { ok: false, reason: "This agent has no memory tools.", cap };
+      windows.open({ agentId: input.agentId, nonce, trigger: input.trigger });
+      return { ok: true, reason: null, cap };
+    },
+    "review-end": (input) => finishReview(store, windows, input),
+    "review-skip": (input) => {
+      store.audit.record(store.audit.nonceFor(input.agentId), {
+        kind: "review",
+        trigger: input.trigger,
+        status: "skipped",
+        reason: input.reason,
+        saved: [],
+        updated: [],
+        durationMs: null,
+        summary: null,
+      });
+      return { ok: true };
+    },
+  };
+}
+
+type UpkeepRoutes = "upkeep-list" | "upkeep-run" | "keep" | "archive" | "dismiss-pair";
+
+function upkeepRoutes(
+  store: MemoryStore,
+  projectOf: (paseoProjectId: string | null) => ProjectRef | null,
+): Pick<Routes, UpkeepRoutes> {
+  return {
+    "upkeep-list": (input) => {
+      const project = projectOf(input.paseoProjectId);
+      const stale = store.list({ project, scope: "all", stale: true, limit: 50 });
+      return {
+        mode: store.config.duplicateMerge,
+        staleDays: store.config.staleDays,
+        lastRunAt: lastUpkeepRun(store),
+        ...upkeepPairs(store, project),
+        stale: stale.map(toItem),
+      };
+    },
+    "upkeep-run": () => runUpkeep(store, new Date().toISOString()),
+    keep: (input) => ({ ok: store.keep(input.id) }),
+    archive: (input) => ({ ok: store.archive(input.id) }),
+    "dismiss-pair": (input) => {
+      store.dismissPair(input.a, input.b);
+      return { ok: true };
+    },
+  };
+}
+
+async function agentContext(
   ctx: RouteContext,
   input: ServiceParsedInput<"agent-context">,
-): ServiceOutputs["agent-context"] {
+): Promise<ServiceOutputs["agent-context"]> {
   const { project, provider } = input;
   const { store } = ctx;
   if (project) store.upsertProject(project);
   const nonce = randomBytes(12).toString("base64url");
-  store.audit.open({ nonce, projectKey: project?.key ?? null, provider });
+  store.audit.open({ nonce, projectKey: project?.key ?? null, provider, tools: input.includeTools });
   let systemPrompt: string | null = null;
   if (input.includeContext) {
-    const context = buildContext({ store, project, budgetChars: ctx.contextBudget });
-    systemPrompt = buildSystemPrompt({ context: context.text, project, hasTools: input.includeTools });
-    store.markUsed(context.memoryIds);
+    const task = input.task
+      ? await findTaskMatches({ store, project, task: input.task, budgetMs: input.taskBudgetMs })
+      : null;
+    const context = buildContext({ store, project, task });
+    systemPrompt = buildSystemPrompt({
+      context: context.text,
+      project,
+      hasTools: input.includeTools,
+      extraInstructions: store.config.extraInstructions,
+    });
+    store.markShown(context.memoryIds);
     store.audit.record(nonce, {
       kind: "inject",
       memories: context.memoryIds,
       sessions: context.sessionIds,
       chars: systemPrompt.length,
-      budget: ctx.contextBudget,
+      budget: store.config.contextBudgetChars,
+      task: task && taskAudit(task, context.taskIds),
     });
   }
   const caller = { projectKey: project?.key ?? null, agentId: null, provider, nonce };
@@ -96,6 +174,16 @@ function agentContext(
     ? { url: ctx.mcpUrl(), headers: signCaller(ctx.secret, caller) }
     : null;
   return { systemPrompt, mcpServer, nonce };
+}
+
+function taskAudit(task: TaskMatches, injectedIds: number[]) {
+  const scores = new Map(task.hits.map((h) => [Number(h.id), h.relevance ?? h.similarity ?? h.score]));
+  return {
+    query: clip(redact(task.query), 200),
+    source: task.source,
+    matches: injectedIds.map((id) => ({ id, score: Math.round((scores.get(id) ?? 0) * 1000) / 1000 })),
+    note: task.note,
+  };
 }
 
 async function saveFromUi(
@@ -173,5 +261,8 @@ function toSession(s: SessionRow): SessionItem {
     files: JSON.parse(s.files) as string[],
     updatedAt: s.updated_at,
     endedAt: s.ended_at,
+    summary: s.summary,
+    outcomes: s.outcomes,
+    reviewedAt: s.reviewed_at,
   };
 }

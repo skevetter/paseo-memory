@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { EmbeddingTier } from "../shared/service-api";
+import type { EmbeddingTier, Strictness } from "../shared/service-api";
 
 export type EmbedKind = "document" | "query";
 
@@ -15,6 +15,7 @@ export interface TierSpec {
   documentPrefix: string;
   duplicateThreshold: number;
   searchFloor: { min: number; relative: number };
+  taskFloor: Record<Strictness, number>;
 }
 
 const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
@@ -32,6 +33,7 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     documentPrefix: "",
     duplicateThreshold: 0.92,
     searchFloor: { min: 0.12, relative: 0.5 },
+    taskFloor: { low: 0.15, medium: 0.22, high: 0.32 },
   },
   low: {
     tier: "low",
@@ -44,6 +46,7 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     documentPrefix: "",
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.55, relative: 0.88 },
+    taskFloor: { low: 0.53, medium: 0.57, high: 0.62 },
   },
   medium: {
     tier: "medium",
@@ -56,6 +59,7 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     documentPrefix: "",
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.5, relative: 0.85 },
+    taskFloor: { low: 0.5, medium: 0.56, high: 0.62 },
   },
   high: {
     tier: "high",
@@ -68,6 +72,7 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     documentPrefix: "",
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.5, relative: 0.88 },
+    taskFloor: { low: 0.49, medium: 0.53, high: 0.6 },
   },
 };
 

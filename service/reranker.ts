@@ -1,8 +1,10 @@
 import { mkdirSync } from "node:fs";
-import type { EmbeddingTier, RerankMode } from "../shared/service-api";
+import type { EmbeddingTier, RerankMode, Strictness } from "../shared/service-api";
 
 export const RERANK_MODEL = "Alibaba-NLP/gte-reranker-modernbert-base";
 export const RERANK_CANDIDATES = 30;
+// Re-ranker probabilities a task match must reach; calibrated in tests/embedder.test.ts.
+export const RERANK_TASK_FLOOR: Record<Strictness, number> = { low: 0.2, medium: 0.4, high: 0.65 };
 const MAX_PAIR_TOKENS = 512;
 const MAX_DOC_CHARS = 1500;
 

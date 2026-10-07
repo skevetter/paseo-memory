@@ -22,7 +22,7 @@ Decisions that the code does not explain on its own. Research sources are listed
 - The service writes info lines to stdout and warnings and errors to stderr, each prefixed with `info`, `warn` or `error`, plus one `@@paseo-memory {"event":"ready"|"fatal",...}` line on stdout. The plugin parses each line's level, logs it under its own tag on the matching stream, and keeps its own info lines on stdout too. 1.0 wrote everything to stderr, so Paseo's log view showed normal startup lines as errors.
 - Exit code 78 means a configuration problem (no SQLite build, sqlite-vec failure, bad flags, the port held by another program). The plugin marks the service `fatal` and retries every 60 seconds. Any other exit restarts with exponential backoff from 1 second to 30 seconds; a run longer than 60 seconds resets the backoff. A service that does not report ready in 20 seconds is killed and restarted.
 - The service exits when its stdin closes or its parent pid disappears, so a killed plugin process never leaves a service holding the port.
-- Settings that affect the service (tier, port, budget, retention, paths) restart it. Other settings apply in the plugin immediately.
+- Service restarts are reserved for settings the process is built around: tier, re-rank, port, retention and paths. Starting-memory counts, the budget, task strictness, detail level, extra instructions, the review save cap, duplicate merge mode, the stale window and usage ranking live in the running service. The plugin pushes them through the `configure` route when settings change and again each time the service reports ready, so a restart never runs with stale values.
 
 ## One port, two APIs
 
@@ -66,8 +66,10 @@ Decisions that the code does not explain on its own. Research sources are listed
 ## Usage and quality
 
 - A use is an injection into an agent, a place in the top 5 of an agent's `memory_search`, or a `memory_get`. Searches from the app UI and the attachment picker do not count, so browsing does not inflate the signal.
-- Ranking adds up to 4% for use (full at 31 uses, log scale) next to the existing pinned, recency and project boosts. Recency counts from the later of the last edit and the last use. The injected block ranks unpinned project memories by recency plus half the log of use count.
-- Stale means unpinned and neither edited nor used for 60 days. The panel's Stale filter lists those oldest first, which is where cleanup starts.
+- 1.2 splits use into `shown` and `opened`. Shown counts injections and top-5 search hits. Opened counts a `memory_get` of a memory that the same agent was shown earlier, read from that agent's audit trail. A fetch of an id the user pasted is a use but not an open.
+- Ranking adds up to 4% for use (full at 31 uses, log scale) next to the pinned, recency and project boosts. With usage ranking on, the result is multiplied by up to 1.06 for the open rate (opened divided by shown), and by 0.95 for a memory shown 10 or more times and never opened. The factor applies after RRF in search and to the starting project and global lists. It is small on purpose: it breaks ties between similar matches and never outweighs relevance.
+- Recency counts from the later of the last edit and the last use. The starting block ranks unpinned project memories by recency plus half the log of use count, times the same usage factor.
+- Stale means unpinned and neither edited, used nor kept for the stale window (60 days by default). The Review tab lists those oldest first with Keep, which sets `kept_at`, and Archive, which soft-deletes the memory and sets `archived_at`.
 - A save that is a near duplicate of a memory with the same type in the same partition returns that memory's id as `near_duplicate` and stores nothing. 1.0 returned candidates and left the decision to the agent, which usually retried with `force` and created a second row.
 - The 4,000 character cap is enforced in the store for saves and updates. The tool error tells the agent to save one fact under 800 characters or split it.
 - Turns with a failed outcome, an empty reply or an error banner reply are not digested. 1.0 stored `[System Error]` text and showed it to the next agent as recent work.
@@ -80,10 +82,38 @@ Decisions that the code does not explain on its own. Research sources are listed
 
 ## Capture
 
-- Agents save memories themselves. This matches Engram and keeps memories curated. The plugin runs no LLM.
+- Agents save memories themselves. This matches Engram and keeps memories curated. The plugin runs no LLM of its own.
 - The turn-end hook stores only a session digest: last prompt, last reply, edited file paths. It never stores tool output or reasoning, and it redacts secrets. Digests are pruned after 30 days.
 - The `agent.turn_ended` payload contains the whole timeline. The plugin slices from the last user message and sends only the digest to the service.
 - The tool descriptions and server instructions ask agents to search before saving, save only decisions, root causes, conventions, config and user corrections, prefer `topic_key` upserts, and keep content under about 800 characters.
+
+## Task-aware starting memory
+
+- No plugin hook can change a user message before the agent reads it; `agent.turn_started` carries only the agent and turn id. Starting memory is therefore matched once, at creation. Per-message recall needs harness hooks (Claude Code `UserPromptSubmit`, omp extensions) and is future work.
+- `before("workspace.create")` sees the creation request, including `firstAgentContext.prompt` when a workspace is created with a first agent. The plugin keeps the prompt for 2 minutes with the request's source directory, project id and worktree slug, and returns the request unchanged.
+- The `agent.create` that follows runs in the new workspace's directory, which for a worktree did not exist when the request arrived. Matching tries, in order: the agent's cwd is inside a directory workspace's path; the agent's cwd contains the worktree slug; the request's project id equals the agent's Paseo project, or the request's source directory is the project root. Paths are compared after `realpath`, because macOS reaches temp and home folders through symlinks. A matched prompt is taken once. The CLI's `paseo run --new-workspace` creates the workspace without the prompt, so its agents fall back to names.
+- Without a first prompt, the query is the agent title, the branch (read from `.git/HEAD`, following a worktree's `gitdir` pointer, skipping main, master, develop, dev and trunk) and the folder name, with separators turned into spaces and repeats removed.
+- The query runs through the normal hybrid search for project and global memory. A hit counts as a task match only when every signal it has clears its floor: the re-ranker probability (`RERANK_TASK_FLOOR`) and the cosine similarity (`taskFloor` in `TIERS`). Keyword-only hits pass only when no model is loaded and strictness is low. The floors are calibrated in `tests/embedder.test.ts` on the benchmark corpus: at least 80% of relevant memories clear the medium floor and at least 90% of each query's median unrelated memory stays under it. In the scratch daemon a names query ("Quick chore pm task recall") scored 0.55 on the re-ranker against an unrelated memory; requiring the vector floor as well removed it.
+- The search gets what is left of the 1.8 second hook budget after the project lookup, minus 400 ms for building the block. A slower search is abandoned, the block keeps its general lists, and the audit notes why.
+- "Relevant to this task" comes first, then pinned memories, project memory, recent sessions and global memory. A task match is not listed again further down. The audit `inject` event records the query (redacted, at most 200 characters), its source and the injected matches with scores.
+
+## Background session review
+
+- The agent's own model already has the session in context, so it writes the summary and the memories. The plugin only decides when to ask.
+- The scheduler lives in the plugin process. After a completed turn with a usable reply it counts the turn. With at least 2 counted turns it starts a timer: the idle time in idle mode, or 5 seconds after every N turns in turns mode. `agent.turn_started` cancels the timer; failed and canceled turns schedule nothing; `agent.archived` and `agent.closed` drop the agent. Archive is not a trigger because an archived agent cannot answer. A daemon restart loses pending timers, which only costs one review.
+- When the timer fires the plugin reads the agent snapshot. It skips, with an audit `review` event, an agent that is archived, closed, in error, busy, or waiting on a permission. Providers in `mcpDenyProviders` are never scheduled, and the service declines agents whose injection had no memory tools. Plan mode and read-only agents are reviewed: they can still call `memory_save`.
+- The review is one message through `paseo.agents.ref(id).send()`. The SDK names this `ref`; there is no `agents.get`. The first line is `[paseo-memory:review v1 <display>]`, and the agent is asked to start its reply with `[paseo-memory:review-reply v1 <display>]`, then `Summary:`, `Saved:` and `Updated:` lines or `Nothing to save`.
+- `review-start` opens a window for the agent's nonce. Saves inside it that create or update a row count toward the cap, and the next save past the cap is a tool error. The window closes when the review turn ends, or after 15 minutes.
+- At the end the plugin sends the reply to `review-end`. The saved and updated ids come from the audit trail of the window, not from the reply, which can be wrong. The parsed summary goes to `sessions.summary` and a line per memory to `sessions.outcomes`; both are in `sessions_fts` and in the Recent sessions lines. The audit `review` event holds the trigger, the ids, the duration and the summary, or the skip reason.
+- A user message sent during a review is queued by Paseo. The review is not canceled; the user's turn starts after it and resets the timer like any turn. The review does use a turn and some of the agent's context, which the setting hint says.
+- Visibility: the client registers timeline transformers for user and assistant messages. Collapsed removes the marked prompt and replaces the marked reply with one plugin row ("Memory review: saved #14, updated #9") that expands to the summary. Hidden removes both. Full changes nothing. The mode travels in the marker, because a transformer cannot read settings, so changing the setting affects later reviews only. Assistant text written before the tool calls and the tool calls themselves stay visible, because a transformer sees one item at a time and cannot tell which turn an unmarked item belongs to.
+
+## Upkeep
+
+- Candidate pairs: two live memories of the same type in the same partition whose vectors are at or above the tier's duplicate threshold, or two memories with the same `topic_key` where one is global or both are in the same project. Pairs the user marked "Keep both" are stored in `upkeep_dismissed` and skipped.
+- Contradiction heuristic: each side states a value the other does not. Values are numbers with optional units, versions, `code spans` and quoted strings. "The service port is 6797" and "The service port is 6798" contradict; two restatements with the same numbers are duplicates. Contradictions are listed in the Review tab and never merged automatically.
+- Suggest lists duplicates with a Merge action that uses the 1.1 merge. Automatic merges into the more used memory, or the newer one on a tie. The source keeps its rows and versions, is soft-deleted with `merged_into`, and an audit `merge` event is written under the `upkeep` nonce.
+- The job runs once after the model loads and the indexer catches up, then daily, and on demand from the Review tab.
 
 ## Hook safety
 
@@ -96,7 +126,7 @@ Decisions that the code does not explain on its own. Research sources are listed
 
 ## Deferred
 
-- Optional LLM extractor at turn end (Mem0-style ADD or UPDATE, never DELETE), reviewed before it becomes durable.
+- Per-message recall, which needs a harness hook that sees each user message.
 - Graph entities and relations.
 - JSONL export and import, which also covers cross-host sharing.
 - Per-agent private scope.

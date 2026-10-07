@@ -19,6 +19,15 @@ export interface SessionRow {
   started_at: string;
   updated_at: string;
   ended_at: string | null;
+  summary: string | null;
+  outcomes: string | null;
+  reviewed_at: string | null;
+}
+
+export interface SessionReview {
+  agentId: string;
+  summary: string | null;
+  outcomes: string | null;
 }
 
 export interface TurnInput {
@@ -89,6 +98,15 @@ export function recordTurn(db: Database, input: TurnInput, ts: string): boolean 
   return true;
 }
 
+export function storeReview(db: Database, review: SessionReview, ts: string): boolean {
+  const summary = review.summary ? clip(redact(review.summary), 2000) : null;
+  return (
+    db
+      .query(`UPDATE sessions SET summary = coalesce(?, summary), outcomes = ?, reviewed_at = ? WHERE id = ?`)
+      .run(summary, review.outcomes, ts, review.agentId).changes > 0
+  );
+}
+
 export function listSessions(
   db: Database,
   input: { projectKey: string | null; query: string; limit: number },
@@ -136,7 +154,7 @@ export function searchSessions(
     scope: "project",
     projectKey: row.project_key,
     projectName: row.project_name,
-    preview: clip(row.last_reply ?? row.last_prompt ?? "", 240),
+    preview: clip(row.summary ?? row.last_reply ?? row.last_prompt ?? "", 240),
     pinned: false,
     updatedAt: row.updated_at,
     score: 0.5 / (RRF_K + index + 1),

@@ -1,5 +1,13 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { MemoryPanel } from "./client/memory-panel";
+import { ReviewRow } from "./client/review-row";
+import {
+  REVIEW_ITEM_KIND,
+  REVIEW_ITEM_VERSION,
+  ReviewItemSchema,
+  transformAssistantMessage,
+  transformUserMessage,
+} from "./client/review-timeline";
 import { MemorySettingsScreen } from "./client/settings-screen";
 import { memoryAttachments, saveMemoryRpc } from "./shared/contracts";
 
@@ -19,6 +27,22 @@ export default function contribute(client: PluginClientContext) {
       Component: MemorySettingsScreen,
     }),
     client.addAttachmentSource(memoryAttachments),
+    client.addTimelineTransformer({
+      id: "review-prompt",
+      query: { itemType: "user_message" },
+      transform: ({ item }) => transformUserMessage(item.text),
+    }),
+    client.addTimelineTransformer({
+      id: "review-reply",
+      query: { itemType: "assistant_message" },
+      transform: ({ item, phase }) => transformAssistantMessage(item.text, phase),
+    }),
+    client.addTimelineRenderer({
+      kind: REVIEW_ITEM_KIND,
+      version: REVIEW_ITEM_VERSION,
+      schema: ReviewItemSchema,
+      Component: ReviewRow,
+    }),
     client.addSlashCommand({
       name: "remember",
       description: "Saves a note to this project's memory, or to global memory with the global: prefix.",

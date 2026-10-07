@@ -185,7 +185,6 @@ describe("service launch", () => {
       tier: "low",
       rerank: "off",
       port: 7000,
-      contextBudgetChars: 900,
       sessionRetentionDays: 7,
     };
     expect(serviceArgs(config, { entry: "/p/service/main.ts", dataDir: "/d", parentPid: 42 })).toEqual([
@@ -198,8 +197,6 @@ describe("service launch", () => {
       "low",
       "--rerank",
       "off",
-      "--context-budget",
-      "900",
       "--retention-days",
       "7",
       "--parent-pid",
@@ -209,7 +206,7 @@ describe("service launch", () => {
     ]);
   });
 
-  it("migrates v1 and v2 settings to v3", async () => {
+  it("migrates v1, v2 and v3 settings to v4 with the new defaults", async () => {
     const fromV1 = await memorySettings.migrate?.(
       {
         injectContext: false,
@@ -233,6 +230,29 @@ describe("service launch", () => {
       bunPath: "/b",
       rerank: "auto",
     });
+    const fromV3 = await memorySettings.migrate?.(
+      { contextBudgetChars: 9000, injectContext: false, rerank: "on", mcpPort: 6800 },
+      3,
+    );
+    expect(memorySettings.schema.parse(fromV3)).toEqual({
+      ...memorySettings.schema.parse({}),
+      contextBudgetChars: 9000,
+      injectContext: false,
+      rerank: "on",
+      mcpPort: 6800,
+    });
+    expect(memorySettings.schema.parse(fromV3)).toMatchObject({
+      taskMatches: 5,
+      taskStrictness: "medium",
+      reviewTrigger: "idle",
+      reviewIdleMinutes: 10,
+      reviewDisplay: "collapsed",
+      duplicateMerge: "suggest",
+      staleDays: 60,
+    });
+    const parsed = memorySettings.schema.parse(fromV3);
+    expect(memorySettings.schema.safeParse({ ...parsed, taskMatches: 51 }).success).toBe(false);
+    expect(memorySettings.schema.safeParse({ ...parsed, reviewIdleMinutes: 0 }).success).toBe(false);
   });
 });
 
@@ -256,7 +276,6 @@ describe("supervisor", () => {
       tier: "zero",
       rerank: "off",
       port: 40000 + Math.floor(Math.random() * 20000),
-      contextBudgetChars: 6000,
       sessionRetentionDays: 30,
       ...overrides,
     };

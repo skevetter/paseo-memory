@@ -29,7 +29,6 @@ const { values } = parseArgs({
     rerank: { type: "string", default: "auto" },
     "sqlite-path": { type: "string" },
     "models-dir": { type: "string" },
-    "context-budget": { type: "string", default: "6000" },
     "retention-days": { type: "string", default: "30" },
     "parent-pid": { type: "string" },
   },
@@ -52,7 +51,6 @@ try {
     rerank,
     sqlitePath: values["sqlite-path"] || null,
     modelsDir: values["models-dir"] || undefined,
-    contextBudgetChars: Number(values["context-budget"]),
     sessionRetentionDays: Number(values["retention-days"]),
     log,
   });

@@ -6,6 +6,12 @@ import { formatDateTime, plural, QUERY_ROOT, type Styles } from "./panel-styles"
 import { Chip, QueryState } from "./panel-ui";
 
 type AuditMemory = AuditEvent["memories"][number];
+type InjectedTask = NonNullable<NonNullable<AgentAudit["injected"]>["task"]>;
+
+const TASK_SOURCE_LABELS: Record<InjectedTask["source"], string> = {
+  prompt: "From the first message",
+  names: "From the agent title, branch and folder",
+};
 
 const KIND_LABELS: Record<AuditEvent["kind"], string> = {
   inject: "Start",
@@ -15,6 +21,8 @@ const KIND_LABELS: Record<AuditEvent["kind"], string> = {
   save: "Save",
   update: "Update",
   delete: "Delete",
+  review: "Review",
+  merge: "Merge",
 };
 
 interface AgentTabProps {
@@ -126,10 +134,33 @@ function InjectedSection({ injected, onOpenMemory, s }: InjectedProps) {
               Session: {session.title ?? "untitled"}
             </Text>
           ))}
+          {injected.task ? <TaskMatches task={injected.task} onOpenMemory={onOpenMemory} s={s} /> : null}
         </>
       ) : (
         <Text style={s.muted}>Nothing was injected when this agent started.</Text>
       )}
+    </View>
+  );
+}
+
+interface TaskMatchesProps {
+  task: InjectedTask;
+  onOpenMemory: (id: number) => void;
+  s: Styles;
+}
+
+function TaskMatches({ task, onOpenMemory, s }: TaskMatchesProps) {
+  return (
+    <View style={s.section}>
+      <Text style={s.heading}>Relevant to this task</Text>
+      <Text style={s.text} numberOfLines={3}>
+        “{task.query}”
+      </Text>
+      <Text style={s.muted}>{TASK_SOURCE_LABELS[task.source]}</Text>
+      {task.memories.map((memory) => (
+        <MemoryRef key={memory.id} memory={memory} onOpenMemory={onOpenMemory} s={s} />
+      ))}
+      {task.note ? <Text style={s.muted}>{task.note}</Text> : null}
     </View>
   );
 }
@@ -147,16 +178,33 @@ function EventTimeline({ events, onOpenMemory, s }: TimelineProps) {
       <Text style={s.heading}>Tool calls, newest first</Text>
       {newestFirst.length === 0 ? <Text style={s.muted}>No tool calls yet.</Text> : null}
       {newestFirst.map((event) => (
-        <View key={event.id} style={s.card}>
-          <Text style={s.muted}>
-            {formatDateTime(event.at)} · {KIND_LABELS[event.kind]}
-          </Text>
-          {event.query ? <Text style={s.text}>“{event.query}”</Text> : null}
-          {event.summary ? <Text style={s.muted}>{event.summary}</Text> : null}
-          {event.memories.map((memory) => (
-            <MemoryRef key={memory.id} memory={memory} onOpenMemory={onOpenMemory} s={s} />
-          ))}
-        </View>
+        <EventCard key={event.id} event={event} onOpenMemory={onOpenMemory} s={s} />
+      ))}
+    </View>
+  );
+}
+
+interface EventCardProps {
+  event: AuditEvent;
+  onOpenMemory: (id: number) => void;
+  s: Styles;
+}
+
+function EventCard({ event, onOpenMemory, s }: EventCardProps) {
+  return (
+    <View style={s.card}>
+      <Text style={s.muted}>
+        {formatDateTime(event.at)} · {KIND_LABELS[event.kind]}
+      </Text>
+      {event.query ? <Text style={s.text}>“{event.query}”</Text> : null}
+      {event.summary ? <Text style={s.muted}>{event.summary}</Text> : null}
+      {event.text ? (
+        <Text style={s.text} numberOfLines={6}>
+          {event.text}
+        </Text>
+      ) : null}
+      {event.memories.map((memory) => (
+        <MemoryRef key={memory.id} memory={memory} onOpenMemory={onOpenMemory} s={s} />
       ))}
     </View>
   );

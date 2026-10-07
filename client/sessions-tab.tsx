@@ -70,6 +70,12 @@ function SessionCard({ item, onOpenAgent, s }: SessionCardProps) {
         {title}
       </Text>
       <Text style={s.muted}>{sessionMeta(item)}</Text>
+      {item.summary ? (
+        <Text style={s.text} numberOfLines={4}>
+          Summary: {item.summary}
+        </Text>
+      ) : null}
+      {item.outcomes ? <Text style={s.muted}>{item.outcomes}</Text> : null}
       {item.lastPrompt ? (
         <Text style={s.muted} numberOfLines={3}>
           Request: {item.lastPrompt}
