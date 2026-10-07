@@ -15,7 +15,7 @@ beforeAll(async () => {
     loadEmbedder: async () => hashEmbedder(),
     log: silentLogger,
   });
-  await service.embedderReady();
+  await service.modelsReady();
 });
 afterAll(() => service.stop());
 
@@ -117,7 +117,6 @@ describe("mcp endpoint", () => {
     );
     expect(toolText(found)).toContain("Airflow DAG naming");
 
-    // A token for another project cannot see it.
     const other = signCaller(service.secret, {
       projectKey: "remote:github.com/x/y",
       agentId: null,
@@ -273,7 +272,6 @@ describe("agent audit", () => {
       workspaceId: "ws-1",
       title: "Deploys",
     });
-    // After the link, saves carry the agent id.
     const later = await call(5, "memory_save", {
       title: "Prod runs in eu-west-1",
       content: "Where: infra/prod",

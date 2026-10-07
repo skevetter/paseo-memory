@@ -55,7 +55,6 @@ interface QueryStateProps {
   s: Styles;
 }
 
-// Loading, error and empty lines shared by every list in the panel.
 export function QueryState({ loading, error, empty, emptyText, s }: QueryStateProps) {
   if (loading) return <Text style={s.muted}>Loading…</Text>;
   if (error) return <Text style={s.danger}>{String(error)}</Text>;

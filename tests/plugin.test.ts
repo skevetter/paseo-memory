@@ -237,7 +237,6 @@ describe("service launch", () => {
   });
 });
 
-// Real bun child processes against the service in this checkout.
 describe("supervisor", () => {
   let supervisor: ServiceSupervisor | null = null;
   afterEach(async () => {
@@ -266,8 +265,7 @@ describe("supervisor", () => {
     return { supervisor, ready: supervisor.configure(config) };
   };
 
-  // These tests drive real bun child processes and the supervisor's real restart backoff; process
-  // startup and exit happen outside this process, so there is no in-process signal to await.
+  // Child processes give no in-process signal to await, so poll.
   const waitFor = async (check: () => boolean, ms = 15_000) => {
     const deadline = Date.now() + ms;
     while (!check()) {
@@ -321,7 +319,7 @@ describe("agent.create hook", () => {
       },
       on: () => undefined,
       handle: () => undefined,
-    } as unknown as PluginServerContext; // Only the members contributeServer calls are faked.
+    } as unknown as PluginServerContext; // Fakes only what contributeServer calls.
     const cleanup = contributeServer(server);
     // Project lookup never answers, and the service never starts (no install in config.json).
     const hang = () => new Promise(() => undefined);

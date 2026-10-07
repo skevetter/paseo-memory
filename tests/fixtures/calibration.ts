@@ -1,8 +1,5 @@
-// Calibration fixture for per-tier duplicate thresholds and search floors.
 // Each memory is "title\ncontent", the same text the store embeds.
-
 export const CALIBRATION = {
-  // Restatements of the same fact: must reach the tier's duplicate threshold.
   duplicates: [
     [
       "Picked Postgres for the warehouse\nWhy: joins and JSONB",
@@ -17,7 +14,6 @@ export const CALIBRATION = {
       "Airflow DAG ids use snake_case\nWhat: DAG ids are snake_case names",
     ],
   ],
-  // Same project and topic area, different facts: must stay below the duplicate threshold.
   distinct: [
     [
       "Picked Postgres for the warehouse\nWhy: joins and JSONB",
@@ -72,7 +68,6 @@ export interface BenchQuery {
   kind: "paraphrase" | "no-overlap" | "near-miss";
 }
 
-// Harder retrieval benchmark: near-miss distractor clusters plus paraphrase and zero-overlap queries.
 export const BENCHMARK: { corpus: readonly BenchMemory[]; queries: readonly BenchQuery[] } = {
   corpus: [
     {

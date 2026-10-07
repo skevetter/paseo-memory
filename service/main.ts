@@ -1,9 +1,3 @@
-// Entry point: bun service/main.ts --data-dir <dir> --port <port> [--tier zero|low|medium|high]
-//   [--rerank auto|on|off] [--sqlite-path <dylib>] [--models-dir <dir>] [--context-budget <chars>]
-//   [--retention-days <n>] [--parent-pid <pid>]
-// Info lines go to stdout and warnings and errors to stderr, each prefixed with its level. One
-// SERVICE_EVENT_PREFIX line on stdout reports ready or fatal.
-
 import { parseArgs } from "node:util";
 import { createLogger } from "../shared/log";
 import {
@@ -92,8 +86,7 @@ async function shutdown(reason: string): Promise<void> {
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
 
-// Under a supervisor (--parent-pid), exit when it goes away instead of orphaning the port:
-// stdin EOF reports a clean exit at once, the pid poll covers a SIGKILLed parent.
+// stdin EOF catches a supervisor that exits cleanly; the pid poll catches one that was SIGKILLed.
 const parentPid = Number(values["parent-pid"] ?? 0);
 if (parentPid > 0) {
   process.stdin.on("end", () => void shutdown("supervisor closed stdin"));

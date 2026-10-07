@@ -1,7 +1,3 @@
-// The memory digest injected into new agents' system prompts and returned by memory_context.
-// Order favors pinned memories, then the project's most used and recent memories, then recent
-// sessions, then global memory. Lines never cut a title, and text ends at a word boundary.
-
 import type { MemoryHit, MemoryStore, ProjectRef, SessionRow } from "./store";
 import { age, clipWords } from "./text";
 
@@ -14,12 +10,10 @@ export interface ContextInput {
 
 export interface ContextResult {
   text: string;
-  // What made it into the block, for usage counters and the audit log.
   memoryIds: number[];
   sessionIds: string[];
 }
 
-// Appends lines until the character budget is spent; push returns false once a line no longer fits.
 class Budget {
   readonly lines: string[] = [];
   readonly memoryIds: number[] = [];
@@ -38,7 +32,6 @@ class Budget {
     return true;
   }
 
-  // The heading is written only when at least its first item fits after it.
   section<T>(
     heading: string,
     items: readonly T[],
@@ -94,7 +87,6 @@ export function buildContext(input: ContextInput): ContextResult {
   };
 }
 
-// Unpinned memories ranked by use and by how recently they were edited or used.
 function byRelevance(hits: MemoryHit[], limit: number): MemoryHit[] {
   const nowMs = Date.now();
   const rank = (m: MemoryHit) => {

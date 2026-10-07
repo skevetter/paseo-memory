@@ -50,8 +50,6 @@ export const memorySettings = defineSettings({
   scope: "host",
   version: 3,
   schema: settingsSchema,
-  // v1 had embeddings (model2vec | off), duplicateThreshold and sqliteVecPath; v2 replaced them
-  // with embeddingTier. v3 adds rerank, which takes its default.
   migrate(values) {
     const {
       embeddings: _e,
@@ -155,7 +153,6 @@ export const workspaceAgentsRpc = defineRpc({
 export const ServiceStateSchema = z.enum(["starting", "running", "restarting", "fatal", "stopped"]);
 
 const PathInfoSchema = z.object({
-  // The path in use, or null when it could not be resolved.
   value: z.string().nullable(),
   source: z.enum(["override", "detected"]),
 });
@@ -166,7 +163,6 @@ export const statusRpc = defineRpc({
   output: z.object({
     service: z.object({
       state: ServiceStateSchema,
-      // Human-readable cause for fatal and restarting states (missing bun, sqlite-vec failure, ...).
       detail: z.string().nullable(),
       bunPath: z.string().nullable(),
       bunVersion: z.string().nullable(),
@@ -176,7 +172,6 @@ export const statusRpc = defineRpc({
       restarts: z.number(),
     }),
     paths: z.object({ bun: PathInfoSchema, sqlite: PathInfoSchema, service: PathInfoSchema }),
-    // Null until the service reports ready.
     live: z
       .object({
         version: z.string(),

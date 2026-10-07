@@ -1,16 +1,11 @@
-// Internal HTTP API between the plugin process (supervisor and proxy) and the Bun memory service.
-// Every route is POST /v1/<name> with a JSON body on 127.0.0.1, authenticated by the
-// SERVICE_KEY_HEADER header. Both sides derive the key from the shared secret file.
-
 import { z } from "zod";
 
 export const SERVICE_KEY_HEADER = "x-paseo-memory-key";
 export const SERVICE_KEY_LABEL = "paseo-memory/internal-api/v1";
 export const SERVICE_EVENT_PREFIX = "@@paseo-memory ";
 export const FATAL_EXIT_CODE = 78;
-// Environment variable the create hook sets so agent.session_open can link the caller nonce.
 export const NONCE_ENV = "PASEO_MEMORY_NONCE";
-// Hard cap on memory content. Agents are asked to stay under about 800 characters.
+// Hard cap; the agent instructions ask for about 800 characters.
 export const MAX_CONTENT_CHARS = 4000;
 
 export const EMBEDDING_TIERS = ["zero", "low", "medium", "high"] as const;
@@ -115,8 +110,6 @@ export type ServiceRoute = keyof typeof serviceInputs;
 export type ServiceInput<R extends ServiceRoute> = z.input<(typeof serviceInputs)[R]>;
 export type ServiceParsedInput<R extends ServiceRoute> = z.output<(typeof serviceInputs)[R]>;
 
-// ---------- output views shared with the plugin RPCs ----------
-
 export const MemoryItemSchema = z.object({
   kind: z.enum(["memory", "session"]),
   id: z.string(),
@@ -153,7 +146,6 @@ export const MemoryDetailSchema = z.object({
       revisionCount: z.number(),
     })
     .nullable(),
-  // Set when the requested memory was merged into another one.
   mergedInto: z.number().nullable(),
   versions: z.array(
     z.object({ version: z.number(), title: z.string(), content: z.string(), createdAt: z.string() }),
@@ -178,7 +170,7 @@ export type SessionItem = z.infer<typeof SessionItemSchema>;
 export const AUDIT_KINDS = ["inject", "context", "search", "get", "save", "update", "delete"] as const;
 export type AuditKind = (typeof AUDIT_KINDS)[number];
 
-// A memory an audit event touched. The title is read at view time; null means it was deleted.
+// The title is read at view time; null means the memory was deleted.
 const AuditMemorySchema = z.object({
   id: z.number(),
   title: z.string().nullable(),
@@ -273,7 +265,6 @@ export interface ServiceOutputs {
   "agent-context": {
     systemPrompt: string | null;
     mcpServer: { url: string; headers: Record<string, string> } | null;
-    // Links this agent's tool calls to its Paseo agent id once agent.session_open reports it.
     nonce: string | null;
   };
   "link-agent": { ok: boolean };
@@ -304,7 +295,6 @@ export interface ServiceOutputs {
   };
 }
 
-// One JSON line on the service's stdout, prefixed with SERVICE_EVENT_PREFIX, reports startup.
 export type ServiceEvent =
   | { event: "ready"; port: number; status: ServiceStatus }
   | { event: "fatal"; error: string };

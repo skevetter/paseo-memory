@@ -1,8 +1,3 @@
-// Minimal MCP endpoint (Streamable HTTP transport, JSON responses only) served by the memory
-// service on 127.0.0.1. Each injected agent carries an HMAC token bound to its project key and a
-// random nonce, so the service knows which project memory to use and which agent made each call,
-// and the token survives service restarts.
-
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { SERVICE_VERSION } from "./version";
 
@@ -17,7 +12,6 @@ export interface Caller {
   projectKey: string | null;
   agentId: string | null;
   provider: string | null;
-  // Random per agent.create; agent_links maps it to the Paseo agent id.
   nonce: string | null;
 }
 
@@ -27,7 +21,6 @@ export interface McpOptions {
   tools: ToolDefinition[];
   serverName?: string;
   serverVersion?: string;
-  // Fills in what the token cannot know at signing time, such as the agent id behind a nonce.
   resolveCaller?: (caller: Caller) => Caller;
 }
 
@@ -55,6 +48,7 @@ export function verifyCaller(secret: string, header: string | null | undefined):
   if (!payload || !sig) return null;
   const expected = createHmac("sha256", secret).update(payload).digest();
   const given = Buffer.from(sig, "base64url");
+  // Constant-time compare so response timing does not leak the signature.
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   return parseCaller(payload);
 }
@@ -126,7 +120,6 @@ async function callTool(tools: ToolDefinition[], message: JsonRpcRequest, caller
   }
 }
 
-// Status responses for requests that never reach JSON-RPC dispatch.
 function preflight(req: Request, secret: string): Response | Caller {
   // Reject browser-originated requests (DNS rebinding, drive-by) outright.
   if (req.headers.get("origin")) return Response.json({ error: "origin not allowed" }, { status: 403 });
@@ -149,7 +142,7 @@ function parseBody(body: string): JsonRpcRequest | JsonRpcRequest[] | Response {
   }
 }
 
-// Notifications get no response, except that v0.1 answered every known non-ping method.
+// Notifications get no response, except known non-ping methods, which keep the original wire behavior.
 function dispatch(
   methods: Record<string, MethodHandler>,
   message: JsonRpcRequest,
@@ -186,7 +179,6 @@ function respond(message: JsonRpcRequest | JsonRpcRequest[], responses: unknown[
   return Response.json(Array.isArray(message) ? responses : responses[0], { headers });
 }
 
-// Handles requests to /mcp. Routing and listening belong to the service's HTTP server.
 export function createMcpHandler(options: McpOptions): (req: Request) => Promise<Response> {
   const methods = methodTable(options);
   return async (req) => {

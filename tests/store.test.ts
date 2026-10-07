@@ -20,7 +20,6 @@ afterEach(() => store.close());
 
 const titles = (hits: { title: string }[]) => hits.map((h) => h.title);
 
-// Every text maps to one of two orthogonal vectors, chosen by `pick`.
 function switchEmbedder(model: string, pick: (text: string) => boolean): Embedder {
   return {
     spec: hashSpec(model, 4),
@@ -165,7 +164,6 @@ describe("dedupe and versions", () => {
       similarity: 1,
     });
     expect(store.stats().memories).toBe(1);
-    // Another type in the same partition is listed for the agent to decide instead.
     expect(
       await store.save({ ...base, type: "gotcha", title: "Postgres gotcha", content: "vacuum" }),
     ).toEqual({
@@ -179,7 +177,6 @@ describe("dedupe and versions", () => {
     expect((await store.save({ ...base, title: "Other", content: "x", topicKey: "db/engine" })).status).toBe(
       "created",
     );
-    // Another project's identical vector is in another partition and is not a duplicate.
     expect(
       (await store.save({ ...base, project: otherRepo, title: "Picked Postgres", content: "joins" })).status,
     ).toBe("created");
@@ -272,7 +269,6 @@ describe("embedding tiers in the store", () => {
       { model: "test/small", dims: 32, count: 3 },
     ]);
 
-    // Switching back reuses the kept vectors; an edit drops every model's stale vector.
     const callsBefore = big.calls;
     store.setEmbedder(big);
     await store.indexPending();
@@ -426,7 +422,6 @@ describe("sessions and context", () => {
     const ctx = buildContext({ store, project: dataRepo, budgetChars: 600 });
     expect(ctx.text.length).toBeLessThanOrEqual(600);
     expect(ctx.memoryIds.length).toBeGreaterThan(0);
-    // Every listed id is in the block, and no line is cut short.
     for (const id of ctx.memoryIds) expect(ctx.text).toContain(`#${id} [note] Memory number`);
     for (const line of ctx.text.split("\n").filter((l) => l.startsWith("- "))) {
       expect(line).toMatch(/about things \(just now\): x+$/);
@@ -596,7 +591,6 @@ describe("re-ranking", () => {
     });
     const reranked = titles(await store.search({ query: "deploy", project: null, limit: 2 }));
     expect(reranked).toEqual(["Deploy freeze dates", "Deploy rollback steps"]);
-    // All three candidates were scored even though only two were returned.
     expect(seen[0]).toHaveLength(3);
     store.setReranker(null);
     expect(titles(await store.search({ query: "deploy", project: null }))).toEqual(fused);

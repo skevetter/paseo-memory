@@ -1,6 +1,3 @@
-// The memory service: one SQLite store, the agents' MCP endpoint, and the plugin's internal API,
-// served by one Bun HTTP server on 127.0.0.1.
-
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -41,7 +38,6 @@ export interface ServiceOptions {
   contextBudgetChars?: number;
   sessionRetentionDays?: number;
   log?: Logger;
-  // Test seams: tests inject preloaded models instead of downloading them.
   loadEmbedder?: (tier: EmbeddingTier, modelsDir: string) => Promise<Embedder>;
   loadReranker?: (modelsDir: string) => Promise<Reranker>;
 }
@@ -52,8 +48,7 @@ export interface RunningService {
   mcpUrl: string;
   secret: string;
   status(): ServiceStatus;
-  // Resolves when the embedder and the re-ranker have loaded or failed.
-  embedderReady(): Promise<void>;
+  modelsReady(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -106,7 +101,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
   mcpUrl = `http://127.0.0.1:${port}/mcp`;
 
   const pruneTimer = startPruning(store, options.sessionRetentionDays ?? 30, log);
-  // Models load after the server is listening; keyword search serves requests meanwhile.
+  // Models load after the server is listening so keyword search serves requests meanwhile.
   const modelsLoaded = activateEmbedder({ store, models, options, log }).then(() =>
     activateReranker({ store, models, options, log }),
   );
@@ -117,7 +112,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     mcpUrl,
     secret,
     status,
-    embedderReady: () => modelsLoaded,
+    modelsReady: () => modelsLoaded,
     async stop() {
       clearInterval(pruneTimer);
       await server.stop(true);
@@ -160,7 +155,6 @@ function serviceStatus(store: MemoryStore, models: ModelStates, mcpUrl: string):
   };
 }
 
-// MCP callers carry only a project key; names come from the projects table when known.
 function callerProject(store: MemoryStore, projectKey: string | null): ProjectRef | null {
   if (!projectKey) return null;
   return (
@@ -173,7 +167,6 @@ function callerProject(store: MemoryStore, projectKey: string | null): ProjectRe
   );
 }
 
-// Tokens are signed before Paseo assigns the agent id; the nonce link supplies it afterwards.
 function resolveCaller(store: MemoryStore, caller: Caller): Caller {
   if (caller.agentId || !caller.nonce) return caller;
   return { ...caller, agentId: store.audit.agentFor(caller.nonce) };
@@ -206,7 +199,6 @@ function serve(port: number, handlers: { mcp: Handler; internal: Handler; log: L
   }
 }
 
-// POST /v1/<route>: loopback only, no browser origins, and the HMAC key derived from the secret.
 function createInternalHandler(routes: Routes, key: string, log: Logger): Handler {
   const expected = Buffer.from(key);
   return async (req) => {
@@ -228,8 +220,10 @@ function createInternalHandler(routes: Routes, key: string, log: Logger): Handle
 }
 
 function rejectInternal(req: Request, expected: Buffer): Response | null {
+  // Browser-originated requests are rejected outright (DNS rebinding, drive-by).
   if (req.headers.get("origin")) return Response.json({ error: "origin not allowed" }, { status: 403 });
   const given = Buffer.from(req.headers.get(SERVICE_KEY_HEADER) ?? "");
+  // Constant-time compare so response timing does not leak the key.
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
@@ -280,7 +274,6 @@ function activateEmbedder({ store, models, options, log }: Activation): Promise<
   );
 }
 
-// A re-ranker that fails to load leaves search in fused order.
 function activateReranker({ store, models, options, log }: Activation): Promise<void> {
   const { reranker } = models;
   if (!reranker.enabled) return Promise.resolve();

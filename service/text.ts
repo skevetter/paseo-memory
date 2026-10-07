@@ -1,5 +1,3 @@
-// Text helpers shared by the store, session digests and the tool surface.
-
 import { createHash } from "node:crypto";
 
 const STOPWORDS = new Set(
@@ -8,7 +6,6 @@ const STOPWORDS = new Set(
   ),
 );
 
-// FTS5 query: quoted, deduplicated tokens joined by OR, stopwords dropped.
 export function ftsQuery(text: string): string | null {
   const tokens = text
     .toLowerCase()
@@ -27,7 +24,6 @@ export function clip(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-// Like clip, but ends at a word boundary so no word is cut in half.
 export function clipWords(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
@@ -40,7 +36,7 @@ export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-// Reciprocal rank fusion constant: a hit at rank r contributes 1 / (RRF_K + r).
+// RRF k=60, from Cormack, Clarke and Buettcher (SIGIR 2009).
 export const RRF_K = 60;
 
 export function age(iso: string): string {

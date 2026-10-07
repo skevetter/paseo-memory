@@ -1,8 +1,3 @@
-// Plugin server: a thin supervisor and proxy. The Bun memory service owns storage, embeddings and
-// the agents' MCP endpoint; this process resolves Paseo projects, injects context and the MCP
-// server into new agents, links agents to their audit trail, records turn digests, and forwards
-// UI RPCs over loopback HTTP.
-
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
@@ -46,7 +41,6 @@ const RPC_TIMEOUT_MS = 5000;
 type AgentCreateRequest = PluginBeforeRequests["agent.create"];
 type HookAgent = PluginLifecycleEvents["agent.created"]["agent"];
 
-// Resolves to `fallback` when `promise` is not settled within `ms`; the timer never outlives it.
 async function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
   const expired = Promise.withResolvers<T>();
   const timer = setTimeout(() => expired.resolve(fallback()), ms);
@@ -124,8 +118,6 @@ export function contributeServer(server: PluginServerContext): () => Promise<voi
   };
 }
 
-// ---------- lifecycle hooks ----------
-
 function registerHooks(server: PluginServerContext, state: PluginState): void {
   server.before("agent.create", async ({ request }, { paseo }) => {
     try {
@@ -139,7 +131,6 @@ function registerHooks(server: PluginServerContext, state: PluginState): void {
     }
   });
 
-  // The create hook's environment reaches this hook together with the new agent id.
   server.before("agent.session_open", ({ request }) => {
     const nonce = request.reason === "create" ? request.env[NONCE_ENV] : undefined;
     if (!nonce) return;
@@ -264,8 +255,6 @@ function withInjection(
   const env = injected.nonce ? { ...request.env, [NONCE_ENV]: injected.nonce } : request.env;
   return { ...request, config: next, ...(env ? { env } : {}) };
 }
-
-// ---------- RPCs for the app UI ----------
 
 async function projectForSave(
   paseo: PaseoApi,

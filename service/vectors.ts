@@ -1,7 +1,3 @@
-// sqlite-vec storage: one vec0 table per embedding model and dimension count, partitioned by
-// scope ('global' or 'project:<hash>'), with cosine distance. memory_embeddings records which
-// model embedded which content hash, so stale and missing vectors are found by query.
-
 import type { Database } from "bun:sqlite";
 import type { TierSpec } from "./embedder";
 import { sha256 } from "./text";
@@ -24,7 +20,6 @@ export function vecTableName(model: string, dims: number): string {
     .replace(/^_|_$/g, "")}_${dims}`;
 }
 
-// vec0 partition value: 'global', or 'project:' plus a short hash of the project key.
 export function scopeKey(scope: "global" | "project", projectKey: string | null): string {
   return scope === "global" ? "global" : `project:${sha256(projectKey ?? "").slice(0, 16)}`;
 }
@@ -68,7 +63,6 @@ export class VectorIndex {
       .run(target.id, this.spec.model, vector.length, target.hash, this.now());
   }
 
-  // KNN inside one scope partition. vec0 cosine distance is 1 - cosine similarity.
   knn(vector: Float32Array, partition: string, k: number): Neighbor[] {
     return this.db
       .query<{ memory_id: number; distance: number }, [Uint8Array, number, string]>(
@@ -78,7 +72,6 @@ export class VectorIndex {
       .map((r) => ({ id: Number(r.memory_id), similarity: 1 - r.distance }));
   }
 
-  // The stored vector for a memory, when it matches the memory's current content.
   vector(id: number, hash: string): Float32Array | null {
     const current = this.db
       .query(`SELECT 1 FROM memory_embeddings WHERE memory_id = ? AND model = ? AND content_hash = ?`)
@@ -93,7 +86,6 @@ export class VectorIndex {
   }
 }
 
-// Removes a memory's vectors from every model's table, not only the active one.
 export function dropVectors(db: Database, id: number): void {
   for (const { table_name } of vecTables(db)) {
     db.query(`DELETE FROM ${table_name} WHERE memory_id = ?`).run(BigInt(id));

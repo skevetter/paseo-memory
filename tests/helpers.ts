@@ -1,6 +1,3 @@
-// Shared fixtures: two projects, temp directories, and a deterministic embedder that needs no
-// model files (hashed bag of words), so vector paths run in every test environment.
-
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,7 +38,6 @@ export function hashSpec(model: string, dims: number): TierSpec {
   };
 }
 
-// Each lowercase word adds 1 to a hashed dimension; vectors are L2-normalized.
 export function hashEmbedder(model = "test/hash", dims = 64): Embedder & { calls: number } {
   const embedder = {
     spec: hashSpec(model, dims),

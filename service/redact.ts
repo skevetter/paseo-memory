@@ -1,5 +1,3 @@
-// Strip content the user marked private and mask common secret shapes before anything is stored.
-
 const PATTERNS: readonly [RegExp, string][] = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]"],
   [/\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY_ID]"],

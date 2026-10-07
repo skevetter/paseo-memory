@@ -1,6 +1,3 @@
-// MCP tool surface exposed to agents. Tool names and argument schemas match v0.1. Every call
-// is recorded in the audit log under the caller's nonce.
-
 import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
 import { buildContext } from "./context";
 import type { Caller, ToolDefinition } from "./mcp";

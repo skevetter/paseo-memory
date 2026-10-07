@@ -1,5 +1,3 @@
-// Maps an agent's cwd or workspace to its Paseo project and the stable project key memory uses.
-
 import { resolve, sep } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { ProjectRef } from "../shared/service-api";
@@ -30,7 +28,6 @@ export function projectFromDescriptor(d: ProjectDescriptor): ProjectRef {
   };
 }
 
-// The innermost registered workspace directory that contains cwd.
 export function workspaceForCwd<W extends WorkspaceEntry>(entries: readonly W[], cwd: string): W | undefined {
   const target = resolve(cwd);
   return entries

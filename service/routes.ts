@@ -1,5 +1,3 @@
-// Internal API routes for the plugin process. Inputs arrive validated by serviceInputs.
-
 import { randomBytes } from "node:crypto";
 import type {
   MemoryItem,
@@ -72,7 +70,6 @@ export function createRoutes(ctx: RouteContext): Routes {
   };
 }
 
-// Mints the agent's nonce, records what was injected, and signs the token that carries the nonce.
 function agentContext(
   ctx: RouteContext,
   input: ServiceParsedInput<"agent-context">,

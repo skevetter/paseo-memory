@@ -1,6 +1,3 @@
-// Leveled logging for the service. Info lines go to stdout and warnings and errors to stderr,
-// each prefixed with its level, so Paseo's plugin log shows normal startup lines on stdout.
-
 export interface Logger {
   info(message: string): void;
   warn(message: string): void;
@@ -29,7 +26,6 @@ export const silentLogger: Logger = {
 
 const LINE = /^(info|warn|error) (?:\[[\w-]+\] )?(.*)$/s;
 
-// Splits a line written by formatLine into its level and message; other lines get `fallback`.
 export function parseLine(line: string, fallback: LogLevel): { level: LogLevel; message: string } {
   const match = LINE.exec(line);
   const level = match?.[1];

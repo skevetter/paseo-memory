@@ -1,6 +1,3 @@
-// SQLite bootstrap for the service: pick a SQLite build that can load extensions, open the
-// database, and load sqlite-vec. sqlite-vec is required; any failure here is fatal.
-
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -13,8 +10,7 @@ export const MAC_SQLITE_CANDIDATES = [
 
 export class FatalError extends Error {}
 
-// Apple's system SQLite is built without extension loading, so macOS needs a vanilla build.
-// Linux Bun ships a SQLite that loads extensions, so nothing is swapped there.
+// Apple's system SQLite cannot load extensions; Linux Bun's can, so only macOS swaps the library.
 export function resolveSqliteLibrary(
   setting: string | null,
   platform: NodeJS.Platform = process.platform,

@@ -1,12 +1,3 @@
-// Locate the two things the supervisor launches: a bun binary and the service entry point.
-//
-// The plugin bundle runs through eval, so it has no __dirname or import.meta.url and cannot see
-// its own directory. Paseo records every installed plugin's directory (directory, Git and npm
-// sources alike) as plugins.<id>.path in $PASEO_HOME/config.json, so the default service path
-// is <that directory>/service/main.ts for the entry whose paseo-plugin.json id is paseo-memory.
-// Running the service from the plugin directory keeps its node_modules (sqlite-vec,
-// transformers.js, onnxruntime-node) resolvable without copying native files anywhere.
-
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -30,7 +21,6 @@ export const realLocateEnv: LocateEnv = {
 
 export class LocateError extends Error {}
 
-// Setting first, then PATH, then the Homebrew and bun.sh install locations.
 export function findBun(setting: string, sys: LocateEnv = realLocateEnv): string {
   if (setting) {
     if (!sys.exists(setting)) throw new LocateError(`bun override ${setting} does not exist.`);
@@ -52,7 +42,7 @@ export interface ServiceLocation {
   source: string;
 }
 
-// servicePath may name the plugin directory or the entry file itself.
+// The plugin bundle runs through eval with no __dirname, so the default path comes from config.json.
 export function resolveServicePath(
   setting: string,
   paseoHome: string,
@@ -60,7 +50,6 @@ export function resolveServicePath(
 ): ServiceLocation {
   if (setting) return locationFromSetting(setting, sys);
   const matches = installedPluginDirs(paseoHome, sys).filter((p) => isMemoryPluginDir(p.dir, sys));
-  // Prefer the entry installed under the manifest id, then any other enabled install.
   const best = matches.find((p) => p.id === PLUGIN_ID) ?? matches[0];
   if (!best) {
     throw new LocateError(
@@ -112,7 +101,6 @@ function isMemoryPluginDir(dir: string, sys: LocateEnv): boolean {
   }
 }
 
-// Narrows parsed JSON to a plain object.
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value))

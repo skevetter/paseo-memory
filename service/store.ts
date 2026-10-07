@@ -1,7 +1,3 @@
-// Single-file SQLite memory store: memories (global and project scope), versions, session
-// digests, FTS5 keyword search, sqlite-vec KNN per embedding model, reciprocal rank fusion, an
-// optional cross-encoder re-ranker, usage counters and the per-agent audit log.
-
 import type { Database } from "bun:sqlite";
 import { type Logger, silentLogger } from "../shared/log";
 import {
@@ -31,10 +27,14 @@ export type { ProjectRef, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
 export type Scope = "global" | "project";
 
-// Memories nobody used or edited for this long show up in the stale list.
 export const STALE_DAYS = 60;
-// Search results this high up count as a use when an agent searches.
 const USED_TOP_N = 5;
+const PINNED_BOOST = 0.1;
+const PROJECT_BOOST = 0.05;
+const MAX_RECENCY_BOOST = 0.06;
+const RECENCY_HALF_LIFE_DAYS = 30;
+const MAX_USAGE_BOOST = 0.04;
+const FULL_USAGE_BOOST_USES = 31;
 
 export class ContentTooLongError extends Error {
   constructor(length: number) {
@@ -90,7 +90,6 @@ export interface SaveInput {
 
 export type SaveResult =
   | { status: "created" | "updated" | "duplicate"; id: number }
-  // Same type and scope as an existing memory and close enough to restate it; nothing was saved.
   | { status: "near_duplicate"; id: number; title: string; similarity: number }
   | {
       status: "possible_duplicate";
@@ -123,7 +122,6 @@ export interface SearchInput {
   type?: string;
   limit?: number;
   includeSessions?: boolean;
-  // Agent searches count their top results as uses; UI browsing does not.
   track?: boolean;
 }
 
@@ -133,12 +131,10 @@ export interface MemoryPatch {
   type?: string;
   pinned?: boolean;
   topicKey?: string | null;
-  // Moving to project scope needs the project.
   scope?: Scope;
   project?: ProjectRef | null;
 }
 
-// A ranked hit plus the text the re-ranker reads and the boost it keeps after re-ranking.
 interface Candidate {
   hit: SearchHit;
   text: string;
@@ -152,7 +148,6 @@ export interface StoreOptions {
   log?: Logger;
 }
 
-// A save after redaction, with its resolved scope, content hash and (optional) vector.
 interface SaveDraft {
   input: SaveInput;
   title: string;
@@ -212,8 +207,6 @@ export class MemoryStore {
     return this.embedder?.spec ?? null;
   }
 
-  // Activates a model: creates its vec0 table and embeds, in the background, every memory that
-  // has no current vector for it. Keyword search keeps working while that runs.
   setEmbedder(embedder: Embedder | null): void {
     this.embedder = embedder;
     this.vectors = embedder ? new VectorIndex(this.db, embedder.spec, () => this.ts()) : null;
@@ -223,12 +216,9 @@ export class MemoryStore {
     this.scheduleIndex();
   }
 
-  // Null keeps the fused order.
   setReranker(reranker: Reranker | null): void {
     this.reranker = reranker;
   }
-
-  // ---------- projects ----------
 
   upsertProject(project: ProjectRef): void {
     const ts = this.ts();
@@ -267,8 +257,6 @@ export class MemoryStore {
     return row ? { key, name: row.name, rootPath: row.root_path, paseoProjectId: null } : null;
   }
 
-  // ---------- memories ----------
-
   async save(input: SaveInput): Promise<SaveResult> {
     if (input.content.length > MAX_CONTENT_CHARS) throw new ContentTooLongError(input.content.length);
     const title = redact(input.title).trim().slice(0, 200);
@@ -300,7 +288,6 @@ export class MemoryStore {
       .all(...ids);
   }
 
-  // Injected into an agent, in an agent's top search results, or fetched by an agent.
   markUsed(ids: number[]): void {
     const unique = [...new Set(ids)];
     if (unique.length === 0) return;
@@ -312,7 +299,6 @@ export class MemoryStore {
       .run(this.ts(), ...unique);
   }
 
-  // The memory a deleted id was merged into, if any.
   mergedInto(id: number): number | null {
     return (
       this.db
@@ -321,7 +307,6 @@ export class MemoryStore {
     );
   }
 
-  // Text and scope changes drop the memory's vectors; the background indexer embeds it again.
   update(id: number, patch: MemoryPatch): boolean {
     if (patch.content !== undefined && patch.content.length > MAX_CONTENT_CHARS) {
       throw new ContentTooLongError(patch.content.length);
@@ -369,7 +354,6 @@ export class MemoryStore {
     return changed > 0;
   }
 
-  // Restores an older version's title and content; the current text becomes a version too.
   restore(id: number, version: number): boolean {
     const old = this.db
       .query<{ title: string; content: string }, [number, number]>(
@@ -379,7 +363,6 @@ export class MemoryStore {
     return old ? this.update(id, { title: old.title, content: old.content }) : false;
   }
 
-  // Keeps the target unchanged and soft-deletes the source with a pointer to the target.
   merge(sourceId: number, targetId: number): { ok: boolean; message: string } {
     if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
     const live = this.get([sourceId, targetId]);
@@ -412,7 +395,6 @@ export class MemoryStore {
     scope?: SearchScope;
     limit?: number;
     pinnedOnly?: boolean;
-    // Unpinned memories not used or edited for STALE_DAYS, least recently touched first.
     stale?: boolean;
   }): MemoryHit[] {
     const filter = scopeFilter(input.scope ?? "all", input.project);
@@ -431,8 +413,6 @@ export class MemoryStore {
       .map((row) => memoryHit(row, 0));
   }
 
-  // FTS5 BM25 and vector KNN fused by reciprocal rank, boosted for pinned, recent, used and
-  // project-scoped memories, then re-ranked by the cross-encoder when one is active.
   async search(input: SearchInput): Promise<SearchHit[]> {
     const scope = input.scope ?? "all";
     const limit = input.limit ?? 8;
@@ -459,9 +439,6 @@ export class MemoryStore {
     return hits;
   }
 
-  // ---------- sessions ----------
-
-  // Failed turns (no assistant reply) are not recorded. Returns whether the turn was stored.
   recordTurn(input: TurnInput): boolean {
     if (input.project) this.upsertProject(input.project);
     this.audit.retitle(input.agentId, input.title);
@@ -486,7 +463,6 @@ export class MemoryStore {
       .all(projectKey ?? "", excludeAgentId ?? "", limit);
   }
 
-  // Session digests and audit events share one retention window.
   pruneHistory(retentionDays: number): { sessions: number; audit: number } {
     const cutoff = new Date(this.now().getTime() - retentionDays * 86_400_000).toISOString();
     // bun:sqlite `changes` includes rows the FTS triggers touch, so count the deleted ids instead.
@@ -495,8 +471,6 @@ export class MemoryStore {
       .all(cutoff).length;
     return { sessions, audit: this.audit.prune(cutoff) };
   }
-
-  // ---------- status ----------
 
   stats(): { memories: number; sessions: number; projects: number } {
     const one = (sql: string) => this.db.query<{ n: number }, []>(sql).get()?.n ?? 0;
@@ -507,7 +481,6 @@ export class MemoryStore {
     };
   }
 
-  // Memories that lack a current vector for the active model.
   pendingEmbeddings(): number {
     if (!this.embedder) return 0;
     const row = this.db
@@ -532,14 +505,11 @@ export class MemoryStore {
     return vecTables(this.db);
   }
 
-  // Resolves once every memory has a current vector for the active model (or indexing gave up on it).
   async indexPending(): Promise<void> {
     while (this.indexing) await this.indexing;
     this.scheduleIndex();
     while (this.indexing) await this.indexing;
   }
-
-  // ---------- save internals ----------
 
   private saveNow(draft: SaveDraft): SaveResult {
     if (draft.input.project) this.upsertProject(draft.input.project);
@@ -596,8 +566,6 @@ export class MemoryStore {
     return { status: "duplicate", id: same.id };
   }
 
-  // A close match with the same type restates an existing memory: return it instead of saving.
-  // Close matches of another type are listed for the agent to decide.
   private nearDuplicates(draft: SaveDraft): SaveResult | null {
     if (!draft.vector || !this.vectors || draft.input.force || draft.topicKey) return null;
     const candidates = this.closeMatches(draft.vector, scopeKey(draft.scope, draft.projectKey));
@@ -612,7 +580,6 @@ export class MemoryStore {
     };
   }
 
-  // Live memories in one partition at or above the tier's duplicate threshold, closest first.
   private closeMatches(
     vector: Float32Array,
     partition: string,
@@ -678,7 +645,6 @@ export class MemoryStore {
     return { id, partition: scopeKey(draft.scope, draft.projectKey), hash: draft.hash };
   }
 
-  // Writes the vector for the active model, or queues the memory for the background indexer.
   private storeVector(target: VectorTarget, vector: Float32Array | null): void {
     if (!this.vectors) return;
     if (vector) this.vectors.write(target, vector);
@@ -692,8 +658,6 @@ export class MemoryStore {
       )
       .run(row.id, row.revision_count, row.title, row.content, row.updated_at);
   }
-
-  // ---------- search internals ----------
 
   private async embedOne(text: string, kind: EmbedKind): Promise<Float32Array | null> {
     const embedder = this.embedder;
@@ -721,7 +685,6 @@ export class MemoryStore {
       .map((r) => r.id);
   }
 
-  // Short or unmatched queries fall back to substring matching.
   private likeIds(query: string, filter: SqlFilter): number[] {
     const like = `%${query.replace(/[%_]/g, "")}%`;
     return this.db
@@ -733,7 +696,6 @@ export class MemoryStore {
       .map((r) => r.id);
   }
 
-  // KNN in the global and project partitions, kept above the tier's search floor.
   private vectorIds(vector: Float32Array, input: SearchInput & { scope: SearchScope }): number[] {
     const vectors = this.vectors;
     if (!vectors) return [];
@@ -786,8 +748,6 @@ export class MemoryStore {
     });
   }
 
-  // Rescores the top fused candidates with the cross-encoder, keeping each one's boost. Any
-  // re-ranker failure keeps the fused order.
   private async rerank(query: string, candidates: Candidate[], limit: number): Promise<SearchHit[]> {
     const fused = candidates.sort((a, b) => b.hit.score - a.hit.score);
     const reranker = this.reranker;
@@ -808,8 +768,6 @@ export class MemoryStore {
     }
   }
 
-  // ---------- background indexing ----------
-
   private scheduleIndex(): void {
     if (!this.embedder || this.closed) return;
     if (this.indexing) {
@@ -826,7 +784,6 @@ export class MemoryStore {
       });
   }
 
-  // Embeds pending memories in id order, one batch at a time, until none remain or the model changes.
   private async runIndex(): Promise<void> {
     const embedder = this.embedder;
     if (!embedder) return;
@@ -894,8 +851,6 @@ export class MemoryStore {
   }
 }
 
-// ---------- helpers ----------
-
 function patched(existing: MemoryRow, patch: MemoryPatch) {
   const title = patch.title !== undefined ? redact(patch.title).trim() : existing.title;
   const content = patch.content !== undefined ? redact(patch.content).trim() : existing.content;
@@ -947,13 +902,13 @@ function addRanks(ranks: Map<number, number>, ids: number[]): void {
   for (const [index, id] of ids.entries()) ranks.set(id, (ranks.get(id) ?? 0) + 1 / (RRF_K + index + 1));
 }
 
-// Pinned +10%, recency up to +6% (half-life about a month), project scope +5%, use up to +4%
-// (full at 31 uses). A memory counts as recent when it was edited or used recently.
 function boost(row: MemoryRow, nowMs: number): number {
   const touched = Math.max(Date.parse(row.updated_at), row.last_used_at ? Date.parse(row.last_used_at) : 0);
-  const recency = 0.06 / (1 + Math.max(0, (nowMs - touched) / 86_400_000) / 30);
-  const usage = 0.04 * Math.min(1, Math.log2(1 + row.use_count) / 5);
-  return 1 + 0.1 * row.pinned + recency + (row.scope === "project" ? 0.05 : 0) + usage;
+  const ageDays = Math.max(0, (nowMs - touched) / 86_400_000);
+  const recency = MAX_RECENCY_BOOST / (1 + ageDays / RECENCY_HALF_LIFE_DAYS);
+  const usageShare = Math.log2(1 + row.use_count) / Math.log2(1 + FULL_USAGE_BOOST_USES);
+  const usage = MAX_USAGE_BOOST * Math.min(1, usageShare);
+  return 1 + PINNED_BOOST * row.pinned + recency + (row.scope === "project" ? PROJECT_BOOST : 0) + usage;
 }
 
 function memoryHit(row: MemoryWithProject, score: number): MemoryHit {

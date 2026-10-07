@@ -1,9 +1,3 @@
-// Embedding tiers for the memory service. One table (TIERS) defines every model; the loader
-// reads only that table, so adding a model means adding a row.
-// zero runs model2vec in pure TypeScript (WordPiece tokenizer plus a mean of static token
-// vectors, no ONNX runtime). The other tiers run transformers.js on onnxruntime-node in-process.
-// Models download on first use into the service's models directory.
-
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EmbeddingTier } from "../shared/service-api";
@@ -14,28 +8,18 @@ export interface TierSpec {
   tier: EmbeddingTier;
   model: string;
   backend: "model2vec" | "transformers";
-  // transformers.js dtype and pooling; model2vec ignores both.
   dtype: "q8" | "fp32";
   pooling: "cls" | "mean";
   dims: number;
   queryPrefix: string;
   documentPrefix: string;
-  // Cosine similarity at or above which a new memory is reported as possible_duplicate.
   duplicateThreshold: number;
-  // Vector hits enter fusion only at or above max(min, best hit * relative).
   searchFloor: { min: number; relative: number };
 }
 
 const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
 
-// Thresholds are calibrated per model against tests/fixtures/calibration.ts by the
-// "tier calibration" tests in tests/embedder.test.ts. Cosine similarities on that fixture:
-//   tier    duplicates   distinct facts  relevant hit  unrelated
-//   zero    0.976-1.000  0.195-0.645     0.189-0.390   0.013-0.245
-//   low     0.987-0.994  0.632-0.754     0.635-0.691   0.486-0.626
-//   medium  0.987-0.992  0.533-0.731     0.560-0.717   0.404-0.517
-//   high    0.982-0.995  0.607-0.761     0.582-0.666   0.414-0.576
-// Static embeddings score low and spread wide; transformer models score high and compress.
+// Thresholds are calibrated per tier on tests/fixtures/calibration.ts by the "tier calibration" tests.
 export const TIERS: Record<EmbeddingTier, TierSpec> = {
   zero: {
     tier: "zero",
@@ -92,7 +76,6 @@ export interface Embedder {
   embed(texts: string[], kind: EmbedKind): Promise<Float32Array[]>;
 }
 
-// Long memories add latency without improving a single-vector summary.
 const MAX_EMBED_CHARS = 8000;
 
 export function loadEmbedder(tier: EmbeddingTier, modelsDir: string): Promise<Embedder> {
@@ -106,8 +89,7 @@ async function loadModel2Vec(spec: TierSpec, modelsDir: string): Promise<Embedde
 }
 
 async function loadTransformers(spec: TierSpec, modelsDir: string): Promise<Embedder> {
-  // Loaded on demand: it pulls in the onnxruntime-node native addon, which the zero tier must not
-  // depend on (it can be missing or fail to load on some platforms).
+  // Dynamic import: the zero tier must not depend on onnxruntime-node's native addon.
   const transformers = await import("@huggingface/transformers");
   mkdirSync(modelsDir, { recursive: true });
   transformers.env.cacheDir = modelsDir;
@@ -173,7 +155,6 @@ interface EmbeddingTable {
   dims: number;
 }
 
-// model2vec ships one F32 tensor [vocab, dims] in a safetensors file.
 function readEmbeddingTable(path: string): EmbeddingTable {
   const buf = readFileSync(path);
   const headerLength = Number(buf.readBigUInt64LE(0));
@@ -196,7 +177,6 @@ function readEmbeddingTable(path: string): EmbeddingTable {
   };
 }
 
-// Sums the static vector of every known token into `vector`; returns how many were added.
 function addTokenVectors(vector: Float32Array, table: EmbeddingTable, ids: number[]): number {
   let count = 0;
   for (const id of ids) {
@@ -226,8 +206,7 @@ interface TokenizerJson {
   };
 }
 
-// BERT basic tokenizer + greedy WordPiece. Matches HF BertNormalizer/BertPreTokenizer for
-// the uncased vocabularies potion models use. Unknown words are dropped (model2vec behavior).
+// Matches HF BertNormalizer/BertPreTokenizer; unknown words are dropped, as model2vec does.
 export class WordPieceTokenizer {
   private readonly vocab: Map<string, number>;
   private readonly prefix: string;
@@ -265,7 +244,6 @@ export class WordPieceTokenizer {
     return text.match(/[^\s\p{P}\p{S}]+|[\p{P}\p{S}]/gu) ?? [];
   }
 
-  // Greedy longest-match-first; a word with any unmatched remainder yields no ids.
   private wordPiece(word: string): number[] {
     const chars = Array.from(word);
     if (chars.length > this.maxChars) return [];
@@ -289,8 +267,6 @@ export class WordPieceTokenizer {
   }
 }
 
-// BertNormalizer per character: drop NUL, U+FFFD and control characters, pad CJK ideographs
-// with spaces, and map every whitespace character to a space.
 function normalizeChar(ch: string): string {
   const cp = ch.codePointAt(0) ?? 0;
   if (cp === 0 || cp === 0xfffd || isControl(ch)) return "";

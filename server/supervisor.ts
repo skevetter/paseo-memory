@@ -1,6 +1,3 @@
-// Supervises the Bun memory service: finds bun and the service entry, spawns it with a clean
-// environment, restarts it with backoff when it exits, and proxies internal API calls to it.
-
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -113,7 +110,6 @@ export class ServiceSupervisor {
     return this.state === "running" && this.live !== null;
   }
 
-  // Applies a configuration; restarts the service only when it changed.
   async configure(config: ServiceConfig): Promise<void> {
     if (this.config && JSON.stringify(this.config) === JSON.stringify(config) && this.state !== "stopped")
       return;
@@ -179,7 +175,6 @@ export class ServiceSupervisor {
     return this.live;
   }
 
-  // The paths in use and whether they came from an override setting or detection.
   paths(): MemoryStatus["paths"] {
     const config = this.config;
     const source = (setting: string | undefined): "override" | "detected" =>
@@ -306,7 +301,6 @@ export class ServiceSupervisor {
     }
   }
 
-  // Service lines keep their level; unprefixed stdout is info and unprefixed stderr a warning.
   private forward(line: string, fallback: "info" | "warn"): void {
     const { level, message } = parseLine(line, fallback);
     this.options.log[level](`service: ${message}`);
@@ -329,7 +323,6 @@ function forEachLine(stream: Readable, onLine: (line: string) => void): void {
   });
 }
 
-// SIGTERM lets the service close the database; SIGKILL after a grace period.
 function terminate(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   const { promise, resolve } = Promise.withResolvers<void>();

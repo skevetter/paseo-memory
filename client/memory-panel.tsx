@@ -88,7 +88,6 @@ function PanelBody({ workspaceId, projectId, projectName, nav, setNav, s }: Body
   return <MemoriesTab projectId={projectId} projectName={projectName} onOpenMemory={openMemory} s={s} />;
 }
 
-// No tab is active while a memory is open; pressing one returns to its list.
 function TabRow({ tab, onChange, s }: { tab: Tab | null; onChange: (tab: Tab) => void; s: Styles }) {
   return (
     <View style={s.row}>

@@ -1,8 +1,3 @@
-// Real-model tests for every embedding tier. Models load from PASEO_MEMORY_TEST_MODELS (default:
-// the system temp directory). The zero tier downloads its 30 MB model when missing unless
-// PASEO_MEMORY_SKIP_MODEL=1. The low, medium and high tiers are skipped when their model files
-// are absent from that directory; set PASEO_MEMORY_DOWNLOAD_MODELS=1 to download them instead.
-
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

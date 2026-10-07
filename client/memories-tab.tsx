@@ -14,8 +14,7 @@ const SCOPES: readonly { value: Scope; label: string }[] = [
   { value: "global", label: "Global" },
 ];
 
-// Remaining characters show once the content gets this close to the limit.
-const REMAINING_WARNING = 500;
+const SHOW_REMAINING_WITHIN = 500;
 
 interface MemoriesTabProps {
   projectId: string | null;
@@ -97,7 +96,6 @@ interface MemoryCardProps {
   s: Styles;
 }
 
-// The panel search returns memories; sessions live in the Sessions tab, so a session item opens nothing.
 function MemoryCard({ item, onOpenMemory, s }: MemoryCardProps) {
   const isMemory = item.kind === "memory";
   return (
@@ -163,7 +161,7 @@ function AddMemoryForm({ projectId, s }: { projectId: string | null; s: Styles }
         multiline
         accessibilityLabel="Memory content"
       />
-      {remaining <= REMAINING_WARNING ? (
+      {remaining <= SHOW_REMAINING_WITHIN ? (
         <Text style={s.muted}>{plural(remaining, "character left", "characters left")}</Text>
       ) : null}
       <View style={s.row}>

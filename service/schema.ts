@@ -1,7 +1,3 @@
-// Schema and migrations for memory.db. v1 (paseo-memory 0.1) stored vectors as BLOBs keyed by
-// memory alone; v2 keeps vectors only in vec0 tables, one per model, tracked in vec_tables.
-// v3 (1.1) adds usage counters, merge pointers, agent links and audit events.
-
 import type { Database } from "bun:sqlite";
 
 export const SCHEMA_VERSION = 3;
@@ -36,8 +32,6 @@ function addV3Columns(db: Database): void {
   }
 }
 
-// agent_links maps the nonce in an agent's memory token to its Paseo agent id. audit_events keeps
-// ids and scores only, never memory content.
 const V3_SQL = `
   CREATE TABLE IF NOT EXISTS agent_links (
     nonce TEXT PRIMARY KEY, agent_id TEXT, workspace_id TEXT, project_key TEXT, provider TEXT, title TEXT,

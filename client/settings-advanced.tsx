@@ -21,13 +21,13 @@ const PATHS: readonly { key: PathKey; setting: PathSetting; label: string }[] = 
   { key: "service", setting: "servicePath", label: "Service directory" },
 ];
 
-// Bun and the service directory resolve before the service starts; SQLite resolves inside it.
 function resolvedText(key: PathKey, status: MemoryStatus | null): string {
   const waiting = "Shown when the service is running";
   if (!status) return waiting;
   const { value, source } = status.paths[key];
   if (value) return `Using ${value} (${source})`;
-  return key === "sqlite" && status.service.state !== "running" ? waiting : "Not found";
+  const resolvesInsideService = key === "sqlite";
+  return resolvesInsideService && status.service.state !== "running" ? waiting : "Not found";
 }
 
 interface AdvancedProps {

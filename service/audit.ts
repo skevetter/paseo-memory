@@ -1,7 +1,3 @@
-// Per-agent audit of what memory did: the block injected at agent.create and every tool call.
-// Rows hold ids, scores and statuses, never memory content. Each agent's token carries a random
-// nonce; agent_links maps it to the Paseo agent id once the plugin reports the link.
-
 import type { Database } from "bun:sqlite";
 import type { AgentAudit, AuditEvent, AuditKind, WorkspaceAgent } from "../shared/service-api";
 import { redact } from "./redact";
@@ -40,6 +36,7 @@ interface EventRow {
   created_at: string;
 }
 
+// Rows hold ids, scores and statuses, never memory content.
 export class AuditLog {
   private readonly db: Database;
   private readonly now: () => string;
@@ -49,7 +46,6 @@ export class AuditLog {
     this.now = now;
   }
 
-  // A link row exists from agent.create on; the agent id arrives later.
   open(input: { nonce: string; projectKey: string | null; provider: string | null }): void {
     this.db
       .query(
@@ -93,7 +89,6 @@ export class AuditLog {
       .run(nonce, kind, JSON.stringify(stored), this.now());
   }
 
-  // Events older than the cutoff go, and so do links that no longer have events.
   prune(cutoff: string): number {
     const events = this.db.query(`DELETE FROM audit_events WHERE created_at < ? RETURNING id`).all(cutoff);
     this.db
@@ -160,7 +155,6 @@ export class AuditLog {
   }
 }
 
-// Turns stored event rows into views, reading memory and session titles in two queries.
 class AuditViews {
   private readonly db: Database;
   private readonly memoryTitles: Map<number, string>;

@@ -1,5 +1,3 @@
-// Automatic per-agent session digests: last prompt, last reply and edited files, redacted.
-
 import type { Database } from "bun:sqlite";
 import type { ProjectRef, SearchScope } from "../shared/service-api";
 import { isUsableReply } from "../shared/turns";
@@ -48,7 +46,6 @@ export interface SessionHit {
   score: number;
 }
 
-// Turns are stored only with a usable reply; see shared/turns.ts.
 export function recordTurn(db: Database, input: TurnInput, ts: string): boolean {
   if (!isUsableReply(input.assistantText)) return false;
   const userText = input.userText ? clip(redact(input.userText), 1500) : null;
@@ -92,7 +89,6 @@ export function recordTurn(db: Database, input: TurnInput, ts: string): boolean 
   return true;
 }
 
-// Recent sessions for a project, or FTS matches when there is a query.
 export function listSessions(
   db: Database,
   input: { projectKey: string | null; query: string; limit: number },
