@@ -88,14 +88,14 @@ The `rerank` setting controls `Alibaba-NLP/gte-reranker-modernbert-base` (q8, 15
 
 | Tier | Top-1 | MRR | Top-1 (paraphrase / no overlap / near miss) | ms per search | Added by re-rank |
 | --- | --- | --- | --- | --- | --- |
-| zero | 21/39 | 0.675 | 7 / 4 / 10 | 0.2 | |
-| zero + re-rank | 35/39 | 0.923 | 12 / 10 / 13 | 61.8 | +61.5 ms |
-| low | 29/39 | 0.825 | 10 / 6 / 13 | 3.4 | |
-| low + re-rank | 36/39 | 0.923 | 12 / 11 / 13 | 38.8 | +35.4 ms |
-| medium | 32/39 | 0.887 | 12 / 7 / 13 | 5.2 | |
-| medium + re-rank | 37/39 | 0.974 | 12 / 12 / 13 | 40.2 | +35.0 ms |
-| high | 34/39 | 0.911 | 12 / 9 / 13 | 12.1 | |
-| high + re-rank | 35/39 | 0.936 | 13 / 9 / 13 | 41.8 | +29.8 ms |
+| zero | 23/39 | 0.703 | 8 / 4 / 11 | 0.2 | |
+| zero + re-rank | 35/39 | 0.923 | 12 / 10 / 13 | 55.4 | +55.2 ms |
+| low | 29/39 | 0.825 | 10 / 6 / 13 | 2.5 | |
+| low + re-rank | 36/39 | 0.923 | 12 / 11 / 13 | 37.6 | +35.1 ms |
+| medium | 32/39 | 0.887 | 12 / 7 / 13 | 4.9 | |
+| medium + re-rank | 37/39 | 0.974 | 12 / 12 / 13 | 39.1 | +34.2 ms |
+| high | 34/39 | 0.911 | 12 / 9 / 13 | 11.8 | |
+| high + re-rank | 35/39 | 0.936 | 13 / 9 / 13 | 40.0 | +28.3 ms |
 
 Re-ranking improves every tier, mostly on queries that share no words with the answer. It costs 30 to 60 ms per search and about 150 MB of memory.
 
@@ -191,7 +191,7 @@ Counts, the budget and the review, upkeep and ranking settings take effect for t
 | sqlitePath | (auto) | macOS SQLite library with extension loading |
 | servicePath | (auto) | Plugin directory or `service/main.ts` |
 
-Settings migrate automatically: v1 keys (`embeddings`, `duplicateThreshold`, `sqliteVecPath`) are dropped, v2 settings gain `rerank`, and v3 settings keep their values and gain the 1.2 settings with their defaults. The database moves to schema v4 on first start: new usage, review and archive columns, and a rebuilt `sessions_fts`.
+Settings migrate automatically: v1 keys (`embeddings`, `duplicateThreshold`, `sqliteVecPath`) are dropped, v2 settings gain `rerank`, and v3 settings keep their values and gain the 1.2 settings with their defaults. The database moves to schema v5 on first start: new usage, review and archive columns, and rebuilt `sessions_fts` and `memories_fts` indexes in which "." no longer counts as part of a word, so the last word of a sentence matches a keyword search.
 
 ## Not in 1.2
 

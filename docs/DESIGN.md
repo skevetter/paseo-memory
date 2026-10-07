@@ -36,6 +36,7 @@ Decisions that the code does not explain on its own. Research sources are listed
 - One `vec0` table exists per model and dimension count. `scope_key` is a partition key (`global` or `project:<16 hex of sha256(projectKey)>`), so KNN for a project reads only that project's and the global partition, and dedupe reads only the memory's own partition.
 - `memory_embeddings` records `(memory_id, model, dims, content_hash)`. A missing row or a hash mismatch marks a memory as pending for that model. Edits drop the memory's vectors from every model's table.
 - Bun's `changes` count includes rows that the FTS triggers touch, so session pruning counts `RETURNING` rows instead.
+- Both FTS5 indexes use `porter unicode61 tokenchars '_-/'`. Through schema v4, "." was a token character too, so a sentence's last word was indexed with its period ("backoff.") and a search for "backoff" missed it. Schema v5 drops and recreates `memories_fts` and its triggers, then refills it from live memories with rowid set to the memory id, so ids and soft-deleted rows stay as they were. A dotted query such as "config.ts" becomes a two-word phrase and still matches. On the benchmark, zero-tier top-1 without re-ranking went from 22/39 to 23/39 (MRR 0.690 to 0.703); every other row is unchanged.
 
 ## Embedding tiers
 
@@ -50,7 +51,7 @@ Decisions that the code does not explain on its own. Research sources are listed
 
 - `Alibaba-NLP/gte-reranker-modernbert-base` reads the query and each candidate together, which fixes the failure mode of single-vector search: queries that share no words with the answer and near-miss distractors that share many. It pairs with the medium embedder (same ModernBERT tokenizer family) and has a q8 ONNX export.
 - It rescores the top 30 fused candidates, not the whole store: 30 pairs take about 35 ms on Apple Silicon. Each candidate keeps its pinned, recency, usage and project boost as a multiplier on the re-ranker probability, so a pinned memory still wins a tie.
-- `auto` turns it on for medium and high only. The zero tier exists to avoid the ONNX runtime, and the low tier is for small machines. The benchmark shows re-ranking also helps those tiers (zero goes from 21/39 to 35/39 top-1), so users can choose `on`.
+- `auto` turns it on for medium and high only. The zero tier exists to avoid the ONNX runtime, and the low tier is for small machines. The benchmark shows re-ranking also helps those tiers (zero goes from 23/39 to 35/39 top-1), so users can choose `on`.
 - Loading failure, scoring failure or a single candidate keeps the fused order. The status RPC reports the re-ranker state.
 - `tests/fixtures/calibration.ts` `BENCHMARK` holds 50 memories in topic clusters with near-miss siblings and 39 queries: 13 paraphrases, 13 with no content word shared with the answer, and 13 whose wording overlaps a distractor more than the answer. `bench/retrieval.ts` runs the real store search on it per tier, with and without re-ranking.
 

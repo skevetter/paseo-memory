@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
@@ -14,6 +14,7 @@ export function migrate(db: Database): void {
     addColumns(db, "sessions", V4_SESSION_COLUMNS);
     addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
     db.run(V4_SQL);
+    db.run(V5_SQL);
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
@@ -90,6 +91,32 @@ const V4_SQL = `
     low_id INTEGER NOT NULL, high_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (low_id, high_id));
 `;
 
+// Same tokenizer as sessions_fts; the index is refilled from live memories so rowid stays the memory id.
+const V5_SQL = `
+  DROP TRIGGER IF EXISTS memories_ai;
+  DROP TRIGGER IF EXISTS memories_ad;
+  DROP TRIGGER IF EXISTS memories_au;
+  DROP TABLE IF EXISTS memories_fts;
+  CREATE VIRTUAL TABLE memories_fts USING fts5(
+    title, content, topic_key, content = 'memories', content_rowid = 'id',
+    tokenize = "porter unicode61 tokenchars '_-/'");
+  CREATE TRIGGER memories_ai AFTER INSERT ON memories WHEN new.deleted_at IS NULL BEGIN
+    INSERT INTO memories_fts(rowid, title, content, topic_key) VALUES (new.id, new.title, new.content, new.topic_key);
+  END;
+  CREATE TRIGGER memories_ad AFTER DELETE ON memories WHEN old.deleted_at IS NULL BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
+      VALUES ('delete', old.id, old.title, old.content, old.topic_key);
+  END;
+  CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
+      SELECT 'delete', old.id, old.title, old.content, old.topic_key WHERE old.deleted_at IS NULL;
+    INSERT INTO memories_fts(rowid, title, content, topic_key)
+      SELECT new.id, new.title, new.content, new.topic_key WHERE new.deleted_at IS NULL;
+  END;
+  INSERT INTO memories_fts(rowid, title, content, topic_key)
+    SELECT id, title, content, topic_key FROM memories WHERE deleted_at IS NULL;
+`;
+
 function dropV1Vectors(db: Database): void {
   const vecTables = db
     .query<{ name: string }, []>(
@@ -135,22 +162,6 @@ const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS vec_tables (
     model TEXT NOT NULL, dims INTEGER NOT NULL, table_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
     PRIMARY KEY (model, dims));
-  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-    title, content, topic_key, content = 'memories', content_rowid = 'id',
-    tokenize = "porter unicode61 tokenchars '_-./'");
-  CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories WHEN new.deleted_at IS NULL BEGIN
-    INSERT INTO memories_fts(rowid, title, content, topic_key) VALUES (new.id, new.title, new.content, new.topic_key);
-  END;
-  CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories WHEN old.deleted_at IS NULL BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
-      VALUES ('delete', old.id, old.title, old.content, old.topic_key);
-  END;
-  CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
-      SELECT 'delete', old.id, old.title, old.content, old.topic_key WHERE old.deleted_at IS NULL;
-    INSERT INTO memories_fts(rowid, title, content, topic_key)
-      SELECT new.id, new.title, new.content, new.topic_key WHERE new.deleted_at IS NULL;
-  END;
   CREATE TABLE IF NOT EXISTS sessions (
     rowid INTEGER PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,

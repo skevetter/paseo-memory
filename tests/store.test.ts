@@ -390,6 +390,44 @@ describe("migration", () => {
       upgraded.close();
     }
   });
+
+  it("upgrades a v4 database: rebuilds the keyword index, keeps every memory and its id", async () => {
+    const path = join(tempDir(), "memory.db");
+    const { db } = openDatabase(path);
+    // A 1.2.0 database: today's schema with the memories index that kept "." inside words.
+    migrate(db);
+    db.run(`DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au; DROP TABLE memories_fts;
+      CREATE VIRTUAL TABLE memories_fts USING fts5(title, content, topic_key, content = 'memories',
+        content_rowid = 'id', tokenize = "porter unicode61 tokenchars '_-./'");
+      INSERT INTO memories (id, scope, type, title, content, content_hash, created_at, updated_at, deleted_at) VALUES
+        (3, 'global', 'config', 'Config file', 'Settings live in config.ts', 'h3', '2026-01-01', '2026-01-01', NULL),
+        (5, 'global', 'note', 'Gone', 'Removed zebra note', 'h5', '2026-01-01', '2026-01-01', '2026-02-01'),
+        (7, 'global', 'decision', 'Retries', 'Payments retry three times with backoff.', 'h7', '2026-01-01', '2026-01-01', NULL);
+      INSERT INTO memories_fts(rowid, title, content, topic_key)
+        SELECT id, title, content, topic_key FROM memories WHERE deleted_at IS NULL;
+      PRAGMA user_version = 4;`);
+    const keyword = (q: string) =>
+      db
+        .query<{ rowid: number }, [string]>(`SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?`)
+        .all(q)
+        .map((r) => r.rowid);
+    expect(keyword('"backoff"')).toEqual([]);
+    db.close();
+    const upgraded = new MemoryStore({ path });
+    try {
+      expect(upgraded.get([3, 5, 7]).map((r) => [r.id, r.title])).toEqual([
+        [3, "Config file"],
+        [7, "Retries"],
+      ]);
+      expect(titles(await upgraded.search({ query: "backoff", project: null }))).toEqual(["Retries"]);
+      expect(titles(await upgraded.search({ query: "config.ts", project: null }))).toEqual(["Config file"]);
+      expect(await upgraded.search({ query: "zebra", project: null })).toEqual([]);
+      expect(upgraded.detail(5).memory).toBeNull();
+      expect(upgraded.stats().memories).toBe(2);
+    } finally {
+      upgraded.close();
+    }
+  });
 });
 
 describe("redaction", () => {
@@ -719,5 +757,23 @@ describe("fts query", () => {
   it("quotes tokens and drops stopwords", () => {
     expect(ftsQuery("What did we decide about the auth-flow?")).toBe('"decide" OR "about" OR "auth-flow"');
     expect(ftsQuery("the a")).toBeNull();
+  });
+
+  it("finds a word that ends a sentence", async () => {
+    const saved = await store.save({
+      title: "Payment retries",
+      content: "Retries are capped at three attempts with backoff.",
+      type: "decision",
+      scope: "global",
+      project: null,
+    });
+    expect((await store.search({ query: "backoff", project: null })).map((h) => h.id)).toEqual([
+      String(saved.id),
+    ]);
+    expect(store.update(saved.id as number, { content: "Retries use jitter." })).toBe(true);
+    expect(await store.search({ query: "backoff", project: null })).toEqual([]);
+    expect((await store.search({ query: "jitter", project: null })).map((h) => h.id)).toEqual([
+      String(saved.id),
+    ]);
   });
 });
