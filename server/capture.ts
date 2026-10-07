@@ -9,25 +9,22 @@ export interface TurnDigest {
 }
 
 export function digestLatestTurn(timeline: readonly AgentTimelineItem[]): TurnDigest {
-  let start = 0;
-  for (let i = timeline.length - 1; i >= 0; i--) {
-    if (timeline[i].type === "user_message") {
-      start = i;
-      break;
-    }
-  }
-  let userText: string | null = null;
-  const replies: string[] = [];
-  const files = new Set<string>();
-  for (const item of timeline.slice(start)) {
-    if (item.type === "user_message") userText = item.text;
-    else if (item.type === "assistant_message" && item.text.trim()) replies.push(item.text);
-    else if (item.type === "tool_call") {
-      const detail = item.detail as { type?: string; filePath?: string } | undefined;
-      if (detail && (detail.type === "edit" || detail.type === "write") && detail.filePath) files.add(detail.filePath);
-    }
-  }
+  const start = Math.max(
+    0,
+    timeline.findLastIndex((item) => item.type === "user_message"),
+  );
+  const turn = timeline.slice(start);
+  const userText = turn.flatMap((item) => (item.type === "user_message" ? [item.text] : []))[0] ?? null;
   // The last assistant message is normally the turn's conclusion.
-  const assistantText = replies.length ? replies[replies.length - 1] : null;
-  return { userText, assistantText, files: [...files] };
+  const replies = turn.flatMap((item) =>
+    item.type === "assistant_message" && item.text.trim() ? [item.text] : [],
+  );
+  const files = new Set(turn.flatMap(editedFile));
+  return { userText, assistantText: replies.at(-1) ?? null, files: [...files] };
+}
+
+function editedFile(item: AgentTimelineItem): string[] {
+  if (item.type !== "tool_call") return [];
+  const { detail } = item;
+  return (detail.type === "edit" || detail.type === "write") && detail.filePath ? [detail.filePath] : [];
 }

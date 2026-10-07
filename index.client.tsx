@@ -5,8 +5,19 @@ import { memoryAttachments, saveMemoryRpc } from "./shared/contracts";
 
 export default function contribute(client: PluginClientContext) {
   const cleanups = [
-    client.addWorkspacePanel({ id: "memory", title: "Memory", icon: "Brain", context: "workspace", Component: MemoryPanel }),
-    client.addSettingsScreen({ id: "memory", title: "Memory", icon: "Brain", Component: MemorySettingsScreen }),
+    client.addWorkspacePanel({
+      id: "memory",
+      title: "Memory",
+      icon: "Brain",
+      context: "workspace",
+      Component: MemoryPanel,
+    }),
+    client.addSettingsScreen({
+      id: "memory",
+      title: "Memory",
+      icon: "Brain",
+      Component: MemorySettingsScreen,
+    }),
     client.addAttachmentSource(memoryAttachments),
     client.addSlashCommand({
       name: "remember",
@@ -22,7 +33,7 @@ export default function contribute(client: PluginClientContext) {
         const isGlobal = /^global:/i.test(text);
         const body = text.replace(/^global:\s*/i, "");
         await rpc(saveMemoryRpc, {
-          title: body.split("\n")[0].slice(0, 120),
+          title: (body.split("\n")[0] ?? body).slice(0, 120),
           content: body,
           type: "note",
           scope: isGlobal ? "global" : "project",

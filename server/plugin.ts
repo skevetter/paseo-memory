@@ -1,362 +1,236 @@
-// Wires the store, MCP server, lifecycle hooks, and RPCs into the Paseo plugin runtime.
+// Plugin server: a thin supervisor and proxy. The Bun memory service owns storage, embeddings and
+// the agents' MCP endpoint; this process resolves Paseo projects, injects context and the MCP
+// server into new agents, records turn digests, and forwards UI RPCs over loopback HTTP.
 
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+import type {
+  PluginBeforeRequests,
+  PluginLifecycleEvents,
+  PluginServerContext,
+} from "@getpaseo/plugin/server";
 import {
-  type MemorySettings,
-  PLUGIN_ID,
   attachmentSearchRpc,
   deleteMemoryRpc,
+  type MemorySettings,
   memorySettings,
+  PLUGIN_ID,
   saveMemoryRpc,
   searchMemoriesRpc,
   statusRpc,
   updateMemoryRpc,
 } from "../shared/contracts";
+import type { ProjectRef } from "../shared/service-api";
 import { digestLatestTurn } from "./capture";
-import { type EmbedderState, ensureModelFiles, loadStaticEmbedder } from "./embedder";
-import { MemoryMcpServer, signCaller } from "./mcp";
-import { MemoryStore, type ProjectRef } from "./store";
-import { MCP_INSTRUCTIONS, buildContext, buildSystemPrompt, createTools } from "./tools";
+import { createProjectResolver, type ProjectResolver, projectFromDescriptor } from "./projects";
+import { type ServiceConfig, ServiceSupervisor } from "./supervisor";
 
 const MCP_KEY = "memory";
 const DEFAULTS: MemorySettings = memorySettings.schema.parse({});
+// before("agent.create") blocks agent creation, so it gets one overall deadline.
+const CREATE_HOOK_BUDGET_MS = 1800;
+const PROJECT_LOOKUP_MS = 1000;
+const RPC_TIMEOUT_MS = 5000;
+
+type AgentCreateRequest = PluginBeforeRequests["agent.create"];
+
+// Resolves to `fallback` when `promise` is not settled within `ms`; the timer never outlives it.
+async function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
+  const expired = Promise.withResolvers<T>();
+  const timer = setTimeout(() => expired.resolve(fallback()), ms);
+  try {
+    return await Promise.race([promise, expired.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function paseoHome(): string {
+  return process.env.PASEO_HOME || join(homedir(), ".paseo");
+}
 
 export function dataDir(): string {
-  const home = process.env.PASEO_HOME || join(homedir(), ".paseo");
-  return process.env.PASEO_MEMORY_DIR || join(home, "plugin-data", PLUGIN_ID);
+  return process.env.PASEO_MEMORY_DIR || join(paseoHome(), "plugin-data", PLUGIN_ID);
 }
 
-function loadSecret(dir: string): string {
-  const path = join(dir, "mcp-secret");
-  if (existsSync(path)) return readFileSync(path, "utf8").trim();
-  const secret = randomBytes(32).toString("hex");
-  writeFileSync(path, secret, { mode: 0o600 });
-  return secret;
+export function serviceConfig(settings: MemorySettings): ServiceConfig {
+  return {
+    bunPath: settings.bunPath,
+    servicePath: settings.servicePath,
+    sqlitePath: settings.sqlitePath,
+    tier: settings.embeddingTier,
+    port: settings.mcpPort,
+    contextBudgetChars: settings.contextBudgetChars,
+    sessionRetentionDays: settings.sessionRetentionDays,
+  };
 }
 
-interface ProjectCacheEntry {
-  project: ProjectRef | null;
-  at: number;
+interface PluginState {
+  settings: MemorySettings;
+  supervisor: ServiceSupervisor;
+  projects: ProjectResolver;
+  log: (message: string) => void;
 }
 
-export function contributeServer(server: PluginServerContext): () => void {
-  const dir = dataDir();
-  mkdirSync(dir, { recursive: true });
-  const settingsHandle = server.registerSettings(memorySettings);
-  let settings: MemorySettings = DEFAULTS;
+export function contributeServer(server: PluginServerContext): () => Promise<void> {
   const log = (message: string) => console.error(`[paseo-memory] ${message}`);
+  const supervisor = new ServiceSupervisor({ dataDir: dataDir(), paseoHome: paseoHome(), log });
+  const state: PluginState = {
+    settings: DEFAULTS,
+    supervisor,
+    log,
+    projects: createProjectResolver((project) => {
+      supervisor.call("project-upsert", { project }, RPC_TIMEOUT_MS).catch(() => undefined);
+    }, log),
+  };
 
-  const store = new MemoryStore({
-    path: join(dir, "memory.db"),
-    sqliteVecPath: null,
-    duplicateThreshold: DEFAULTS.duplicateThreshold,
-  });
-  let embedderState: EmbedderState = { status: "off" };
-  let mcp: MemoryMcpServer | null = null;
-  let mcpState = "starting";
-  const secret = loadSecret(dir);
-  const projectCache = new Map<string, ProjectCacheEntry>();
-  const projectsByKey = new Map<string, ProjectRef>();
-
-  // ---- project resolution: agent cwd/workspace -> Paseo project -> stable project key ----
-
-  async function resolveProject(paseo: PaseoApi, input: { cwd: string; workspaceId?: string | null }): Promise<ProjectRef | null> {
-    const cacheKey = input.workspaceId ?? input.cwd;
-    const cached = projectCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < 5 * 60_000) return cached.project;
-    let project: ProjectRef | null = null;
-    try {
-      const [{ entries }, { projects }] = await Promise.all([
-        paseo.workspaces.list({ page: { limit: 200 } }),
-        paseo.projects.list(),
-      ]);
-      const cwd = resolve(input.cwd);
-      const workspace =
-        (input.workspaceId ? entries.find((w) => w.id === input.workspaceId) : undefined) ??
-        entries
-          .filter((w) => {
-            const d = w.workspaceDirectory ? resolve(w.workspaceDirectory) : null;
-            return d !== null && (cwd === d || cwd.startsWith(d + sep));
-          })
-          .sort((a, b) => (b.workspaceDirectory?.length ?? 0) - (a.workspaceDirectory?.length ?? 0))[0];
-      const projectId = workspace?.projectId;
-      const descriptor = projectId
-        ? (projects as { projectId: string; projectKey?: string; projectDisplayName: string; projectRootPath: string }[]).find(
-            (p) => p.projectId === projectId,
-          )
-        : undefined;
-      if (projectId && (descriptor || workspace)) {
-        const rootPath = descriptor?.projectRootPath ?? workspace?.projectRootPath ?? null;
-        project = {
-          key: descriptor?.projectKey || (rootPath ? `path:${rootPath}` : `paseo:${projectId}`),
-          name: descriptor?.projectDisplayName ?? workspace?.projectDisplayName ?? projectId,
-          rootPath,
-          paseoProjectId: projectId,
-        };
-        store.upsertProject(project);
-      }
-    } catch (error) {
-      log(`project lookup failed: ${String(error)}`);
-    }
-    projectCache.set(cacheKey, { project, at: Date.now() });
-    if (project) projectsByKey.set(project.key, project);
-    return project;
-  }
-
-  function projectFromPaseoId(paseoProjectId: string | null): ProjectRef | null {
-    return paseoProjectId ? store.projectByPaseoId(paseoProjectId) : null;
-  }
-
-  // ---- settings + background services ----
-
-  async function applySettings(next: MemorySettings): Promise<void> {
-    const portChanged = next.mcpPort !== settings.mcpPort || mcp === null;
-    const embeddingsChanged = next.embeddings !== settings.embeddings || embedderState.status === "off";
-    settings = next;
-    if (portChanged) await restartMcp();
-    if (embeddingsChanged) void loadEmbeddings();
-    try {
-      const pruned = store.pruneSessions(settings.sessionRetentionDays);
-      if (pruned) log(`pruned ${pruned} old session digests`);
-    } catch (error) {
-      log(`prune failed: ${String(error)}`);
-    }
-  }
-
-  async function restartMcp(): Promise<void> {
-    if (mcp) await mcp.stop().catch(() => undefined);
-    const next = new MemoryMcpServer({
-      port: settings.mcpPort,
-      secret,
-      instructions: MCP_INSTRUCTIONS,
-      tools: createTools({
-        store,
-        resolveProject: (caller) => (caller.projectKey ? (projectsByKey.get(caller.projectKey) ?? keyOnly(caller.projectKey)) : null),
-        contextBudget: () => settings.contextBudgetChars,
-      }),
-      log,
-    });
-    try {
-      await next.start();
-      mcp = next;
-      mcpState = `listening on ${next.url}`;
-    } catch (error) {
-      mcp = null;
-      mcpState = `failed: ${String(error)}`;
-      log(`MCP server failed to start on port ${settings.mcpPort}: ${String(error)}`);
-    }
-  }
-
-  async function loadEmbeddings(): Promise<void> {
-    if (settings.embeddings === "off") {
-      embedderState = { status: "off" };
-      store.setEmbedder(null);
-      return;
-    }
-    if (embedderState.status === "loading" || embedderState.status === "ready") return;
-    embedderState = { status: "loading" };
-    try {
-      const modelDir = await ensureModelFiles({ modelsDir: join(dir, "models") });
-      const embedder = loadStaticEmbedder(modelDir);
-      store.setEmbedder(embedder);
-      embedderState = { status: "ready", embedder };
-      log(`embeddings ready (${embedder.model}, ${embedder.dims}d, index ${store.vectorIndex})`);
-    } catch (error) {
-      embedderState = { status: "error", error: String(error) };
-      log(`embeddings unavailable, keyword search only: ${String(error)}`);
-    }
-  }
-
-  void settingsHandle.read().then(async (state) => {
-    await applySettings(state.status === "ready" ? state.values : DEFAULTS);
-  });
-  const unsubscribeSettings = settingsHandle.subscribe(async (state) => {
-    if (state.status === "ready") await applySettings(state.values);
+  const settingsHandle = server.registerSettings(memorySettings);
+  const apply = async (settings: MemorySettings) => {
+    state.settings = settings;
+    await supervisor.configure(serviceConfig(settings));
+  };
+  settingsHandle
+    .read()
+    .then((read) => apply(read.status === "ready" ? read.values : DEFAULTS))
+    .catch((error: unknown) => log(`settings read failed: ${String(error)}`));
+  const unsubscribe = settingsHandle.subscribe(async (read) => {
+    if (read.status === "ready") await apply(read.values);
   });
 
-  // ---- lifecycle hooks ----
+  registerHooks(server, state);
+  registerRpcs(server, state);
 
+  return async () => {
+    await unsubscribe();
+    await supervisor.stop();
+  };
+}
+
+// ---------- lifecycle hooks ----------
+
+function registerHooks(server: PluginServerContext, state: PluginState): void {
   server.before("agent.create", async ({ request }, { paseo }) => {
     try {
-      const config = request.config;
-      if (config.internal) return request;
-      if (!settings.injectContext && !settings.injectMcp) return request;
-      const project = await withTimeout(resolveProject(paseo, { cwd: config.cwd }), 2000, null);
-      const providerBase = String(config.provider).split("/")[0];
-      const canMcp =
-        settings.injectMcp && mcp !== null && !settings.mcpDenyProviders.includes(providerBase) &&
-        !Object.hasOwn(config.mcpServers ?? {}, MCP_KEY);
-      const next = { ...config };
-      if (canMcp && mcp) {
-        next.mcpServers = {
-          ...config.mcpServers,
-          [MCP_KEY]: {
-            type: "http",
-            url: mcp.url,
-            headers: signCaller(secret, { projectKey: project?.key ?? null, agentId: null, provider: providerBase }),
-          },
-        };
-      }
-      if (settings.injectContext) {
-        const context = buildContext({ store, project, budgetChars: settings.contextBudgetChars });
-        const block = buildSystemPrompt({ context, project, hasTools: canMcp });
-        next.systemPrompt = config.systemPrompt ? `${config.systemPrompt}\n\n${block}` : block;
-      }
-      return { ...request, config: next };
+      return await withDeadline(injectMemory(request, paseo, state), CREATE_HOOK_BUDGET_MS, () => {
+        state.log("agent.create injection skipped: memory service did not answer in time");
+        return request;
+      });
     } catch (error) {
-      log(`agent.create injection skipped: ${String(error)}`);
+      state.log(`agent.create injection skipped: ${String(error)}`);
       return request;
     }
   });
 
   const seenTurns = new Set<string>();
   server.on("agent.turn_ended", async (event, { paseo }) => {
-    if (!settings.autoCapture || event.outcome.kind === "canceled") return;
+    if (!state.settings.autoCapture || event.outcome.kind === "canceled") return;
+    // The hook can fire more than once for a turn; record each turn once.
     const turnKey = `${event.agent.id}:${event.turnId ?? event.timeline.length}`;
     if (seenTurns.has(turnKey)) return;
-    seenTurns.add(turnKey);
     if (seenTurns.size > 2000) seenTurns.clear();
-    try {
-      const digest = digestLatestTurn(event.timeline);
-      if (!digest.userText && !digest.assistantText) return;
-      const project = await resolveProject(paseo, { cwd: event.agent.cwd, workspaceId: event.agent.workspaceId });
-      store.recordTurn({
-        agentId: event.agent.id,
-        project,
-        provider: event.agent.provider,
-        title: event.agent.title,
-        workspaceDir: event.agent.cwd,
-        userText: digest.userText,
-        assistantText: digest.assistantText,
-        files: digest.files,
-      });
-    } catch (error) {
-      log(`turn capture failed: ${String(error)}`);
-    }
+    seenTurns.add(turnKey);
+    await captureTurn(event, paseo, state).catch((error: unknown) =>
+      state.log(`turn capture failed: ${String(error)}`),
+    );
   });
 
-  server.on("agent.archived", (event) => {
-    try {
-      store.endSession(event.agent.id);
-    } catch (error) {
-      log(`session end failed: ${String(error)}`);
-    }
+  server.on("agent.archived", async (event) => {
+    await state.supervisor
+      .call("end-session", { agentId: event.agent.id }, RPC_TIMEOUT_MS)
+      .catch((error: unknown) => state.log(`session end failed: ${String(error)}`));
   });
 
   server.on("workspace.created", async (event, { paseo }) => {
-    projectCache.delete(event.workspace.id);
-    await resolveProject(paseo, { cwd: event.workspace.cwd, workspaceId: event.workspace.id });
+    state.projects.forget(event.workspace.id);
+    await state.projects.resolve(paseo, { cwd: event.workspace.cwd, workspaceId: event.workspace.id });
   });
+}
 
-  // ---- RPCs for the app UI ----
-
-  server.handle(searchMemoriesRpc, (input) => {
-    const project = projectFromPaseoId(input.paseoProjectId);
-    return {
-      items: store
-        .search({ query: input.query, project, scope: input.scope, limit: input.limit })
-        .map((h) => ({
-          kind: h.kind,
-          id: h.id,
-          title: h.title,
-          type: h.type,
-          scope: h.scope,
-          projectName: h.projectName,
-          preview: h.preview,
-          pinned: h.pinned,
-          updatedAt: h.updatedAt,
-        })),
-    };
-  });
-
-  server.handle(saveMemoryRpc, async (input, { paseo }) => {
-    let project = projectFromPaseoId(input.paseoProjectId);
-    if (!project && input.paseoProjectId) {
-      const { projects } = await paseo.projects.list();
-      const d = (projects as { projectId: string; projectKey?: string; projectDisplayName: string; projectRootPath: string }[]).find(
-        (p) => p.projectId === input.paseoProjectId,
-      );
-      if (d) {
-        project = {
-          key: d.projectKey || `path:${d.projectRootPath}`,
-          name: d.projectDisplayName,
-          rootPath: d.projectRootPath,
-          paseoProjectId: d.projectId,
-        };
-      }
-    }
-    if (input.scope === "project" && !project) return { id: null, status: "error", message: "Unknown project" };
-    const result = store.save({
-      title: input.title,
-      content: input.content,
-      type: input.type,
-      scope: input.scope,
-      project,
-      pinned: input.pinned,
-      force: true,
-      source: "user",
-    });
-    return { id: result.id, status: result.status, message: `${result.status} #${result.id ?? "-"}` };
-  });
-
-  server.handle(updateMemoryRpc, (input) => ({ ok: store.update(input.id, { pinned: input.pinned }) }));
-  server.handle(deleteMemoryRpc, (input) => ({ ok: store.delete(input.id) }));
-
-  server.handle(statusRpc, () => {
-    const stats = store.stats();
-    return {
-      dbPath: store.path,
-      ...stats,
-      embeddings:
-        embedderState.status === "ready"
-          ? `${embedderState.embedder.model} (${embedderState.embedder.dims}d)`
-          : embedderState.status === "error"
-            ? `error: ${embedderState.error}`
-            : embedderState.status,
-      vectorIndex: store.vectorIndex,
-      mcp: mcpState,
-    };
-  });
-
-  server.handle(attachmentSearchRpc, (input) => ({
-    items: store.search({ query: input.query, project: null, scope: "all", limit: 15 }).filter((h) => h.kind === "memory").map((h) => {
-      const full = store.get([Number(h.id)])[0];
-      return {
-        id: h.id,
-        identifier: `#${h.id}`,
-        title: h.title,
-        subtitle: `${h.type} · ${h.projectName ?? "global"}`,
-        url: `https://paseo.sh/memory/${h.id}`,
-        text: `Memory #${h.id} (${h.type}, ${h.projectName ?? "global"}): ${h.title}\n\n${full?.content ?? h.preview}`,
-        resourceType: "memory",
-      };
-    }),
-  }));
-
-  return () => {
-    unsubscribeSettings();
-    void mcp?.stop();
-    store.close();
+async function captureTurn(
+  event: PluginLifecycleEvents["agent.turn_ended"],
+  paseo: PaseoApi,
+  state: PluginState,
+): Promise<void> {
+  const digest = digestLatestTurn(event.timeline);
+  if (!digest.userText && !digest.assistantText) return;
+  const { agent } = event;
+  const project = await state.projects.resolve(paseo, { cwd: agent.cwd, workspaceId: agent.workspaceId });
+  const turn = {
+    agentId: agent.id,
+    project,
+    provider: agent.provider,
+    title: agent.title,
+    workspaceDir: agent.cwd,
   };
+  await state.supervisor.call("record-turn", { ...turn, ...digest }, RPC_TIMEOUT_MS);
 }
 
-function keyOnly(key: string): ProjectRef {
-  return { key, name: key.replace(/^remote:|^path:/, ""), rootPath: null, paseoProjectId: null };
-}
-
-async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<T>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(fallback), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
+async function injectMemory(
+  request: AgentCreateRequest,
+  paseo: PaseoApi,
+  state: PluginState,
+): Promise<AgentCreateRequest> {
+  const { settings } = state;
+  const config = request.config;
+  if (config.internal || (!settings.injectContext && !settings.injectMcp)) return request;
+  const project = await withDeadline(
+    state.projects.resolve(paseo, { cwd: config.cwd }),
+    PROJECT_LOOKUP_MS,
+    () => null,
+  );
+  const provider = String(config.provider).split("/")[0] ?? "";
+  const includeTools =
+    settings.injectMcp &&
+    !settings.mcpDenyProviders.includes(provider) &&
+    !Object.hasOwn(config.mcpServers ?? {}, MCP_KEY);
+  const remaining = Math.max(200, CREATE_HOOK_BUDGET_MS - PROJECT_LOOKUP_MS);
+  const injected = await state.supervisor.call(
+    "agent-context",
+    { project, provider, includeContext: settings.injectContext, includeTools },
+    remaining,
+  );
+  const next = { ...config };
+  if (injected.mcpServer) {
+    next.mcpServers = { ...config.mcpServers, [MCP_KEY]: { type: "http", ...injected.mcpServer } };
   }
+  if (injected.systemPrompt) {
+    next.systemPrompt = config.systemPrompt
+      ? `${config.systemPrompt}\n\n${injected.systemPrompt}`
+      : injected.systemPrompt;
+  }
+  return { ...request, config: next };
+}
+
+// ---------- RPCs for the app UI ----------
+
+async function projectForSave(
+  paseo: PaseoApi,
+  paseoProjectId: string | null,
+  state: PluginState,
+): Promise<ProjectRef | null> {
+  if (!paseoProjectId) return null;
+  const { known } = await state.supervisor.call("project-known", { paseoProjectId }, RPC_TIMEOUT_MS);
+  if (known) return null;
+  const { projects } = await paseo.projects.list();
+  const descriptor = projects.find((p) => p.projectId === paseoProjectId);
+  return descriptor ? projectFromDescriptor(descriptor) : null;
+}
+
+function registerRpcs(server: PluginServerContext, state: PluginState): void {
+  const { supervisor } = state;
+  server.handle(searchMemoriesRpc, (input) => supervisor.call("search", input, RPC_TIMEOUT_MS));
+  server.handle(saveMemoryRpc, async (input, { paseo }) => {
+    const project = await projectForSave(paseo, input.paseoProjectId, state);
+    return supervisor.call("save", { ...input, project }, RPC_TIMEOUT_MS);
+  });
+  server.handle(updateMemoryRpc, (input) => supervisor.call("update", input, RPC_TIMEOUT_MS));
+  server.handle(deleteMemoryRpc, (input) => supervisor.call("delete", input, RPC_TIMEOUT_MS));
+  server.handle(attachmentSearchRpc, (input) => supervisor.call("attachments", input, RPC_TIMEOUT_MS));
+  server.handle(statusRpc, async () => {
+    const live = supervisor.running
+      ? await supervisor.call("status", {}, 1500).catch(() => supervisor.lastStatus())
+      : null;
+    return { service: supervisor.snapshot(), live };
+  });
 }

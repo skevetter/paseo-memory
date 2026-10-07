@@ -1,0 +1,104 @@
+// Schema and migrations for memory.db. v1 (paseo-memory 0.1) stored vectors as BLOBs keyed by
+// memory alone; v2 keeps vectors only in vec0 tables, one per model, tracked in vec_tables.
+
+import type { Database } from "bun:sqlite";
+
+export const SCHEMA_VERSION = 2;
+
+export function migrate(db: Database): void {
+  const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
+  if (current >= SCHEMA_VERSION) return;
+  db.transaction(() => {
+    if (current === 1) dropV1Vectors(db);
+    db.run(SCHEMA_SQL);
+    db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  })();
+}
+
+// The background indexer re-embeds every memory after this.
+function dropV1Vectors(db: Database): void {
+  const vecTables = db
+    .query<{ name: string }, []>(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'memories_vec_%' AND sql LIKE '%vec0%'`,
+    )
+    .all();
+  for (const table of vecTables) db.run(`DROP TABLE ${table.name}`);
+  db.run(`DROP TABLE IF EXISTS memory_embeddings`);
+}
+
+const SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS projects (
+    key TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS project_aliases (
+    paseo_project_id TEXT PRIMARY KEY, project_key TEXT NOT NULL REFERENCES projects(key), updated_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+    project_key TEXT REFERENCES projects(key),
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    topic_key TEXT,
+    content_hash TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    revision_count INTEGER NOT NULL DEFAULT 1,
+    duplicate_count INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'agent',
+    agent_id TEXT, provider TEXT, workspace_dir TEXT, branch TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_seen_at TEXT, deleted_at TEXT,
+    CHECK ((scope = 'global' AND project_key IS NULL) OR (scope = 'project' AND project_key IS NOT NULL)));
+  CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_topic ON memories(scope, ifnull(project_key, ''), topic_key)
+    WHERE topic_key IS NOT NULL AND deleted_at IS NULL;
+  CREATE INDEX IF NOT EXISTS ix_memories_scope ON memories(scope, project_key, deleted_at, updated_at DESC);
+  CREATE TABLE IF NOT EXISTS memory_versions (
+    memory_id INTEGER NOT NULL, version INTEGER NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+    created_at TEXT NOT NULL, PRIMARY KEY (memory_id, version));
+  CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    model TEXT NOT NULL, dims INTEGER NOT NULL, content_hash TEXT NOT NULL, embedded_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, model));
+  CREATE TABLE IF NOT EXISTS vec_tables (
+    model TEXT NOT NULL, dims INTEGER NOT NULL, table_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+    PRIMARY KEY (model, dims));
+  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    title, content, topic_key, content = 'memories', content_rowid = 'id',
+    tokenize = "porter unicode61 tokenchars '_-./'");
+  CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories WHEN new.deleted_at IS NULL BEGIN
+    INSERT INTO memories_fts(rowid, title, content, topic_key) VALUES (new.id, new.title, new.content, new.topic_key);
+  END;
+  CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories WHEN old.deleted_at IS NULL BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
+      VALUES ('delete', old.id, old.title, old.content, old.topic_key);
+  END;
+  CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content, topic_key)
+      SELECT 'delete', old.id, old.title, old.content, old.topic_key WHERE old.deleted_at IS NULL;
+    INSERT INTO memories_fts(rowid, title, content, topic_key)
+      SELECT new.id, new.title, new.content, new.topic_key WHERE new.deleted_at IS NULL;
+  END;
+  CREATE TABLE IF NOT EXISTS sessions (
+    rowid INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE,
+    project_key TEXT, agent_id TEXT NOT NULL, provider TEXT, title TEXT, workspace_dir TEXT,
+    first_prompt TEXT, last_prompt TEXT, last_reply TEXT, files TEXT NOT NULL DEFAULT '[]',
+    turns INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT);
+  CREATE INDEX IF NOT EXISTS ix_sessions_project ON sessions(project_key, updated_at DESC);
+  CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title, first_prompt, last_prompt, last_reply, content = 'sessions', content_rowid = 'rowid',
+    tokenize = "porter unicode61 tokenchars '_-./'");
+  CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply)
+      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply);
+  END;
+  CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply)
+      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply);
+  END;
+  CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, first_prompt, last_prompt, last_reply)
+      VALUES ('delete', old.rowid, old.title, old.first_prompt, old.last_prompt, old.last_reply);
+    INSERT INTO sessions_fts(rowid, title, first_prompt, last_prompt, last_reply)
+      VALUES (new.rowid, new.title, new.first_prompt, new.last_prompt, new.last_reply);
+  END;
+`;

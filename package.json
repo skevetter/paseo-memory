@@ -1,31 +1,40 @@
 {
   "name": "paseo-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight native memory for Paseo agents: one SQLite file, global and project scopes, hybrid search.",
   "license": "MIT",
   "repository": "github:skevetter/paseo-memory",
   "files": [
-    "paseo-plugin.json",
+    "README.md",
+    "client/",
     "index.client.tsx",
     "index.server.ts",
-    "client/",
+    "paseo-plugin.json",
     "server/",
-    "shared/",
-    "README.md"
+    "service/",
+    "shared/"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p service/tsconfig.json",
+    "test": "bun test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write ."
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.15",
     "@getpaseo/plugin": "0.11.0-beta.5",
     "@tanstack/react-query": "^5.90.11",
+    "@types/bun": "^1.4.2",
     "@types/node": "^24.19.1",
     "@types/react": "~19.2.0",
     "react": "19.1.0",
     "react-native": "0.81.5",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.7",
-    "zod": "^4.4.3"
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "sqlite-vec": "^0.1.9",
+    "zod": "^4.6.5"
   }
 }

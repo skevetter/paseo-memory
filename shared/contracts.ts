@@ -1,43 +1,47 @@
-import { defineAttachmentSource, defineRpc, defineSettings } from "@getpaseo/plugin";
+import { defineAttachmentSource, defineRpc, defineSettings, type RpcOutput } from "@getpaseo/plugin";
 import { z } from "zod";
+import { EMBEDDING_TIERS, MEMORY_TYPES, SearchScopeSchema } from "./service-api";
 
 export const PLUGIN_ID = "paseo-memory";
 
-export const MEMORY_TYPES = [
-  "decision",
-  "bugfix",
-  "pattern",
-  "config",
-  "discovery",
-  "preference",
-  "gotcha",
-  "summary",
-  "note",
-] as const;
-
+export { MEMORY_TYPES, SearchScopeSchema };
 export const MemoryTypeSchema = z.enum(MEMORY_TYPES);
 export const MemoryScopeSchema = z.enum(["global", "project"]);
-export const SearchScopeSchema = z.enum(["all", "project", "global"]);
+
+const settingsSchema = z.object({
+  injectContext: z.boolean().default(true),
+  injectMcp: z.boolean().default(true),
+  autoCapture: z.boolean().default(true),
+  embeddingTier: z.enum(EMBEDDING_TIERS).default("medium"),
+  mcpPort: z.number().int().min(1024).max(65535).default(6797),
+  contextBudgetChars: z.number().int().min(500).max(20000).default(6000),
+  sessionRetentionDays: z.number().int().min(1).max(365).default(30),
+  mcpDenyProviders: z.array(z.string()).default(["pi"]),
+  // Empty means auto-detect: bun on PATH, Homebrew SQLite, and the plugin directory from config.json.
+  bunPath: z.string().default(""),
+  sqlitePath: z.string().default(""),
+  servicePath: z.string().default(""),
+});
 
 export const memorySettings = defineSettings({
   id: "memory",
   scope: "host",
-  version: 1,
-  schema: z.object({
-    injectContext: z.boolean().default(true),
-    injectMcp: z.boolean().default(true),
-    autoCapture: z.boolean().default(true),
-    embeddings: z.enum(["model2vec", "off"]).default("model2vec"),
-    mcpPort: z.number().int().min(1024).max(65535).default(6797),
-    contextBudgetChars: z.number().int().min(500).max(20000).default(6000),
-    sessionRetentionDays: z.number().int().min(1).max(365).default(30),
-    duplicateThreshold: z.number().min(0.5).max(1).default(0.92),
-    mcpDenyProviders: z.array(z.string()).default(["pi"]),
-    sqliteVecPath: z.string().default(""),
-  }),
+  version: 2,
+  schema: settingsSchema,
+  // v1 had embeddings (model2vec | off), duplicateThreshold and sqliteVecPath. v2 replaces them
+  // with embeddingTier (per-tier thresholds) and a required sqlite-vec.
+  migrate(values) {
+    const {
+      embeddings: _e,
+      duplicateThreshold: _d,
+      sqliteVecPath: _s,
+      ...kept
+    } = z.record(z.string(), z.unknown()).parse(values ?? {});
+    return kept;
+  },
 });
 
-export type MemorySettings = z.output<typeof memorySettings.schema>;
+export type MemorySettings = z.output<typeof settingsSchema>;
 
 export const MemoryItemSchema = z.object({
   kind: z.enum(["memory", "session"]),
@@ -88,19 +92,48 @@ export const deleteMemoryRpc = defineRpc({
   output: z.object({ ok: z.boolean() }),
 });
 
+export const ServiceStateSchema = z.enum(["starting", "running", "restarting", "fatal", "stopped"]);
+
 export const statusRpc = defineRpc({
   name: "memory.status",
   input: z.object({}),
   output: z.object({
-    dbPath: z.string(),
-    memories: z.number(),
-    sessions: z.number(),
-    projects: z.number(),
-    embeddings: z.string(),
-    vectorIndex: z.string(),
-    mcp: z.string(),
+    service: z.object({
+      state: ServiceStateSchema,
+      // Human-readable cause for fatal and restarting states (missing bun, sqlite-vec failure, ...).
+      detail: z.string().nullable(),
+      bunPath: z.string().nullable(),
+      bunVersion: z.string().nullable(),
+      servicePath: z.string().nullable(),
+      servicePathSource: z.string().nullable(),
+      pid: z.number().nullable(),
+      restarts: z.number(),
+    }),
+    // Null until the service reports ready.
+    live: z
+      .object({
+        sqliteVersion: z.string(),
+        sqliteLibrary: z.string().nullable(),
+        sqliteVecVersion: z.string(),
+        dbPath: z.string(),
+        mcpUrl: z.string(),
+        memories: z.number(),
+        sessions: z.number(),
+        projects: z.number(),
+        embedder: z.object({
+          tier: z.enum(EMBEDDING_TIERS),
+          model: z.string(),
+          dims: z.number(),
+          state: z.enum(["loading", "ready", "error"]),
+          error: z.string().nullable(),
+          pending: z.number(),
+        }),
+      })
+      .nullable(),
   }),
 });
+
+export type MemoryStatus = RpcOutput<typeof statusRpc>;
 
 const AttachmentPayloadSchema = z.object({
   items: z.array(
