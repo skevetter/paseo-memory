@@ -16,7 +16,6 @@ import type { MemoryStore, SearchHit, SessionRow } from "./store";
 export interface RouteContext {
   store: MemoryStore;
   secret: string;
-  // Known only after the server binds its port.
   mcpUrl(): string;
   contextBudget: number;
   status(): ServiceStatus;

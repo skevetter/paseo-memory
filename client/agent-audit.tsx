@@ -19,7 +19,6 @@ const KIND_LABELS: Record<AuditEvent["kind"], string> = {
 
 interface AgentTabProps {
   workspaceId: string;
-  // Null follows the most recently active agent.
   agentId: string | null;
   onSelectAgent: (agentId: string) => void;
   onOpenMemory: (id: number) => void;

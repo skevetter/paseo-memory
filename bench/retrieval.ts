@@ -1,12 +1,3 @@
-// Retrieval benchmark: top-1, MRR and search latency for every embedding tier, with and without
-// the cross-encoder re-ranker, on BENCHMARK in tests/fixtures/calibration.ts. Runs the store's
-// real search path (FTS5 + vec0 + fusion + boosts) in memory.
-//
-//   bun bench/retrieval.ts [--models-dir <dir>] [--tiers zero,low,medium,high]
-//
-// Models load from --models-dir (default: PASEO_MEMORY_TEST_MODELS or the test models directory)
-// and download there when missing.
-
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";

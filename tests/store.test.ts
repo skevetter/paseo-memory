@@ -195,7 +195,6 @@ describe("vector search", () => {
   it("vec0 KNN returns only the requested scope partition", () => {
     const { db } = openDatabase(":memory:");
     migrate(db);
-    // The index is exercised alone, without memories rows behind the ids.
     db.run("PRAGMA foreign_keys = OFF");
     const index = new VectorIndex(db, hashSpec("test/knn", 4), () => new Date().toISOString());
     const global = scopeKey("global", null);

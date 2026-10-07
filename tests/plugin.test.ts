@@ -78,7 +78,6 @@ describe("agent links", () => {
     links.add("new", "/w", "omp");
     expect(links.match("a1", "/w", "omp")).toBe("old");
     now = 200_000;
-    // "new" is now older than the two-minute window.
     expect(links.match("a2", "/w", "omp")).toBeNull();
   });
 });
@@ -246,7 +245,6 @@ describe("supervisor", () => {
 
   const start = (overrides: Partial<ServiceConfig> = {}) => {
     const dataDir = tempDir("pm-supervisor-");
-    // Reuse the zero tier's cached model so the child does not download it.
     const models = process.env.PASEO_MEMORY_TEST_MODELS ?? join(tmpdir(), "paseo-memory-test-models");
     mkdirSync(models, { recursive: true });
     symlinkSync(models, join(dataDir, "models"));
@@ -264,8 +262,6 @@ describe("supervisor", () => {
     };
     return { supervisor, ready: supervisor.configure(config) };
   };
-
-  // Child processes give no in-process signal to await, so poll.
   const waitFor = async (check: () => boolean, ms = 15_000) => {
     const deadline = Date.now() + ms;
     while (!check()) {

@@ -44,7 +44,6 @@ const V3_SQL = `
   CREATE INDEX IF NOT EXISTS ix_audit_created ON audit_events(created_at);
 `;
 
-// The background indexer re-embeds every memory after this.
 function dropV1Vectors(db: Database): void {
   const vecTables = db
     .query<{ name: string }, []>(

@@ -209,7 +209,6 @@ function createInternalHandler(routes: Routes, key: string, log: Logger): Handle
     const parsed = serviceInputs[route].safeParse(await req.json().catch(() => undefined));
     if (!parsed.success) return Response.json({ error: parsed.error.message }, { status: 400 });
     try {
-      // serviceInputs[route] and routes[route] are keyed by the same route name.
       const handler = routes[route] as (input: unknown) => unknown;
       return Response.json(await handler(parsed.data));
     } catch (error) {
