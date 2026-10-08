@@ -55,8 +55,6 @@ npm run bench
 - **Data:** `$PASEO_HOME/plugin-data/paseo-memory/memory.db`
 - **Logs:** `paseo plugin logs paseo-memory`
 - **Settings:** the plugin settings screen, with help text for each setting
-- **Design:** `docs/DESIGN.md`
-- **Full reference:** `docs/REFERENCE.md` (settings, storage, benchmarks, testing)
 
 ## License
 
