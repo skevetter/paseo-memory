@@ -1,4 +1,4 @@
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
+import type { AgentTimelineItem } from "./host-types";
 
 export interface TurnDigest {
   userText: string | null;

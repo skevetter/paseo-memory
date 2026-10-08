@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { digestLatestTurn } from "../server/capture";
+import { missingDependencies } from "../server/dependencies";
 import { AgentLinks } from "../server/links";
 import { findBun, type LocateEnv, LocateError, resolveServicePath } from "../server/locate";
 import { contributeServer } from "../server/plugin";
@@ -130,6 +131,15 @@ describe("locating bun", () => {
       "bun not found. Install with `curl -fsSL https://bun.sh/install | bash`.",
     );
     expect(() => findBun("/nope/bun", fakeFs({}))).toThrow(LocateError);
+  });
+});
+
+describe("service dependencies", () => {
+  it("lists the runtime packages missing from node_modules", () => {
+    const present = new Set(["/p/node_modules/sqlite-vec/package.json"]);
+    expect(missingDependencies("/p", (path) => present.has(path))).toEqual(["@huggingface/transformers"]);
+    present.add("/p/node_modules/@huggingface/transformers/package.json");
+    expect(missingDependencies("/p", (path) => present.has(path))).toEqual([]);
   });
 });
 

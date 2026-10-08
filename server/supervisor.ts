@@ -19,6 +19,7 @@ import {
   type ServiceRoute,
   type ServiceStatus,
 } from "../shared/service-api";
+import { installDependencies, missingDependencies } from "./dependencies";
 import { findBun, type LocateEnv, realLocateEnv, resolveServicePath, type ServiceLocation } from "./locate";
 
 export interface ServiceConfig {
@@ -196,6 +197,10 @@ export class ServiceSupervisor {
       this.markFatal(error instanceof Error ? error.message : String(error));
       return;
     }
+    if (missingDependencies(this.location.root, existsSync).length > 0) {
+      void this.installThenLaunch(this.bunPath, this.location.root);
+      return;
+    }
     this.state = this.restarts > 0 ? "restarting" : "starting";
     void this.readBunVersion(this.bunPath);
     const args = serviceArgs(config, {
@@ -210,6 +215,27 @@ export class ServiceSupervisor {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.attach(child);
+  }
+
+  private async installThenLaunch(bunPath: string, root: string): Promise<void> {
+    const config = this.config;
+    this.state = "starting";
+    this.detail = "installing service dependencies";
+    this.options.log.info(`installing service dependencies in ${root} with ${bunPath}`);
+    try {
+      await installDependencies(bunPath, root, serviceEnv(process.env));
+    } catch (error) {
+      if (this.config === config) this.markFatal(`dependency install failed: ${errorMessage(error)}`);
+      return;
+    }
+    if (this.config !== config || this.snapshot().state === "stopped") return;
+    const missing = missingDependencies(root, existsSync);
+    if (missing.length > 0) {
+      this.markFatal(`dependencies still missing after install: ${missing.join(", ")}`);
+      return;
+    }
+    this.options.log.info("service dependencies installed");
+    this.launch();
   }
 
   private attach(child: ChildProcess): void {
@@ -334,4 +360,8 @@ function terminate(child: ChildProcess): Promise<void> {
   child.stdin?.end();
   child.kill("SIGTERM");
   return promise;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

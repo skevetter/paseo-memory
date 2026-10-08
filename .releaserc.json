@@ -4,17 +4,22 @@
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
-    ["@semantic-release/npm", { "npmPublish": false }],
+    [
+      "@semantic-release/npm",
+      {
+        "npmPublish": false
+      }
+    ],
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "printf 'export const SERVICE_VERSION = \"%s\";\\n' ${nextRelease.version} > service/version.ts"
+        "prepareCmd": "printf 'export const SERVICE_VERSION = \"%s\";\\n' ${nextRelease.version} > service/version.ts && sed -i -E 's/--ref v[0-9]+\\.[0-9]+\\.[0-9]+/--ref v${nextRelease.version}/; s/Replace `v[0-9]+\\.[0-9]+\\.[0-9]+`/Replace `v${nextRelease.version}`/' README.md"
       }
     ],
     [
       "@semantic-release/git",
       {
-        "assets": ["package.json", "package-lock.json", "service/version.ts"],
+        "assets": ["package.json", "package-lock.json", "bun.lock", "service/version.ts", "README.md"],
         "message": "chore(release): ${nextRelease.version} [skip ci]"
       }
     ],

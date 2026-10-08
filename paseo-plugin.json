@@ -4,6 +4,5 @@
   "description": "Local memory for Paseo agents.",
   "requirements": {
     "paseo": ">=0.11.0-beta.5"
-  },
-  "build": [["npm", "ci", "--omit=dev"]]
+  }
 }

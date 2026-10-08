@@ -26,6 +26,7 @@ The settings screen controls how much memory each agent receives, the session re
 
 - The plugin starts a Bun child process that serves MCP and an internal API on `127.0.0.1:6797`.
 - Data is stored in `$PASEO_HOME/plugin-data/paseo-memory/memory.db`.
+- On first start the plugin runs `bun install` in its directory to fetch its runtime packages, about 480 MB.
 - Embedding and re-ranking models download from Hugging Face on first use, 30 MB to 337 MB per tier. Models run on the host. No memory content leaves the host.
 - Secrets in common formats are redacted before saving.
 - The session review uses one agent turn.

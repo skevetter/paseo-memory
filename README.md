@@ -12,11 +12,6 @@ Local memory for Paseo agents. One SQLite file stores global and project memory.
 - **Audit:** each agent's injected memories, tool calls and reviews.
 - **UI:** a Memory panel, a settings screen and a `/remember` command.
 
-## Scopes
-
-- **Global:** available to every agent.
-- **Project:** keyed by git remote. Worktrees share project memory.
-
 ## Embeddings
 
 | Tier | Model | Dims |
@@ -37,26 +32,21 @@ Models run on the host and download on first use.
 
 ## Install
 
+Install a release tag from GitHub:
+
 ```bash
-npm install
-paseo plugin install /path/to/paseo-memory
+paseo plugin install git:skevetter/paseo-memory --ref v1.2.1
 ```
+
+Replace `v1.2.1` with a tag from [Releases](https://github.com/skevetter/paseo-memory/releases). On first start the plugin installs its dependencies with Bun.
 
 ## Develop
 
+Use npm or Bun.
+
 ```bash
-npm run typecheck
-npm run lint
-npm test
-npm run bench
+npm install          # or: bun install
+npm run typecheck    # or: bun run typecheck
+npm run lint         # or: bun run lint
+bun test
 ```
-
-## Reference
-
-- **Data:** `$PASEO_HOME/plugin-data/paseo-memory/memory.db`
-- **Logs:** `paseo plugin logs paseo-memory`
-- **Settings:** the plugin settings screen, with help text for each setting
-
-## License
-
-MIT

@@ -1,6 +1,6 @@
 import { resolve, sep } from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
 import type { ProjectRef } from "../shared/service-api";
+import type { PaseoApi } from "./host-types";
 
 interface ProjectDescriptor {
   projectId: string;

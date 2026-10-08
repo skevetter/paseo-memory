@@ -1,6 +1,5 @@
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type {
   PluginBeforeRequests,
   PluginLifecycleEvents,
@@ -35,6 +34,7 @@ import { NONCE_ENV, type ProjectRef, type ServiceOutputs } from "../shared/servi
 import { isUsableReply } from "../shared/turns";
 import { digestLatestTurn, type TurnDigest } from "./capture";
 import { FirstPrompts } from "./first-prompts";
+import type { PaseoAgent, PaseoApi } from "./host-types";
 import { AgentLinks } from "./links";
 import { createProjectResolver, type ProjectResolver, projectFromDescriptor } from "./projects";
 import { ReviewScheduler, type ReviewTrigger, type TurnResult } from "./review";

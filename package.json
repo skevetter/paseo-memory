@@ -7,9 +7,11 @@
   "files": [
     "OVERVIEW.md",
     "README.md",
+    "bun.lock",
     "client/",
     "index.client.tsx",
     "index.server.ts",
+    "package-lock.json",
     "paseo-plugin.json",
     "server/",
     "service/",
