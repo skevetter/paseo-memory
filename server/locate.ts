@@ -10,6 +10,7 @@ export interface LocateEnv {
   readFile(path: string): string;
   env: NodeJS.ProcessEnv;
   home: string;
+  platform: NodeJS.Platform;
 }
 
 export const realLocateEnv: LocateEnv = {
@@ -17,6 +18,7 @@ export const realLocateEnv: LocateEnv = {
   readFile: (path) => readFileSync(path, "utf8"),
   env: process.env,
   home: homedir(),
+  platform: process.platform,
 };
 
 export class LocateError extends Error {}
@@ -30,10 +32,26 @@ export function findBun(setting: string, sys: LocateEnv = realLocateEnv): string
     .split(delimiter)
     .filter(Boolean)
     .map((dir) => join(dir, "bun"));
-  const candidates = [...fromPath, "/opt/homebrew/bin/bun", join(sys.home, ".bun", "bin", "bun")];
+  const candidates = [...fromPath, ...bunLocations(sys.home)];
   const found = candidates.find((path) => sys.exists(path));
-  if (!found) throw new LocateError("bun not found. Install with `brew install bun`.");
+  if (!found) throw new LocateError(`bun not found. ${bunInstallHint(sys.platform)}`);
   return found;
+}
+
+function bunLocations(home: string): string[] {
+  return [
+    "/opt/homebrew/bin/bun",
+    join(home, ".bun", "bin", "bun"),
+    "/usr/local/bin/bun",
+    "/home/linuxbrew/.linuxbrew/bin/bun",
+    join(home, ".local", "bin", "bun"),
+  ];
+}
+
+export function bunInstallHint(platform: NodeJS.Platform): string {
+  return platform === "darwin"
+    ? "Install with `brew install bun`."
+    : "Install with `curl -fsSL https://bun.sh/install | bash`.";
 }
 
 export interface ServiceLocation {

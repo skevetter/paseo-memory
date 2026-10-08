@@ -10,17 +10,17 @@ export const MAC_SQLITE_CANDIDATES = [
 
 export class FatalError extends Error {}
 
-// Apple's system SQLite cannot load extensions; Linux Bun's can, so only macOS swaps the library.
+// Apple's system SQLite cannot load extensions, so macOS needs a replacement; Bun's bundled SQLite can elsewhere.
 export function resolveSqliteLibrary(
   setting: string | null,
   platform: NodeJS.Platform = process.platform,
   exists: (path: string) => boolean = existsSync,
 ): string | null {
-  if (platform !== "darwin") return null;
   if (setting) {
     if (!exists(setting)) throw new FatalError(`SQLite override ${setting} does not exist.`);
     return setting;
   }
+  if (platform !== "darwin") return null;
   const found = MAC_SQLITE_CANDIDATES.find((path) => exists(path));
   if (!found) {
     throw new FatalError("SQLite with extension support not found. Install with `brew install sqlite`.");

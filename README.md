@@ -32,6 +32,7 @@ Models run on the host and download on first use.
 
 - Paseo 0.11.0-beta.5 or later, with plugins enabled
 - Bun 1.4 or later
+- macOS or Linux, arm64 or x64
 - macOS: Homebrew SQLite (`brew install sqlite`). Apple's SQLite cannot load extensions.
 
 ## Install

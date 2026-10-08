@@ -13,6 +13,7 @@ Memory has two scopes. Global memory reaches every agent. Project memory is keye
 
 ## Setup
 
+- macOS or Linux, arm64 or x64.
 - Bun 1.4 or later on the daemon host.
 - macOS: Homebrew SQLite. Apple's SQLite cannot load extensions.
 - Paseo 0.11.0-beta.5 or later.

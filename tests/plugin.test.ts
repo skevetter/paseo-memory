@@ -15,7 +15,11 @@ import { tempDir } from "./helpers";
 
 const repoRoot = join(import.meta.dir, "..");
 
-function fakeFs(files: Record<string, string>, env: NodeJS.ProcessEnv = {}): LocateEnv {
+function fakeFs(
+  files: Record<string, string>,
+  env: NodeJS.ProcessEnv = {},
+  platform: NodeJS.Platform = "darwin",
+): LocateEnv {
   return {
     exists: (path) => Object.hasOwn(files, path),
     readFile: (path) => {
@@ -25,6 +29,7 @@ function fakeFs(files: Record<string, string>, env: NodeJS.ProcessEnv = {}): Loc
     },
     env,
     home: "/Users/me",
+    platform,
   };
 }
 
@@ -111,8 +116,19 @@ describe("locating bun", () => {
     expect(findBun("", fakeFs({ "/Users/me/.bun/bin/bun": "" }))).toBe("/Users/me/.bun/bin/bun");
   });
 
+  it("finds bun in Linux install locations", () => {
+    const linux = (path: string) => fakeFs({ [path]: "" }, {}, "linux");
+    expect(findBun("", linux("/home/linuxbrew/.linuxbrew/bin/bun"))).toBe(
+      "/home/linuxbrew/.linuxbrew/bin/bun",
+    );
+    expect(findBun("", linux("/Users/me/.local/bin/bun"))).toBe("/Users/me/.local/bin/bun");
+  });
+
   it("fails with an actionable message when bun is missing", () => {
     expect(() => findBun("", fakeFs({}))).toThrow("bun not found. Install with `brew install bun`.");
+    expect(() => findBun("", fakeFs({}, {}, "linux"))).toThrow(
+      "bun not found. Install with `curl -fsSL https://bun.sh/install | bash`.",
+    );
     expect(() => findBun("/nope/bun", fakeFs({}))).toThrow(LocateError);
   });
 });
@@ -302,16 +318,12 @@ describe("supervisor", () => {
     expect(s.snapshot().restarts).toBe(1);
   }, 30_000);
 
-  it.if(process.platform === "darwin")(
-    "reports a fatal state when the service refuses to start",
-    async () => {
-      const { supervisor: s } = start({ sqlitePath: "/nonexistent/libsqlite3.dylib" });
-      await waitFor(() => s.snapshot().state === "fatal");
-      expect(s.snapshot().detail).toContain("SQLite override /nonexistent/libsqlite3.dylib does not exist");
-      await expect(s.call("status", {}, 500)).rejects.toThrow(/memory service is fatal/);
-    },
-    30_000,
-  );
+  it("reports a fatal state when the service refuses to start", async () => {
+    const { supervisor: s } = start({ sqlitePath: "/nonexistent/libsqlite3.dylib" });
+    await waitFor(() => s.snapshot().state === "fatal");
+    expect(s.snapshot().detail).toContain("SQLite override /nonexistent/libsqlite3.dylib does not exist");
+    await expect(s.call("status", {}, 500)).rejects.toThrow(/memory service is fatal/);
+  }, 30_000);
 
   it("reports a fatal state when bun is missing", async () => {
     const { supervisor: s } = start({ bunPath: "/nonexistent/bun" });

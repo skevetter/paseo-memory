@@ -92,7 +92,7 @@ const settingsSchema = z.object({
   // Applies to session digests and agent audit events.
   sessionRetentionDays: ranged("sessionRetentionDays", 30),
   mcpDenyProviders: z.array(z.string()).default(["pi"]),
-  // Empty means auto-detect: bun on PATH, Homebrew SQLite, and the plugin directory from config.json.
+  // Empty means auto-detect: bun on PATH, Homebrew SQLite on macOS, and the plugin directory from config.json.
   bunPath: z.string().default(""),
   sqlitePath: z.string().default(""),
   servicePath: z.string().default(""),
