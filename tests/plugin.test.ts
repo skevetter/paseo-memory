@@ -302,12 +302,16 @@ describe("supervisor", () => {
     expect(s.snapshot().restarts).toBe(1);
   }, 30_000);
 
-  it("reports a fatal state when the service refuses to start", async () => {
-    const { supervisor: s } = start({ sqlitePath: "/nonexistent/libsqlite3.dylib" });
-    await waitFor(() => s.snapshot().state === "fatal");
-    expect(s.snapshot().detail).toContain("SQLite override /nonexistent/libsqlite3.dylib does not exist");
-    await expect(s.call("status", {}, 500)).rejects.toThrow(/memory service is fatal/);
-  }, 30_000);
+  it.if(process.platform === "darwin")(
+    "reports a fatal state when the service refuses to start",
+    async () => {
+      const { supervisor: s } = start({ sqlitePath: "/nonexistent/libsqlite3.dylib" });
+      await waitFor(() => s.snapshot().state === "fatal");
+      expect(s.snapshot().detail).toContain("SQLite override /nonexistent/libsqlite3.dylib does not exist");
+      await expect(s.call("status", {}, 500)).rejects.toThrow(/memory service is fatal/);
+    },
+    30_000,
+  );
 
   it("reports a fatal state when bun is missing", async () => {
     const { supervisor: s } = start({ bunPath: "/nonexistent/bun" });
