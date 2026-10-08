@@ -1,6 +1,7 @@
 {
   "id": "paseo-memory",
-  "description": "Shared memory for Paseo agents, stored locally.",
+  "name": "Paseo Memory",
+  "description": "Local memory for Paseo agents.",
   "requirements": {
     "paseo": ">=0.11.0-beta.5"
   },

@@ -5,6 +5,7 @@
   "license": "MIT",
   "repository": "github:skevetter/paseo-memory",
   "files": [
+    "OVERVIEW.md",
     "README.md",
     "client/",
     "index.client.tsx",
