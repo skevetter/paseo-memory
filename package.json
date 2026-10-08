@@ -1,6 +1,6 @@
 {
   "name": "paseo-memory",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Shared memory for Paseo agents, stored locally.",
   "license": "MIT",
   "repository": "github:skevetter/paseo-memory",
