@@ -28,6 +28,10 @@ function serviceText(service: ServiceInfo): RowText {
 function embedderText({ embedder }: LiveInfo): RowText {
   const name = `${TIER_NAMES[embedder.tier]} · ${embedder.model}`;
   if (embedder.state === "error") return { hint: name, error: embedder.error ?? "The model failed to load." };
+  if (embedder.failed > 0) {
+    const reason = embedder.indexError ? `: ${embedder.indexError}` : "";
+    return { hint: name, error: `${embedder.failed} memories could not be indexed${reason}` };
+  }
   if (embedder.pending > 0)
     return { hint: `${name} · Loading (${embedder.pending} left to index)`, error: null };
   if (embedder.state === "loading") return { hint: `${name} · Loading`, error: null };

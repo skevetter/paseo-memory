@@ -1,10 +1,23 @@
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
+import { FatalError } from "./sqlite";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
+
+export class SchemaTooNewError extends FatalError {
+  constructor(found: number, supported: number) {
+    super(
+      `The memory database uses schema v${found}, but this plugin supports up to schema v${supported}. ` +
+        "Update paseo-memory to open it. The database was not modified.",
+    );
+  }
+}
 
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
-  if (current >= SCHEMA_VERSION) return;
+  if (current > SCHEMA_VERSION) throw new SchemaTooNewError(current, SCHEMA_VERSION);
+  if (current === SCHEMA_VERSION) return;
+  if (current > 0) backupBeforeMigration(db, current);
   db.transaction(() => {
     if (current === 1) dropV1Vectors(db);
     db.run(SCHEMA_SQL);
@@ -15,9 +28,39 @@ export function migrate(db: Database): void {
     addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
     db.run(V4_SQL);
     db.run(V5_SQL);
+    addColumns(db, "memories", V6_MEMORY_COLUMNS);
+    addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
+    db.run(V6_SQL);
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
+
+// VACUUM INTO writes a consistent snapshot including pages still in the WAL, which a plain file copy would miss.
+function backupBeforeMigration(db: Database, from: number): void {
+  const file = db
+    .query<{ file: string }, []>(`SELECT file FROM pragma_database_list WHERE name = 'main'`)
+    .get()?.file;
+  if (!file) return;
+  const base = `${file}.pre-v${SCHEMA_VERSION}-from-v${from}.bak`;
+  const target = existsSync(base) ? `${base}.${Date.now()}` : base;
+  db.query(`VACUUM INTO ?`).run(target);
+}
+
+const V6_MEMORY_COLUMNS: [string, string][] = [
+  ["index_generation", "INTEGER NOT NULL DEFAULT 1"],
+  ["record_revision", "INTEGER NOT NULL DEFAULT 1"],
+];
+
+// Existing vectors predate generation tracking, so they cannot prove an earlier index race did not happen.
+const V6_EMBEDDING_COLUMNS: [string, string][] = [
+  ["index_generation", "INTEGER NOT NULL DEFAULT 0"],
+  ["model_fingerprint", "TEXT NOT NULL DEFAULT ''"],
+];
+
+const V6_SQL = `
+  UPDATE memories SET record_revision = revision_count;
+  UPDATE memory_embeddings SET index_generation = 0, model_fingerprint = '';
+`;
 
 const V3_MEMORY_COLUMNS: [string, string][] = [
   ["use_count", "INTEGER NOT NULL DEFAULT 0"],

@@ -31,13 +31,18 @@ export async function findTaskMatches(input: TaskSearch): Promise<TaskMatches> {
   const result: TaskMatches = { query, source: task.source, hits: [], note: null };
   const { taskMatches: limit, taskStrictness: strictness } = store.config;
   if (limit === 0) return { ...result, note: "Task matches are turned off." };
-  const timedOut = Promise.withResolvers<null>();
-  const timer = setTimeout(() => timedOut.resolve(null), input.budgetMs);
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), input.budgetMs);
   try {
     const access = Access.agent(input.project?.key ?? null);
-    const search = store.search({ query, access, scope: "all", limit: limit * 3 });
-    const hits = await Promise.race([search, timedOut.promise]);
-    if (hits === null) {
+    const hits = await store.search({
+      query,
+      access,
+      scope: "all",
+      limit: limit * 3,
+      signal: deadline.signal,
+    });
+    if (deadline.signal.aborted) {
       return {
         ...result,
         note: `The search took longer than ${input.budgetMs} ms, so only the general lists were used.`,
