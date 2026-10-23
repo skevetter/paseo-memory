@@ -35,10 +35,10 @@ Models run on the host and download on first use.
 Install a release tag from GitHub:
 
 ```bash
-paseo plugin install git:skevetter/paseo-memory --ref v1.2.3
+paseo plugin install git:skevetter/paseo-memory --ref v1.2.4
 ```
 
-Replace `v1.2.3` with a tag from [Releases](https://github.com/skevetter/paseo-memory/releases). On first start the plugin installs its dependencies with Bun.
+Replace `v1.2.4` with a tag from [Releases](https://github.com/skevetter/paseo-memory/releases). On first start the plugin installs its dependencies with Bun.
 
 ## Develop
 
