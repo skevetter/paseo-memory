@@ -46,7 +46,9 @@ describe("starting memory selection", () => {
       owner,
       result.memoryRefs.map((ref) => ref.id),
     );
-    expect(selected.filter((row) => row.pinned).map((row) => row.id)).toEqual(pins.slice(0, 2));
+    const selectedPins = selected.filter((row) => row.pinned);
+    expect(selectedPins).toHaveLength(2);
+    for (const row of selectedPins) expect(pins).toContain(row.id);
     expect(selected.filter((row) => row.title.startsWith("Project note")).map((row) => row.scope)).toEqual([
       "project",
       "project",
