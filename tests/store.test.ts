@@ -11,7 +11,16 @@ import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
 import { DEFAULT_RUNTIME, EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
-import { dataRepo, hashEmbedder, hashSpec, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
+import {
+  dataRepo,
+  hashEmbedder,
+  hashSpec,
+  mergeRequest,
+  otherRepo,
+  owner,
+  removeV7Schema,
+  tempDir,
+} from "./helpers";
 
 let store: MemoryStore;
 beforeEach(() => {
@@ -337,6 +346,7 @@ describe("migration", () => {
     const { db } = openDatabase(path);
     // A 1.0 database: today's schema minus everything v3 added.
     migrate(db);
+    removeV7Schema(db);
     db.run(`INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
         VALUES ('global', 'note', 'From 1.0', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
       ALTER TABLE memories DROP COLUMN use_count;
@@ -364,6 +374,7 @@ describe("migration", () => {
     const { db } = openDatabase(path);
     // A 1.1 database: today's schema minus everything v4 added, with the 1.1 sessions index.
     migrate(db);
+    removeV7Schema(db);
     db.run(`DROP TRIGGER sessions_ai; DROP TRIGGER sessions_ad; DROP TRIGGER sessions_au; DROP TABLE sessions_fts;
       DROP TABLE upkeep_dismissed;
       ALTER TABLE memories DROP COLUMN shown_count; ALTER TABLE memories DROP COLUMN opened_count;
@@ -406,6 +417,7 @@ describe("migration", () => {
     const { db } = openDatabase(path);
     // A 1.2.0 database: today's schema with the memories index that kept "." inside words.
     migrate(db);
+    removeV7Schema(db);
     db.run(`DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au; DROP TABLE memories_fts;
       CREATE VIRTUAL TABLE memories_fts USING fts5(title, content, topic_key, content = 'memories',
         content_rowid = 'id', tokenize = "porter unicode61 tokenchars '_-./'");

@@ -11,9 +11,9 @@ import type {
 import { Access } from "./access";
 import { buildContext, buildSystemPrompt } from "./context";
 import { signCaller } from "./mcp";
+import { MutationError, mutationRequestId, ownerMutation } from "./mutations";
 import { redact } from "./redact";
 import { finishReview } from "./review";
-import { errorText } from "./sqlite";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
 import { findTaskMatches, type TaskMatches } from "./task";
 import { clip } from "./text";
@@ -39,6 +39,7 @@ export function createRoutes(ctx: RouteContext): Routes {
     paseoProjectId ? store.projectByPaseoId(paseoProjectId) : null;
   return {
     status: () => ctx.status(),
+    ...lifecycleRoutes(store),
     configure: (input) => {
       store.configure(input);
       return { ok: true };
@@ -72,22 +73,45 @@ export function createRoutes(ctx: RouteContext): Routes {
     ...upkeepRoutes(store, projectOf),
     save: (input) => saveFromUi(store, input),
     update: (input) => updateFromUi(store, input),
-    delete: (input) => ({ ok: store.deleteAuthorized(OWNER, input.id) === "ok" }),
+    delete: (input) => {
+      store.mutations.mutate(ownerMutation(OWNER), {
+        requestId: input.requestId ?? mutationRequestId(),
+        operation: "archive",
+        id: input.id,
+        expectedRevision: input.expectedRevision,
+      });
+      return { ok: true };
+    },
     detail: (input) => store.detailAuthorized(OWNER, input.id),
     restore: (input) => {
-      const outcome = store.restoreAuthorized(OWNER, input.id, input.version);
-      return { ok: outcome === "ok" || outcome === "unchanged" };
+      store.mutations.mutate(ownerMutation(OWNER), {
+        requestId: input.requestId ?? mutationRequestId(),
+        operation: "restore",
+        id: input.id,
+        expectedRevision: input.expectedRevision,
+        change: { sourceRevision: input.version },
+      });
+      return { ok: true };
     },
     merge: (input) => {
-      const result = store.mergeAuthorized(OWNER, input);
-      return {
-        ok: result.ok,
-        message: result.message,
-        mergeId: result.mergeId ?? null,
-        conflict: result.conflict ?? false,
-      };
+      store.mutations.mutate(ownerMutation(OWNER), {
+        requestId: input.requestId ?? mutationRequestId(),
+        operation: "merge",
+        id: input.sourceId,
+        expectedRevision: input.sourceRevision,
+        change: { target: { id: input.targetId, revision: input.targetRevision } },
+      });
+      const detail = store.detailAuthorized(OWNER, input.sourceId);
+      return { ok: true, message: "Merged.", mergeId: detail.mergeId, conflict: false };
     },
-    "merge-undo": (input) => store.undoMergeAuthorized(OWNER, input.mergeId),
+    "merge-undo": (input) => {
+      const result = store.undoMergeAuthorized(OWNER, input.mergeId, {
+        sourceRevision: input.sourceRevision,
+        targetRevision: input.targetRevision,
+      });
+      if (!result.ok) throw new MutationError("revision_conflict", result.message);
+      return result;
+    },
     sessions: (input) => {
       const projectKey = projectOf(input.paseoProjectId)?.key ?? null;
       return { items: store.sessions({ projectKey, query: input.query, limit: input.limit }).map(toSession) };
@@ -98,11 +122,52 @@ export function createRoutes(ctx: RouteContext): Routes {
   };
 }
 
+type LifecycleRoutes =
+  | "mutate"
+  | "lifecycle-detail"
+  | "historical"
+  | "forget-preview"
+  | "evidence-artifact"
+  | "source-invalidate"
+  | "source-forget";
+
+function lifecycleRoutes(store: MemoryStore): Pick<Routes, LifecycleRoutes> {
+  return {
+    mutate: (input) => store.mutations.mutate(ownerMutation(OWNER), input),
+    "lifecycle-detail": ({ id }) => store.lifecycleDetail(OWNER, id),
+    historical: ({ id, asOf }) => {
+      const row = store.historical(OWNER, id, asOf);
+      return row
+        ? {
+            memoryRef: { id: row.id, revision: row.record_revision },
+            title: row.title,
+            content: row.content,
+            state: row.state,
+            recordKind: row.record_kind,
+            verificationStatus: row.verification_status,
+            validFrom: row.valid_from,
+            validUntil: row.valid_until,
+          }
+        : null;
+    },
+    "forget-preview": ({ id }) => store.lifecycle.preview(OWNER, id),
+    "evidence-artifact": (input) => store.provenance.registerArtifact(OWNER, input),
+    "source-invalidate": ({ sourceRef }) => store.invalidateSource(OWNER, sourceRef),
+    "source-forget": ({ sourceRef, requestId }) => store.forgetSource(OWNER, sourceRef, requestId),
+  };
+}
+
 function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-end" | "review-skip"> {
   const { store } = ctx;
   return {
     "review-start": (input) => {
       const cap = store.config.reviewMaxMemories;
+      if (store.sessionInvalidated(input.agentId))
+        return {
+          ok: false,
+          reason: "A source was forgotten. Start a fresh agent context before review.",
+          cap,
+        };
       const nonce = store.audit.toolNonceFor(input.agentId);
       if (!nonce) return { ok: false, reason: "This agent has no memory tools.", cap };
       store.reviews.open({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
@@ -145,7 +210,15 @@ function upkeepRoutes(
     },
     "upkeep-run": () => runUpkeep(store, new Date().toISOString()),
     keep: (input) => ({ ok: store.keep(OWNER, input.id) === "ok" }),
-    archive: (input) => ({ ok: store.archive(OWNER, input.id) === "ok" }),
+    archive: (input) => {
+      store.mutations.mutate(ownerMutation(OWNER), {
+        requestId: input.requestId ?? mutationRequestId(),
+        operation: "archive",
+        id: input.id,
+        expectedRevision: input.expectedRevision,
+      });
+      return { ok: true };
+    },
     "dismiss-pair": (input) => {
       store.dismissPair(input.a, input.b);
       return { ok: true };
@@ -202,33 +275,42 @@ function taskAudit(task: TaskMatches, injectedIds: number[]) {
   };
 }
 
-async function saveFromUi(
-  store: MemoryStore,
-  input: ServiceParsedInput<"save">,
-): Promise<ServiceOutputs["save"]> {
+function saveFromUi(store: MemoryStore, input: ServiceParsedInput<"save">): ServiceOutputs["save"] {
   const known = input.paseoProjectId ? store.projectByPaseoId(input.paseoProjectId) : null;
   const project: ProjectRef | null = known ?? input.project;
-  if (input.scope === "project" && !project) return { id: null, status: "error", message: "Unknown project" };
-  const result = await store.save({ ...input, project, force: true, source: "user" });
-  return { id: result.id, status: result.status, message: `${result.status} #${result.id ?? "-"}` };
+  if (input.scope === "project" && !project) throw new MutationError("scope_denied", "Unknown project.");
+  const result = store.mutations.mutate(ownerMutation(OWNER), {
+    requestId: input.requestId ?? mutationRequestId(),
+    operation: "create",
+    change: {
+      title: input.title,
+      content: input.content,
+      type: input.type,
+      scope: input.scope,
+      project,
+      pinned: input.pinned,
+    },
+  });
+  return { ...result, id: result.memoryRef.id, message: `${result.status} #${result.memoryRef.id}` };
 }
 
 function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): ServiceOutputs["update"] {
   const known = input.paseoProjectId ? store.projectByPaseoId(input.paseoProjectId) : null;
-  try {
-    const outcome = store.updateAuthorized(OWNER, input.id, {
+  store.mutations.mutate(ownerMutation(OWNER), {
+    requestId: input.requestId ?? mutationRequestId(),
+    operation: "update",
+    id: input.id,
+    expectedRevision: input.expectedRevision,
+    change: {
       title: input.title,
       content: input.content,
       type: input.type,
       pinned: input.pinned,
       scope: input.scope,
-      project: known ?? input.project ?? null,
-    });
-    const ok = outcome === "ok" || outcome === "unchanged";
-    return { ok, message: ok ? "Saved." : "This memory no longer exists." };
-  } catch (error) {
-    return { ok: false, message: errorText(error) };
-  }
+      ...(input.scope === "project" ? { project: known ?? input.project ?? null } : {}),
+    },
+  });
+  return { ok: true, message: "Saved." };
 }
 
 async function attachments(store: MemoryStore, query: string): Promise<ServiceOutputs["attachments"]> {

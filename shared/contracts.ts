@@ -1,10 +1,18 @@
 import { defineAttachmentSource, defineRpc, defineSettings, type RpcOutput } from "@getpaseo/plugin";
 import { z } from "zod";
 import {
+  ForgetPreviewSchema,
+  LifecycleDetailSchema,
+  MutationRequestSchema,
+  MutationResultSchema,
+} from "./lifecycle";
+import {
   AgentAuditSchema,
   DEFAULT_RUNTIME,
   DETAIL_LEVELS,
   EMBEDDING_TIERS,
+  EvidenceArtifactInputSchema,
+  HistoricalMemorySchema,
   MAX_CONTENT_CHARS,
   MEMORY_TYPES,
   MERGE_MODES,
@@ -17,6 +25,7 @@ import {
   SearchScopeSchema,
   SessionItemSchema,
   STRICTNESS_LEVELS,
+  serviceInputs,
   UpkeepListSchema,
   WorkspaceAgentSchema,
 } from "./service-api";
@@ -145,6 +154,42 @@ export const searchMemoriesRpc = defineRpc({
   output: z.object({ items: z.array(MemoryItemSchema) }),
 });
 
+export const mutateMemoryRpc = defineRpc({
+  name: "memory.mutate",
+  input: MutationRequestSchema,
+  output: MutationResultSchema,
+});
+export const memoryLifecycleRpc = defineRpc({
+  name: "memory.lifecycle",
+  input: serviceInputs["lifecycle-detail"],
+  output: LifecycleDetailSchema.nullable(),
+});
+export const memoryHistoricalRpc = defineRpc({
+  name: "memory.historical",
+  input: serviceInputs.historical,
+  output: HistoricalMemorySchema.nullable(),
+});
+export const forgetPreviewRpc = defineRpc({
+  name: "memory.forget.preview",
+  input: serviceInputs["forget-preview"],
+  output: ForgetPreviewSchema,
+});
+export const evidenceArtifactRpc = defineRpc({
+  name: "memory.evidence.artifact",
+  input: EvidenceArtifactInputSchema,
+  output: z.object({ sourceRef: z.string(), sourceHash: z.string() }),
+});
+export const invalidateSourceRpc = defineRpc({
+  name: "memory.source.invalidate",
+  input: serviceInputs["source-invalidate"],
+  output: z.object({ affected: z.number().int() }),
+});
+export const forgetSourceRpc = defineRpc({
+  name: "memory.source.forget",
+  input: serviceInputs["source-forget"],
+  output: z.object({ forgotten: z.number().int() }),
+});
+
 export const saveMemoryRpc = defineRpc({
   name: "memory.save",
   input: z.object({
@@ -154,14 +199,17 @@ export const saveMemoryRpc = defineRpc({
     scope: MemoryScopeSchema.default("project"),
     paseoProjectId: z.string().nullable(),
     pinned: z.boolean().default(false),
+    requestId: z.string().min(1).max(200).optional(),
   }),
-  output: z.object({ id: z.number().nullable(), status: z.string(), message: z.string() }),
+  output: MutationResultSchema.extend({ id: z.number(), message: z.string() }),
 });
 
 export const updateMemoryRpc = defineRpc({
   name: "memory.update",
   input: z.object({
     id: z.number().int(),
+    expectedRevision: z.number().int().positive(),
+    requestId: z.string().min(1).max(200).optional(),
     title: z.string().min(1).max(200).optional(),
     content: z.string().min(1).max(MAX_CONTENT_CHARS).optional(),
     type: MemoryTypeSchema.optional(),
@@ -175,7 +223,7 @@ export const updateMemoryRpc = defineRpc({
 
 export const deleteMemoryRpc = defineRpc({
   name: "memory.delete",
-  input: z.object({ id: z.number().int() }),
+  input: serviceInputs.delete,
   output: z.object({ ok: z.boolean() }),
 });
 
@@ -187,7 +235,7 @@ export const memoryDetailRpc = defineRpc({
 
 export const restoreMemoryRpc = defineRpc({
   name: "memory.restore",
-  input: z.object({ id: z.number().int(), version: z.number().int() }),
+  input: serviceInputs.restore,
   output: z.object({ ok: z.boolean() }),
 });
 
@@ -198,6 +246,7 @@ export const mergeMemoryRpc = defineRpc({
     targetId: z.number().int(),
     sourceRevision: z.number().int(),
     targetRevision: z.number().int(),
+    requestId: z.string().min(1).max(200).optional(),
   }),
   output: z.object({
     ok: z.boolean(),
@@ -209,7 +258,7 @@ export const mergeMemoryRpc = defineRpc({
 
 export const undoMergeRpc = defineRpc({
   name: "memory.merge.undo",
-  input: z.object({ mergeId: z.number().int() }),
+  input: serviceInputs["merge-undo"],
   output: z.object({ ok: z.boolean(), message: z.string() }),
 });
 
@@ -260,7 +309,7 @@ export const keepMemoryRpc = defineRpc({
 
 export const archiveMemoryRpc = defineRpc({
   name: "memory.archive",
-  input: z.object({ id: z.number().int() }),
+  input: serviceInputs.archive,
   output: z.object({ ok: z.boolean() }),
 });
 

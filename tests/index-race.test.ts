@@ -7,7 +7,7 @@ import { migrate, SCHEMA_VERSION, SchemaTooNewError } from "../service/schema";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type StoreOptions } from "../service/store";
 import { scopeKey } from "../service/vectors";
-import { dataRepo, hashEmbedder, otherRepo, owner, tempDir } from "./helpers";
+import { dataRepo, hashEmbedder, otherRepo, owner, removeV7Schema, tempDir } from "./helpers";
 
 const stores: MemoryStore[] = [];
 afterEach(() => {
@@ -426,6 +426,7 @@ async function v5Database() {
   await store.indexPending();
   store.close();
   const { db } = openDatabase(path);
+  removeV7Schema(db);
   db.run(`ALTER TABLE memories DROP COLUMN index_generation; ALTER TABLE memories DROP COLUMN record_revision;
     ALTER TABLE memory_embeddings DROP COLUMN index_generation;
     ALTER TABLE memory_embeddings DROP COLUMN model_fingerprint;

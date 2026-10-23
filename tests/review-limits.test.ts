@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { z } from "zod";
 import { type RunningService, serviceKey, startService } from "../service/app";
-import type { Embedder } from "../service/embedder";
-import type { Caller, ToolDefinition } from "../service/mcp";
+import type { Caller } from "../service/mcp";
+import { mutationRequestId, ownerMutation } from "../service/mutations";
 import { MemoryStore } from "../service/store";
 import { createTools } from "../service/tools";
+import { MutationResultSchema } from "../shared/lifecycle";
 import { silentLogger } from "../shared/log";
 import { DEFAULT_RUNTIME, MAX_CONTENT_CHARS, SERVICE_KEY_HEADER } from "../shared/service-api";
 import { hashEmbedder, hashSpec, owner, tempDir } from "./helpers";
@@ -17,7 +18,7 @@ const resultSchema = z.object({
     structuredContent: z.object({ error: z.object({ code: z.string() }) }).optional(),
   }),
 });
-
+type ToolResult = z.infer<typeof resultSchema>["result"];
 let service: RunningService;
 let headers: Record<string, string>;
 let requestId = 0;
@@ -30,18 +31,19 @@ beforeEach(async () => {
     log: silentLogger,
   });
   await service.modelsReady();
-  const context = await internal("agent-context", {
-    project: null,
-    provider: "omp",
-    includeContext: false,
-    includeTools: true,
-  });
-  const parsed = z
+  const context = z
     .object({ nonce: z.string(), mcpServer: z.object({ headers: z.record(z.string(), z.string()) }) })
-    .parse(context);
-  headers = parsed.mcpServer.headers;
+    .parse(
+      await internal("agent-context", {
+        project: null,
+        provider: "omp",
+        includeContext: false,
+        includeTools: true,
+      }),
+    );
+  headers = context.mcpServer.headers;
   await internal("link-agent", {
-    nonce: parsed.nonce,
+    nonce: context.nonce,
     agentId: "reviewer",
     workspaceId: "workspace",
     title: "Review",
@@ -49,7 +51,6 @@ beforeEach(async () => {
   requestId = 0;
 });
 afterEach(() => service.stop());
-
 async function internal(route: string, body: unknown) {
   const response = await fetch(`http://127.0.0.1:${service.port}/v1/${route}`, {
     method: "POST",
@@ -66,7 +67,7 @@ async function begin(cap: number) {
     cap,
   });
 }
-async function call(name: string, args: unknown, id = ++requestId) {
+async function call(name: string, args: unknown, id = ++requestId): Promise<ToolResult> {
   const response = await fetch(service.mcpUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
@@ -74,15 +75,22 @@ async function call(name: string, args: unknown, id = ++requestId) {
   });
   return resultSchema.parse(await response.json()).result;
 }
-const save = (label: string) => ({
-  title: label,
-  content: `durable fact about ${label}`,
+const save = (title: string) => ({
+  title,
+  content: `durable fact about ${title}`,
   scope: "global",
   force: true,
 });
-const text = (result: z.infer<typeof resultSchema>["result"]) => result.content[0]?.text ?? "";
-const seed = async () =>
-  Number(
+function receipt(result: ToolResult) {
+  expect(result.isError).toBe(false);
+  return MutationResultSchema.parse(JSON.parse(result.content[0]?.text ?? "null"));
+}
+function current(id: number) {
+  const detail = service.store.lifecycleDetail(owner, id);
+  return detail?.revisions.find((r) => r.revision === detail.memoryRef.revision)?.snapshot;
+}
+async function seed() {
+  return Number(
     (
       await service.store.save({
         title: "Existing",
@@ -93,42 +101,26 @@ const seed = async () =>
       })
     ).id,
   );
-
-class DeferredEmbedding {
-  readonly entered = Promise.withResolvers<void>();
-  readonly released = Promise.withResolvers<void>();
-  readonly backend = hashEmbedder();
-  private waiting = true;
-  readonly embedder: Embedder = {
-    spec: this.backend.spec,
-    embed: async (texts, kind) => {
-      if (this.waiting) {
-        this.waiting = false;
-        this.entered.resolve();
-        await this.released.promise;
-      }
-      return this.backend.embed(texts, kind);
-    },
-  };
 }
 
-describe("atomic review limits over MCP", () => {
-  it("counts direct updates and topic upserts against the same save cap", async () => {
+describe("atomic review mutation limits over MCP", () => {
+  it("counts direct corrections and topic creations against the same cap without promoting them", async () => {
     const id = await seed();
     await begin(2);
-    expect((await call("memory_update", { id, content: "after" })).isError).toBe(false);
-    expect(text(await call("memory_save", { ...save("Topic"), topic_key: "topic" }))).toStartWith("created:");
+    const updated = receipt(await call("memory_update", { id, content: "after" }));
+    const created = receipt(await call("memory_save", { ...save("Topic"), topic_key: "topic" }));
+    expect(updated).toMatchObject({ status: "updated", state: "candidate" });
+    expect(created.state).toBe("candidate");
     expect(
-      (await call("memory_save", { ...save("Topic"), content: "new topic value", topic_key: "topic" }))
-        .isError,
-    ).toBe(true);
-    expect(service.store.getVisible(owner, [id])[0]?.content).toBe("after");
-    expect(service.store.liveRows(owner).find((row) => row.topic_key === "topic")?.content).toBe(
-      "durable fact about Topic",
-    );
+      (await call("memory_save", { ...save("Topic"), content: "over cap", topic_key: "topic" }))
+        .structuredContent?.error.code,
+    ).toBe("review_cap_reached");
+    expect(current(id)?.content).toBe("after");
+    expect(current(created.memoryRef.id)?.content).toBe("durable fact about Topic");
+    expect(service.store.getVisible(owner, [id, created.memoryRef.id])).toEqual([]);
   });
 
-  it("counts a successful topic upsert as one change", async () => {
+  it("counts a topic correction once and preserves its identity", async () => {
     const original = await service.store.save({
       title: "Topic",
       content: "before",
@@ -138,94 +130,95 @@ describe("atomic review limits over MCP", () => {
       topicKey: "topic",
     });
     await begin(1);
-    expect(text(await call("memory_save", { ...save("Topic"), topic_key: "topic" }))).toBe(
-      `updated: #${original.id} (global)`,
-    );
-    expect((await call("memory_update", { id: original.id, content: "third value" })).isError).toBe(true);
-    expect(service.store.getVisible(owner, [Number(original.id)])[0]?.content).toBe(
-      "durable fact about Topic",
-    );
+    const result = receipt(await call("memory_save", { ...save("Topic"), topic_key: "topic" }));
+    expect(result.memoryRef).toEqual({ id: Number(original.id), revision: 2 });
+    expect(
+      (await call("memory_update", { id: original.id, content: "third" })).structuredContent?.error.code,
+    ).toBe("review_cap_reached");
+    expect(current(Number(original.id))?.content).toBe("durable fact about Topic");
   });
 
-  it("cap zero blocks both saves and updates", async () => {
+  it("permits no memory changes at cap zero", async () => {
     const id = await seed();
     await begin(0);
-    expect((await call("memory_save", save("Blocked"))).isError).toBe(true);
-    expect((await call("memory_update", { id, content: "must not persist" })).isError).toBe(true);
-    expect(service.store.getVisible(owner, [id])[0]?.content).toBe("before");
-    expect(service.store.liveRows(owner).map((row) => row.id)).toEqual([id]);
+    expect((await call("memory_save", save("Blocked"))).structuredContent?.error.code).toBe(
+      "review_cap_reached",
+    );
+    expect(
+      (await call("memory_update", { id, content: "must not persist" })).structuredContent?.error.code,
+    ).toBe("review_cap_reached");
+    expect(current(id)).toMatchObject({ content: "before", record_revision: 1 });
   });
 
-  it("reserves the last slot before embedding so N+1 concurrent calls cannot exceed N", async () => {
-    await begin(1);
-    const deferred = new DeferredEmbedding();
-    service.store.setEmbedder(deferred.embedder);
-    const first = call("memory_save", save("Admitted"));
-    await deferred.entered.promise;
-    try {
-      const rest = await Promise.all([
-        call("memory_save", save("Denied")),
-        call("memory_save", save("Also denied")),
-      ]);
-      expect(rest.map((result) => result.isError)).toEqual([true, true]);
-    } finally {
-      deferred.released.resolve();
-    }
-    expect(text(await first)).toStartWith("created:");
-    expect(service.store.liveRows(owner).map((row) => row.title)).toEqual(["Admitted"]);
+  it("accepts only N of N+1 concurrent writes and replays duplicates after exhaustion", async () => {
+    await begin(2);
+    const args = [save("Concurrent A"), save("Concurrent B"), save("Concurrent C")];
+    const results = await Promise.all(args.map((value, i) => call("memory_save", value, 100 + i)));
+    expect(results.map((r) => r.isError).filter(Boolean)).toEqual([true]);
+    const accepted = results.flatMap((r, i) =>
+      r.isError ? [] : [{ value: receipt(r), index: i, result: r }],
+    );
+    expect(service.store.stats().memories).toBe(2);
+    for (const item of accepted)
+      expect(current(item.value.memoryRef.id)?.title).toBe(args[item.index]?.title);
+    for (const item of accepted)
+      expect(await call("memory_save", args[item.index], 100 + item.index)).toEqual(item.result);
+    expect((await call("memory_save", save("Unrelated"), 200)).structuredContent?.error.code).toBe(
+      "review_cap_reached",
+    );
   });
 
-  it("replays an in-flight request and its receipt after the cap is exhausted", async () => {
+  it("deduplicates simultaneous identical requests without a second mutation slot", async () => {
     await begin(1);
-    const deferred = new DeferredEmbedding();
-    service.store.setEmbedder(deferred.embedder);
-    const first = call("memory_save", save("Idempotent"), 99);
-    await deferred.entered.promise;
-    const retry = call("memory_save", save("Idempotent"), 99);
-    deferred.released.resolve();
-    expect(await retry).toEqual(await first);
-    expect(await call("memory_save", save("Idempotent"), 99)).toEqual(await first);
-    expect((await call("memory_save", save("Unrelated"), 100)).isError).toBe(true);
-    expect(service.store.liveRows(owner).map((row) => row.title)).toEqual(["Idempotent"]);
+    const results = await Promise.all([
+      call("memory_save", save("Idempotent"), 99),
+      call("memory_save", save("Idempotent"), 99),
+    ]);
+    expect(results[0]).toEqual(results[1]);
+    const saved = receipt(results[0] as ToolResult);
+    expect(current(saved.memoryRef.id)).toMatchObject({ title: "Idempotent", record_revision: 1 });
+    expect((await call("memory_save", save("Unrelated"), 100)).structuredContent?.error.code).toBe(
+      "review_cap_reached",
+    );
   });
 });
 
-describe("review retry and attempt accounting over MCP", () => {
-  it("does not charge unchanged updates, duplicate saves or failed writes", async () => {
+describe("review attempts, no-ops and degraded models", () => {
+  it("does not charge no-op, duplicate or failed mutations and still returns prior receipts", async () => {
     const id = await seed();
     await begin(1);
     const unchangedArgs = { id, content: "before" };
     const duplicateArgs = { title: "Existing", content: "before", scope: "global" };
     const unchanged = await call("memory_update", unchangedArgs, 71);
     const duplicate = await call("memory_save", duplicateArgs, 72);
-    expect(text(unchanged)).toStartWith("unchanged:");
-    expect(text(duplicate)).toStartWith("duplicate:");
+    expect(receipt(unchanged).status).toBe("unchanged");
+    expect(receipt(duplicate).status).toBe("duplicate");
     expect((await call("memory_update", { id, content: "x".repeat(MAX_CONTENT_CHARS + 1) })).isError).toBe(
       true,
     );
-    expect(text(await call("memory_update", { id, content: "actual correction" }))).toBe(`updated: #${id}`);
-    expect(service.store.getVisible(owner, [id])[0]).toMatchObject({
-      content: "actual correction",
-      revision_count: 2,
-    });
-    expect((await call("memory_save", save("Over cap"))).isError).toBe(true);
+    const corrected = receipt(await call("memory_update", { id, content: "actual correction" }));
+    expect(corrected.memoryRef.revision).toBe(2);
+    expect(current(id)?.content).toBe("actual correction");
+    expect((await call("memory_save", save("Over cap"))).structuredContent?.error.code).toBe(
+      "review_cap_reached",
+    );
     expect(await call("memory_update", unchangedArgs, 71)).toEqual(unchanged);
     expect(await call("memory_save", duplicateArgs, 72)).toEqual(duplicate);
-    expect(service.store.getVisible(owner, [id])[0]?.content).toBe("actual correction");
   });
 
   it("bounds failed and malformed attempts independently of successful changes", async () => {
     await begin(1);
     for (let i = 0; i < 10; i++) {
-      expect(text(await call("memory_update", { id: 99999, content: "missing" }))).toStartWith("not found:");
+      expect((await call("memory_update", { id: 99999, content: "missing" })).isError).toBe(true);
       expect((await call("memory_save", { title: "Missing content" })).isError).toBe(true);
     }
-    const denied = await call("memory_save", save("Too many attempts"));
-    expect(denied.structuredContent?.error.code).toBe("review_attempt_limit");
-    expect(service.store.liveRows(owner)).toEqual([]);
+    expect((await call("memory_save", save("Too many attempts"))).structuredContent?.error.code).toBe(
+      "review_attempt_limit",
+    );
+    expect(service.store.stats().memories).toBe(0);
   });
 
-  it("counts a durable lexical save even when embedding fails", async () => {
+  it("retains a durable candidate through model outage and serves lexical recall only after approval", async () => {
     await begin(1);
     service.store.setEmbedder({
       spec: hashSpec("test/failed", 4),
@@ -233,48 +226,51 @@ describe("review retry and attempt accounting over MCP", () => {
         throw new Error("offline");
       },
     });
-    expect(text(await call("memory_save", save("Lexical fallback")))).toStartWith("created:");
+    const candidate = receipt(await call("memory_save", save("Lexical fallback")));
     expect((await call("memory_save", save("Over cap"))).isError).toBe(true);
-    expect(service.store.liveRows(owner).map((row) => row.title)).toEqual(["Lexical fallback"]);
+    expect(await service.store.search({ access: owner, query: "Lexical fallback" })).toEqual([]);
+    service.store.mutations.mutate(ownerMutation(owner), {
+      requestId: mutationRequestId(),
+      operation: "promote",
+      id: candidate.memoryRef.id,
+      expectedRevision: candidate.memoryRef.revision,
+    });
+    await service.store.indexPending();
     expect(
       (await service.store.search({ access: owner, query: "Lexical fallback" })).map((hit) => hit.title),
     ).toEqual(["Lexical fallback"]);
   });
 });
 
-describe("persisted review capability", () => {
-  it("blocks expired and late-prepared writes until explicit review end, including after restart", async () => {
+describe("persisted review capabilities", () => {
+  it("keeps expiry closed through restart until an explicit task lifecycle transition", async () => {
     let now = new Date("2026-01-01T00:00:00Z");
     const path = join(tempDir("pm-review-expiry-"), "memory.db");
     let store = new MemoryStore({ path, now: () => now, log: silentLogger });
     const caller: Caller = { nonce: "nonce", agentId: "agent", projectKey: null, provider: "omp" };
-    const tools = (target: MemoryStore) => createTools({ store: target, resolveProject: () => null });
-    const invoke = (definitions: ToolDefinition[], id: string) => {
-      const tool = definitions.find((item) => item.name === "memory_save");
+    const invoke = (id: string) => {
+      const tool = createTools({ store, resolveProject: () => null }).find(
+        (item) => item.name === "memory_save",
+      );
       if (!tool) throw new Error("missing save");
       return tool.handler(save("Late"), caller, { id });
     };
     try {
       store.reviews.open({ agentId: "agent", nonce: "nonce", trigger: "idle", cap: 1 });
-      const deferred = new DeferredEmbedding();
-      store.setEmbedder(deferred.embedder);
-      const pending = invoke(tools(store), "late");
-      await deferred.entered.promise;
       now = new Date("2026-01-03T00:00:00Z");
-      deferred.released.resolve();
-      await expect(pending).rejects.toMatchObject({ code: "review_closed" });
-      expect(store.liveRows(owner)).toEqual([]);
+      await expect(invoke("late")).rejects.toMatchObject({ code: "review_closed" });
       store.close();
       store = new MemoryStore({ path, now: () => now, log: silentLogger });
-      await expect(invoke(tools(store), "restart")).rejects.toMatchObject({ code: "review_closed" });
+      await expect(invoke("restart")).rejects.toMatchObject({ code: "review_closed" });
       store.reviews.close("agent");
-      expect(await invoke(tools(store), "after-end")).toStartWith("created:");
+      const result = MutationResultSchema.parse(JSON.parse(await invoke("after-end")));
+      expect(store.lifecycleDetail(owner, result.memoryRef.id)?.state).toBe("candidate");
     } finally {
       store.close();
     }
   });
 
-  it("retains committed cap usage and receipts through restart", async () => {
+  it("retains committed cap usage and exact receipts through restart", async () => {
     const path = join(tempDir("pm-review-restart-"), "memory.db");
     let store = new MemoryStore({ path, log: silentLogger });
     const caller: Caller = { nonce: "nonce", agentId: "agent", projectKey: null, provider: "omp" };
@@ -287,18 +283,21 @@ describe("persisted review capability", () => {
     };
     try {
       store.reviews.open({ agentId: "agent", nonce: "nonce", trigger: "idle", cap: 1 });
-      const receipt = await invoke("original");
+      const original = await invoke("original");
+      const result = MutationResultSchema.parse(JSON.parse(original));
       store.close();
       store = new MemoryStore({ path, log: silentLogger });
-      expect(await invoke("original")).toBe(receipt);
+      expect(await invoke("original")).toBe(original);
       await expect(invoke("new-request")).rejects.toMatchObject({ code: "review_cap_reached" });
-      expect(store.liveRows(owner).map((row) => row.title)).toEqual(["Retained"]);
+      expect(store.lifecycleDetail(owner, result.memoryRef.id)?.revisions[0]?.snapshot.title).toBe(
+        "Retained",
+      );
     } finally {
       store.close();
     }
   });
 
-  it("cannot carry a prepared write across review end and a new review on the same agent", async () => {
+  it("fences reservations when a review ends and a new window starts", () => {
     const store = new MemoryStore({ path: ":memory:", log: silentLogger });
     try {
       const input = { agentId: "agent", nonce: "nonce", trigger: "idle", cap: 1 };
@@ -309,18 +308,15 @@ describe("persisted review capability", () => {
       store.reviews.open(input);
       const current = store.reviews.admit("nonce", "same-request", "save");
       if (current.kind !== "granted") throw new Error("missing reservation");
-      await expect(
-        store.save(
-          { title: "Obsolete", content: "old review", scope: "global", project: null, type: "note" },
-          old.reservation,
-        ),
-      ).rejects.toMatchObject({ code: "review_closed" });
+      const mutation = {
+        requestId: "same-request",
+        operation: "create" as const,
+        change: { title: "Current", content: "new review" },
+      };
+      expect(() => store.mutations.mutate(ownerMutation(owner), mutation, old.reservation)).toThrow();
       expect(store.reviews.info("nonce")?.reserved).toBe(1);
-      await store.save(
-        { title: "Current", content: "new review", scope: "global", project: null, type: "note" },
-        current.reservation,
-      );
-      expect(store.liveRows(owner).map((row) => row.title)).toEqual(["Current"]);
+      const accepted = store.mutations.mutate(ownerMutation(owner), mutation, current.reservation);
+      expect(store.getVisible(owner, [accepted.memoryRef.id])[0]?.content).toBe("new review");
     } finally {
       store.close();
     }

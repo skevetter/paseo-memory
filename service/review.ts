@@ -68,7 +68,11 @@ function touchedIds(events: AuditDetail[]): { saved: number[]; updated: number[]
 
 function outcomeText(store: MemoryStore, saved: number[], updated: number[]): string | null {
   const titles = new Map(
-    store.getVisible(Access.owner(), [...saved, ...updated]).map((row) => [row.id, row.title]),
+    [...saved, ...updated].flatMap((id) => {
+      const detail = store.lifecycleDetail(Access.owner(), id);
+      const current = detail?.revisions.find((revision) => revision.revision === detail.memoryRef.revision);
+      return current ? [[id, String(current.snapshot.title ?? "")] as const] : [];
+    }),
   );
   const lines = [
     ...saved.map((id) => `Saved #${id}: ${titles.get(id) ?? "deleted"}`),

@@ -1,4 +1,5 @@
 import type { SearchScope } from "../shared/service-api";
+import { currentLifecycleSql } from "./lifecycle";
 
 export type Scope = "global" | "project";
 export type Operation = "read" | "write" | "delete" | "restore" | "merge";
@@ -68,9 +69,10 @@ export class Access {
   }
 
   /** SQL over `memories m` for the namespaces `scope` resolves to. */
-  memoryFilter(scope: SearchScope, type?: string): SqlFilter {
-    const where = ["m.deleted_at IS NULL"];
+  memoryFilter(scope: SearchScope, type?: string, at?: string): SqlFilter {
+    const where = ["m.deleted_at IS NULL", currentLifecycleSql("m", at ? "?" : undefined)];
     const params: (string | number)[] = [];
+    if (at) params.push(at);
     const { global, projects } = this.reach(scope);
     const parts: string[] = [];
     if (global) parts.push("m.scope = 'global'");

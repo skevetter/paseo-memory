@@ -6,6 +6,7 @@ import {
   dismissPairRpc,
   keepMemoryRpc,
   type MemoryItem,
+  memoryDetailRpc,
   mergeMemoryRpc,
   type UpkeepList,
   upkeepListRpc,
@@ -260,6 +261,7 @@ interface StaleCardProps {
 function StaleCard({ item, action, onOpenMemory, s }: StaleCardProps) {
   const keep = useRpc(keepMemoryRpc);
   const archive = useRpc(archiveMemoryRpc);
+  const detail = useRpc(memoryDetailRpc);
   const id = Number(item.id);
   return (
     <View style={s.card}>
@@ -282,7 +284,13 @@ function StaleCard({ item, action, onOpenMemory, s }: StaleCardProps) {
           label="Archive"
           danger
           disabled={action.isPending}
-          onPress={() => action.mutate(() => archive({ id }))}
+          onPress={() =>
+            action.mutate(async () => {
+              const current = await detail({ id });
+              if (!current.memory) throw new Error("This memory is no longer available.");
+              return archive({ id, expectedRevision: current.memory.recordRevision });
+            })
+          }
           accessibilityLabel={`Archive memory ${item.id}`}
           s={s}
         />

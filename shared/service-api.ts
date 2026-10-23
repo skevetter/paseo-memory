@@ -1,4 +1,15 @@
 import { z } from "zod";
+import {
+  type ForgetPreview,
+  type LifecycleDetail,
+  MemoryRefSchema,
+  MutationRequestSchema,
+  type MutationResult,
+  RecordKindSchema,
+  RecordStateSchema,
+  TimestampSchema,
+  VerificationSchema,
+} from "./lifecycle";
 
 export const SERVICE_KEY_HEADER = "x-paseo-memory-key";
 export const SERVICE_KEY_LABEL = "paseo-memory/internal-api/v1";
@@ -87,8 +98,37 @@ export type SearchScope = z.infer<typeof SearchScopeSchema>;
 
 const MemoryScope = z.enum(["global", "project"]);
 
+const RevisionInput = z.number().int().positive();
+const RequestIdInput = z.string().min(1).max(200);
+export const EvidenceArtifactInputSchema = z.strictObject({
+  sourceRef: z.string().min(1).max(1000),
+  content: z.string().min(1).max(16_384),
+  scope: MemoryScope,
+  projectKey: z.string().nullable(),
+  allowExcerpt: z.boolean(),
+  sourceEventAt: TimestampSchema.optional(),
+});
+export const HistoricalMemorySchema = z.object({
+  memoryRef: MemoryRefSchema,
+  title: z.string(),
+  content: z.string(),
+  state: RecordStateSchema,
+  recordKind: RecordKindSchema,
+  verificationStatus: VerificationSchema,
+  validFrom: z.string().nullable(),
+  validUntil: z.string().nullable(),
+});
+export type HistoricalMemory = z.infer<typeof HistoricalMemorySchema>;
+
 export const serviceInputs = {
   status: z.object({}),
+  mutate: MutationRequestSchema,
+  "lifecycle-detail": z.strictObject({ id: RevisionInput }),
+  historical: z.strictObject({ id: RevisionInput, asOf: TimestampSchema }),
+  "forget-preview": z.strictObject({ id: RevisionInput }),
+  "evidence-artifact": EvidenceArtifactInputSchema,
+  "source-invalidate": z.strictObject({ sourceRef: z.string().min(1).max(1000) }),
+  "source-forget": z.strictObject({ sourceRef: z.string().min(1).max(1000), requestId: RequestIdInput }),
   configure: RuntimeConfigSchema,
   "agent-context": z.object({
     project: ProjectRefSchema.nullable(),
@@ -141,7 +181,11 @@ export const serviceInputs = {
   "upkeep-list": z.object({ paseoProjectId: z.string().nullable() }),
   "upkeep-run": z.object({}),
   keep: z.object({ id: z.number().int() }),
-  archive: z.object({ id: z.number().int() }),
+  archive: z.object({
+    id: RevisionInput,
+    expectedRevision: RevisionInput,
+    requestId: RequestIdInput.optional(),
+  }),
   "dismiss-pair": z.object({ a: z.number().int(), b: z.number().int() }),
   save: z.object({
     title: z.string().min(1),
@@ -151,9 +195,12 @@ export const serviceInputs = {
     paseoProjectId: z.string().nullable(),
     project: ProjectRefSchema.nullable(),
     pinned: z.boolean(),
+    requestId: RequestIdInput.optional(),
   }),
   update: z.object({
     id: z.number().int(),
+    expectedRevision: RevisionInput,
+    requestId: RequestIdInput.optional(),
     title: z.string().min(1).max(200).optional(),
     content: z.string().min(1).optional(),
     type: z.string().optional(),
@@ -162,16 +209,30 @@ export const serviceInputs = {
     paseoProjectId: z.string().nullable().optional(),
     project: ProjectRefSchema.nullable().optional(),
   }),
-  delete: z.object({ id: z.number().int() }),
+  delete: z.object({
+    id: RevisionInput,
+    expectedRevision: RevisionInput,
+    requestId: RequestIdInput.optional(),
+  }),
   detail: z.object({ id: z.number().int() }),
-  restore: z.object({ id: z.number().int(), version: z.number().int() }),
+  restore: z.object({
+    id: RevisionInput,
+    version: RevisionInput,
+    expectedRevision: RevisionInput,
+    requestId: RequestIdInput.optional(),
+  }),
   merge: z.object({
     sourceId: z.number().int(),
     targetId: z.number().int(),
     sourceRevision: z.number().int(),
     targetRevision: z.number().int(),
+    requestId: RequestIdInput.optional(),
   }),
-  "merge-undo": z.object({ mergeId: z.number().int() }),
+  "merge-undo": z.object({
+    mergeId: RevisionInput,
+    sourceRevision: RevisionInput,
+    targetRevision: RevisionInput,
+  }),
   sessions: z.object({
     query: z.string(),
     paseoProjectId: z.string().nullable(),
@@ -227,6 +288,7 @@ export const MemoryDetailSchema = z.object({
     .nullable(),
   mergedInto: z.number().nullable(),
   mergeId: z.number().nullable(),
+  mergeRevisions: z.object({ sourceRevision: z.number(), targetRevision: z.number() }).nullable(),
   archived: z.boolean(),
   versions: z.array(
     z.object({ version: z.number(), title: z.string(), content: z.string(), createdAt: z.string() }),
@@ -402,16 +464,15 @@ export interface ServiceStatus {
   reranker: RerankerStatus;
 }
 
-export type SaveStatus =
-  | "created"
-  | "updated"
-  | "duplicate"
-  | "near_duplicate"
-  | "possible_duplicate"
-  | "error";
-
 export interface ServiceOutputs {
   status: ServiceStatus;
+  mutate: MutationResult;
+  "lifecycle-detail": LifecycleDetail | null;
+  historical: HistoricalMemory | null;
+  "forget-preview": ForgetPreview;
+  "evidence-artifact": { sourceRef: string; sourceHash: string };
+  "source-invalidate": { affected: number };
+  "source-forget": { forgotten: number };
   configure: { ok: true };
   "agent-context": {
     systemPrompt: string | null;
@@ -424,7 +485,7 @@ export interface ServiceOutputs {
   "end-session": { ok: true };
   "project-known": { known: boolean };
   search: { items: MemoryItem[] };
-  save: { id: number | null; status: SaveStatus; message: string };
+  save: MutationResult & { id: number; message: string };
   update: { ok: boolean; message: string };
   delete: { ok: boolean };
   detail: MemoryDetail;

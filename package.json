@@ -9,6 +9,7 @@
     "README.md",
     "bun.lock",
     "client/",
+    "docs/",
     "index.client.tsx",
     "index.server.ts",
     "package-lock.json",

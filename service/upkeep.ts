@@ -99,6 +99,10 @@ export function isExactDuplicate(pair: MemoryPair): boolean {
     a.agent_id === b.agent_id &&
     a.provider === b.provider &&
     a.pinned === b.pinned &&
+    a.record_kind === b.record_kind &&
+    a.verification_status === b.verification_status &&
+    a.valid_from === b.valid_from &&
+    a.valid_until === b.valid_until &&
     a.archived_at === null &&
     b.archived_at === null &&
     canonical(a.title) === canonical(b.title) &&
