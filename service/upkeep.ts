@@ -1,9 +1,12 @@
 import type { UpkeepList } from "../shared/service-api";
+import { Access } from "./access";
 import type { MemoryStore, MemoryWithProject, ProjectRef } from "./store";
 import { clip } from "./text";
 
 const LAST_RUN_KEY = "upkeep_last_run";
 export const UPKEEP_NONCE = "upkeep";
+// Upkeep is host maintenance, not an agent request.
+const OWNER = Access.owner();
 // Numbers with optional units, versions, `code spans` and "quoted values".
 const VALUE = /`[^`]+`|"[^"]+"|\b\d+(?:[.:]\d+)*(?:%|ms|s|m|h|d|kb|mb|gb)?\b/gi;
 
@@ -15,7 +18,7 @@ export interface MemoryPair {
 }
 
 export function candidatePairs(store: MemoryStore): MemoryPair[] {
-  const rows = store.liveRows();
+  const rows = store.liveRows(OWNER);
   const byId = new Map(rows.map((row) => [row.id, row]));
   const pairs = new Map<string, MemoryPair>();
   const add = (a: MemoryWithProject, b: MemoryWithProject, similarity: number | null) => {
@@ -117,7 +120,7 @@ export interface UpkeepRun {
 
 export function runUpkeep(store: MemoryStore, at: string): UpkeepRun {
   const run: UpkeepRun = { merged: 0, duplicates: 0, contradictions: 0, stale: 0 };
-  run.stale = store.list({ project: null, scope: "all", stale: true, limit: 1000 }).length;
+  run.stale = store.list({ access: OWNER, scope: "all", stale: true, limit: 1000 }).length;
   store.setMeta(LAST_RUN_KEY, at);
   if (store.config.duplicateMerge === "off") return run;
   const gone = new Set<number>();
@@ -136,7 +139,7 @@ function autoMerge(store: MemoryStore, pair: MemoryPair, gone: Set<number>): boo
   if (gone.has(pair.a.id) || gone.has(pair.b.id)) return false;
   const target = mergeTarget(pair);
   const source = target.id === pair.a.id ? pair.b : pair.a;
-  if (!store.merge(source.id, target.id).ok) return false;
+  if (!store.mergeAuthorized(OWNER, source.id, target.id).ok) return false;
   gone.add(source.id);
   store.audit.record(UPKEEP_NONCE, {
     kind: "merge",

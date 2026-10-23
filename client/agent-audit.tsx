@@ -23,6 +23,8 @@ const KIND_LABELS: Record<AuditEvent["kind"], string> = {
   delete: "Delete",
   review: "Review",
   merge: "Merge",
+  denied: "Denied",
+  invalid: "Invalid call",
 };
 
 interface AgentTabProps {

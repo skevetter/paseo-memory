@@ -1,4 +1,5 @@
 import { parseReviewReply } from "../shared/review";
+import { Access } from "./access";
 import type { AuditDetail } from "./audit";
 import type { MemoryStore } from "./store";
 
@@ -142,7 +143,9 @@ function touchedIds(events: AuditDetail[]): { saved: number[]; updated: number[]
 }
 
 function outcomeText(store: MemoryStore, saved: number[], updated: number[]): string | null {
-  const titles = new Map(store.get([...saved, ...updated]).map((row) => [row.id, row.title]));
+  const titles = new Map(
+    store.getVisible(Access.owner(), [...saved, ...updated]).map((row) => [row.id, row.title]),
+  );
   const lines = [
     ...saved.map((id) => `Saved #${id}: ${titles.get(id) ?? "deleted"}`),
     ...updated.map((id) => `Updated #${id}: ${titles.get(id) ?? "deleted"}`),

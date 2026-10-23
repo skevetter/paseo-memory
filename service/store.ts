@@ -8,6 +8,7 @@ import {
   type RuntimeConfig,
   type SearchScope,
 } from "../shared/service-api";
+import type { Access, MutationOutcome, Namespace, Scope, SqlFilter } from "./access";
 import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { redact } from "./redact";
@@ -27,9 +28,8 @@ import { errorText, openDatabase } from "./sqlite";
 import { clip, ftsQuery, RRF_K, sha256 } from "./text";
 import { dropVectors, type Neighbor, scopeKey, VectorIndex, type VectorTarget, vecTables } from "./vectors";
 
-export type { ProjectRef, SearchScope, SessionRow };
+export type { ProjectRef, Scope, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
-export type Scope = "global" | "project";
 
 const USED_TOP_N = 5;
 const PINNED_BOOST = 0.1;
@@ -138,7 +138,7 @@ export type SearchHit = MemoryHit | SessionHit;
 
 export interface SearchInput {
   query: string;
-  project: ProjectRef | null;
+  access: Access;
   scope?: SearchScope;
   type?: string;
   limit?: number;
@@ -180,12 +180,16 @@ interface SaveDraft {
   vector: Float32Array | null;
 }
 
-interface SqlFilter {
-  where: string;
-  params: (string | number)[];
-}
-
 type IndexRow = Pick<MemoryRow, "id" | "title" | "content" | "scope" | "project_key" | "content_hash">;
+type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "merged_into" | "archived_at">;
+
+const HIDDEN_DETAIL: MemoryDetail = {
+  memory: null,
+  mergedInto: null,
+  archived: false,
+  versions: [],
+  duplicates: [],
+};
 
 const KNN_K = 50;
 const INDEX_BATCH = 16;
@@ -304,7 +308,18 @@ export class MemoryStore {
     return this.db.transaction(() => this.saveNow(draft))();
   }
 
-  get(ids: number[]): MemoryWithProject[] {
+  getVisible(access: Access, ids: number[]): MemoryWithProject[] {
+    return this.rowsById(ids).filter((row) => access.allows("read", namespaceOf(row)));
+  }
+
+  /** Ids that exist but are outside the caller's grant; callers report them as missing and audit the denial. */
+  deniedIds(access: Access, ids: number[]): number[] {
+    return this.rowsById(ids)
+      .filter((row) => !access.allows("read", namespaceOf(row)))
+      .map((row) => row.id);
+  }
+
+  private rowsById(ids: number[]): MemoryWithProject[] {
     if (ids.length === 0) return [];
     return this.db
       .prepare<MemoryWithProject, number[]>(
@@ -326,34 +341,50 @@ export class MemoryStore {
     this.bump(ids, "opened_count = opened_count + 1", []);
   }
 
-  keep(id: number): boolean {
-    return (
-      this.db.query(`UPDATE memories SET kept_at = ? WHERE id = ? AND deleted_at IS NULL`).run(this.ts(), id)
-        .changes > 0
-    );
+  keep(access: Access, id: number): MutationOutcome {
+    const existing = this.rowsById([id])[0];
+    if (!existing) return "not_found";
+    if (!access.allows("write", namespaceOf(existing))) return "denied";
+    this.db.query(`UPDATE memories SET kept_at = ? WHERE id = ?`).run(this.ts(), id);
+    return "ok";
   }
 
-  archive(id: number): boolean {
+  archive(access: Access, id: number): MutationOutcome {
+    const existing = this.rowsById([id])[0];
+    if (!existing) return "not_found";
+    if (!access.allows("delete", namespaceOf(existing))) return "denied";
     const ts = this.ts();
-    const changed = this.db
-      .query(`UPDATE memories SET deleted_at = ?, archived_at = ? WHERE id = ? AND deleted_at IS NULL`)
-      .run(ts, ts, id).changes;
-    if (changed) dropVectors(this.db, id);
-    return changed > 0;
+    this.db.query(`UPDATE memories SET deleted_at = ?, archived_at = ? WHERE id = ?`).run(ts, ts, id);
+    dropVectors(this.db, id);
+    return "ok";
   }
 
-  mergedInto(id: number): number | null {
-    return this.removed(id)?.merged_into ?? null;
+  /** The merge target of a removed memory, only when the caller may read both ends of the merge. */
+  mergedIntoVisible(access: Access, id: number): number | null {
+    const removed = this.removed(id);
+    return removed ? this.visibleMergeTarget(access, removed) : null;
   }
 
-  update(id: number, patch: MemoryPatch): boolean {
+  private visibleMergeTarget(access: Access, removed: RemovedRow): number | null {
+    if (removed.merged_into === null || !access.allows("read", namespaceOf(removed))) return null;
+    const target = this.removed(removed.merged_into);
+    return target && access.allows("read", namespaceOf(target)) ? removed.merged_into : null;
+  }
+
+  updateAuthorized(access: Access, id: number, patch: MemoryPatch): MutationOutcome {
+    const existing = this.rowsById([id])[0];
+    if (!existing) return "not_found";
+    if (!access.allows("write", namespaceOf(existing))) return "denied";
+    const next = patched(existing, patch);
+    if (!access.allows("write", { scope: next.scope, projectKey: next.projectKey })) return "denied";
+    this.applyUpdate(existing, patch);
+    return "ok";
+  }
+
+  private applyUpdate(existing: MemoryRow, patch: MemoryPatch): void {
     if (patch.content !== undefined && patch.content.length > MAX_CONTENT_CHARS) {
       throw new ContentTooLongError(patch.content.length);
     }
-    const existing = this.db
-      .query<MemoryRow, [number]>(`SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL`)
-      .get(id);
-    if (!existing) return false;
     const next = patched(existing, patch);
     const textChanged = next.title !== existing.title || next.content !== existing.content;
     if (textChanged) this.snapshot(existing);
@@ -374,38 +405,45 @@ export class MemoryStore {
         next.projectKey,
         textChanged ? 1 : 0,
         this.ts(),
-        id,
+        existing.id,
       );
     if (next.hash !== existing.content_hash || next.projectKey !== existing.project_key) {
-      dropVectors(this.db, id);
+      dropVectors(this.db, existing.id);
       this.scheduleIndex();
     }
-    return true;
   }
 
-  delete(id: number, hard = false): boolean {
-    const changed = hard
-      ? this.db.query(`DELETE FROM memories WHERE id = ?`).run(id).changes
-      : this.db
-          .query(`UPDATE memories SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
-          .run(this.ts(), id).changes;
-    if (changed) dropVectors(this.db, id);
-    return changed > 0;
+  deleteAuthorized(access: Access, id: number, hard = false): MutationOutcome {
+    const existing = this.rowsById([id])[0];
+    if (!existing) return "not_found";
+    if (!access.allows("delete", namespaceOf(existing))) return "denied";
+    if (hard) this.db.query(`DELETE FROM memories WHERE id = ?`).run(id);
+    else this.db.query(`UPDATE memories SET deleted_at = ? WHERE id = ?`).run(this.ts(), id);
+    dropVectors(this.db, id);
+    return "ok";
   }
 
-  restore(id: number, version: number): boolean {
+  restoreAuthorized(access: Access, id: number, version: number): MutationOutcome {
+    const existing = this.rowsById([id])[0];
+    if (!existing) return "not_found";
+    if (!access.allows("restore", namespaceOf(existing))) return "denied";
     const old = this.db
       .query<{ title: string; content: string }, [number, number]>(
         `SELECT title, content FROM memory_versions WHERE memory_id = ? AND version = ?`,
       )
       .get(id, version);
-    return old ? this.update(id, { title: old.title, content: old.content }) : false;
+    if (!old) return "not_found";
+    this.applyUpdate(existing, { title: old.title, content: old.content });
+    return "ok";
   }
 
-  merge(sourceId: number, targetId: number): { ok: boolean; message: string } {
+  mergeAuthorized(access: Access, sourceId: number, targetId: number): { ok: boolean; message: string } {
     if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
-    const live = this.get([sourceId, targetId]);
-    if (live.length < 2) return { ok: false, message: "Both memories must exist." };
+    const live = this.rowsById([sourceId, targetId]);
+    // A denied pair reads like a missing one so ids in other namespaces are not confirmed.
+    if (live.length < 2 || live.some((row) => !access.allows("merge", namespaceOf(row)))) {
+      return { ok: false, message: "Both memories must exist." };
+    }
     this.db
       .query(`UPDATE memories SET deleted_at = ?, merged_into = ? WHERE id = ?`)
       .run(this.ts(), targetId, sourceId);
@@ -413,32 +451,34 @@ export class MemoryStore {
     return { ok: true, message: `Merged #${sourceId} into #${targetId}.` };
   }
 
-  detail(id: number): MemoryDetail {
-    const row = this.get([id])[0];
+  detailAuthorized(access: Access, id: number): MemoryDetail {
+    const row = this.rowsById([id])[0];
+    if (row && !access.allows("read", namespaceOf(row))) return HIDDEN_DETAIL;
+    const removed = row ? null : this.removed(id);
+    if (removed && !access.allows("read", namespaceOf(removed))) return HIDDEN_DETAIL;
     const versions = this.db
       .query<{ version: number; title: string; content: string; created_at: string }, [number]>(
         `SELECT version, title, content, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version DESC`,
       )
       .all(id)
       .map((v) => ({ version: v.version, title: v.title, content: v.content, createdAt: v.created_at }));
-    const removed = row ? null : this.removed(id);
     return {
       memory: row ? memoryDetail(row) : null,
-      mergedInto: removed?.merged_into ?? null,
+      mergedInto: removed ? this.visibleMergeTarget(access, removed) : null,
       archived: Boolean(removed?.archived_at),
       versions,
-      duplicates: row ? this.similarTo(row) : [],
+      duplicates: row ? this.similarTo(row, access) : [],
     };
   }
 
   list(input: {
-    project: ProjectRef | null;
+    access: Access;
     scope?: SearchScope;
     limit?: number;
     pinnedOnly?: boolean;
     stale?: boolean;
   }): MemoryHit[] {
-    const filter = scopeFilter(input.scope ?? "all", input.project);
+    const filter = input.access.memoryFilter(input.scope ?? "all");
     const touched = "max(m.updated_at, ifnull(m.last_used_at, ''), ifnull(m.kept_at, ''))";
     const cutoff = new Date(this.now().getTime() - this.config.staleDays * 86_400_000).toISOString();
     const where = [filter.where];
@@ -458,11 +498,11 @@ export class MemoryStore {
     const scope = input.scope ?? "all";
     const limit = input.limit ?? 8;
     const query = input.query.trim();
-    if (!query) return this.list({ project: input.project, scope, limit });
+    if (!query) return this.list({ access: input.access, scope, limit });
     const queryVector = await this.embedOne(query, "query");
     if (this.closed) return [];
 
-    const filter = scopeFilter(scope, input.project, input.type);
+    const filter = input.access.memoryFilter(scope, input.type);
     const ranks = new Map<number, number>();
     addRanks(ranks, this.keywordIds(query, filter));
     if (query.length < 3 || ranks.size === 0) addRanks(ranks, this.likeIds(query, filter));
@@ -474,7 +514,7 @@ export class MemoryStore {
 
     const candidates = this.boostedHits(ranks, new Map(near.map((n) => [n.id, n.similarity])));
     if (input.includeSessions) {
-      const sessions = searchSessions(this.db, { query, project: input.project, scope, limit });
+      const sessions = searchSessions(this.db, { query, access: input.access, scope, limit });
       candidates.push(...sessions.map((hit) => ({ hit, text: `${hit.title}\n${hit.preview}`, weight: 0.9 })));
     }
     const hits = await this.rerank(query, candidates, limit);
@@ -632,41 +672,40 @@ export class MemoryStore {
   private closeMatches(
     vector: Float32Array,
     partition: string,
-    excludeId?: number,
+    options: { excludeId?: number; access?: Access } = {},
   ): { id: number; title: string; type: string; similarity: number }[] {
     if (!this.vectors) return [];
     const threshold = this.vectors.spec.duplicateThreshold;
     const near = this.vectors
       .knn(vector, partition, 4)
-      .filter((n) => n.id !== excludeId && n.similarity >= threshold);
-    const rows = new Map(this.get(near.map((n) => n.id)).map((r) => [r.id, r]));
+      .filter((n) => n.id !== options.excludeId && n.similarity >= threshold);
+    const rows = new Map(this.rowsById(near.map((n) => n.id)).map((r) => [r.id, r]));
     return near.flatMap((n) => {
       const row = rows.get(n.id);
-      if (!row) return [];
+      if (!row || (options.access && !options.access.allows("read", namespaceOf(row)))) return [];
       return [
         { id: n.id, title: row.title, type: row.type, similarity: Math.round(n.similarity * 1000) / 1000 },
       ];
     });
   }
 
-  private similarTo(row: MemoryRow): MemoryDetail["duplicates"] {
+  private similarTo(row: MemoryRow, access: Access): MemoryDetail["duplicates"] {
     const partition = scopeKey(row.scope, row.project_key);
     const vector = this.vectors?.vector(row.id, row.content_hash);
     if (!vector) return [];
-    return this.closeMatches(vector, partition, row.id).map(({ id, title, similarity }) => ({
-      id,
-      title,
-      similarity,
-    }));
+    return this.closeMatches(vector, partition, { excludeId: row.id, access }).map(
+      ({ id, title, similarity }) => ({ id, title, similarity }),
+    );
   }
 
-  liveRows(): MemoryWithProject[] {
+  liveRows(access: Access): MemoryWithProject[] {
+    const filter = access.memoryFilter("all");
     return this.db
-      .query<MemoryWithProject, []>(
+      .query<MemoryWithProject, (string | number)[]>(
         `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
-         WHERE m.deleted_at IS NULL ORDER BY m.id`,
+         WHERE ${filter.where} ORDER BY m.id`,
       )
-      .all();
+      .all(...filter.params);
   }
 
   nearDuplicatesOf(row: MemoryRow): Neighbor[] {
@@ -783,30 +822,53 @@ export class MemoryStore {
       .map((r) => r.id);
   }
 
-  private vectorNeighbors(vector: Float32Array, input: SearchInput & { scope: SearchScope }): Neighbor[] {
+  private vectorNeighbors(
+    vector: Float32Array,
+    input: { access: Access; scope: SearchScope; type?: string },
+  ): Neighbor[] {
     const vectors = this.vectors;
     if (!vectors) return [];
-    const partitions: string[] = [];
-    if (input.scope !== "project") partitions.push(scopeKey("global", null));
-    if (input.scope !== "global" && input.project) partitions.push(scopeKey("project", input.project.key));
     const near = this.liveNeighbors(
-      partitions.flatMap((partition) => vectors.knn(vector, partition, KNN_K)),
-      input.type,
+      this.partitions(input.access, input.scope).flatMap((partition) =>
+        vectors.knn(vector, partition, KNN_K),
+      ),
+      input,
     );
     const { min, relative } = vectors.spec.searchFloor;
     const floor = Math.max(min, (near[0]?.similarity ?? 0) * relative);
     return near.filter((n) => n.similarity >= floor).slice(0, 20);
   }
 
-  private liveNeighbors(near: Neighbor[], type?: string): Neighbor[] {
+  private partitions(access: Access, scope: SearchScope): string[] {
+    const { global, projects } = access.reach(scope);
+    const keys: string[] = [];
+    if (projects.kind === "one") keys.push(projects.key);
+    if (projects.kind === "every") keys.push(...this.projectKeys());
+    return [...(global ? [scopeKey("global", null)] : []), ...keys.map((key) => scopeKey("project", key))];
+  }
+
+  private projectKeys(): string[] {
+    return this.db
+      .query<{ project_key: string }, []>(
+        `SELECT DISTINCT project_key FROM memories WHERE scope = 'project' AND deleted_at IS NULL`,
+      )
+      .all()
+      .map((r) => r.project_key);
+  }
+
+  // The vector table's partition is metadata that can lag behind the row, so every neighbor is re-checked here.
+  private liveNeighbors(
+    near: Neighbor[],
+    input: { access: Access; scope: SearchScope; type?: string },
+  ): Neighbor[] {
     if (near.length === 0) return near;
-    const typeClause = type ? "AND type = ?" : "";
+    const filter = input.access.memoryFilter(input.scope, input.type);
     const live = new Set(
       this.db
         .prepare<{ id: number }, (string | number)[]>(
-          `SELECT id FROM memories WHERE deleted_at IS NULL ${typeClause} AND id IN (${near.map(() => "?").join(",")})`,
+          `SELECT m.id FROM memories m WHERE ${filter.where} AND m.id IN (${near.map(() => "?").join(",")})`,
         )
-        .all(...(type ? [type] : []), ...near.map((n) => n.id))
+        .all(...filter.params, ...near.map((n) => n.id))
         .map((r) => r.id),
     );
     return near.filter((n) => live.has(n.id)).sort((a, b) => b.similarity - a.similarity);
@@ -937,10 +999,10 @@ export class MemoryStore {
       .run(...params, ...unique);
   }
 
-  private removed(id: number): { merged_into: number | null; archived_at: string | null } | null {
+  private removed(id: number): RemovedRow | null {
     return this.db
-      .query<{ merged_into: number | null; archived_at: string | null }, [number]>(
-        `SELECT merged_into, archived_at FROM memories WHERE id = ?`,
+      .query<RemovedRow, [number]>(
+        `SELECT scope, project_key, merged_into, archived_at FROM memories WHERE id = ?`,
       )
       .get(id);
   }
@@ -956,6 +1018,10 @@ export class MemoryStore {
   private ts(): string {
     return this.now().toISOString();
   }
+}
+
+function namespaceOf(row: { scope: Scope; project_key: string | null }): Namespace {
+  return { scope: row.scope, projectKey: row.project_key };
 }
 
 function patched(existing: MemoryRow, patch: MemoryPatch) {
@@ -985,24 +1051,6 @@ function patchedScope(
   const projectKey = project?.key ?? (existing.scope === "project" ? existing.project_key : null);
   if (!projectKey) throw new Error("Moving a memory to project scope needs a project.");
   return { scope: "project", projectKey, project };
-}
-
-function scopeFilter(scope: SearchScope, project: ProjectRef | null, type?: string): SqlFilter {
-  const where = ["m.deleted_at IS NULL"];
-  const params: (string | number)[] = [];
-  if (scope === "global") where.push("m.scope = 'global'");
-  else if (scope === "project") {
-    where.push("m.scope = 'project'", "m.project_key = ?");
-    params.push(project?.key ?? "");
-  } else if (project) {
-    where.push("(m.scope = 'global' OR m.project_key = ?)");
-    params.push(project.key);
-  }
-  if (type) {
-    where.push("m.type = ?");
-    params.push(type);
-  }
-  return { where: where.join(" AND "), params };
 }
 
 function addRanks(ranks: Map<number, number>, ids: number[]): void {

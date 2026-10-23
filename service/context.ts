@@ -1,4 +1,5 @@
-import type { RuntimeConfig } from "../shared/service-api";
+import type { ProjectUnresolved, RuntimeConfig } from "../shared/service-api";
+import { Access } from "./access";
 import { type MemoryHit, type MemoryStore, type ProjectRef, type SessionRow, usageFactor } from "./store";
 import type { TaskMatches } from "./task";
 import { age, clipWords } from "./text";
@@ -53,6 +54,7 @@ class Budget {
 
 export function buildContext(input: ContextInput): ContextResult {
   const { store, project } = input;
+  const access = Access.agent(project?.key ?? null);
   const { config } = store;
   const budget = new Budget(config.contextBudgetChars);
   const listed = new Set<number>();
@@ -65,9 +67,9 @@ export function buildContext(input: ContextInput): ContextResult {
 
   budget.section("## Relevant to this task", input.task?.hits ?? [], line, keepMemory);
   const taskIds = [...budget.memoryIds];
-  budget.section("## Pinned", fresh(pinnedMemories(store, project)), pinnedLine(store), keepMemory);
+  budget.section("## Pinned", fresh(pinnedMemories(store, access)), pinnedLine(store, access), keepMemory);
   if (project) {
-    const ranked = byRelevance(fresh(store.list({ project, scope: "project", limit: 60 })), config);
+    const ranked = byRelevance(fresh(store.list({ access, scope: "project", limit: 60 })), config);
     budget.section(
       `## Project memory (${project.name}); memory_get for detail`,
       ranked.slice(0, config.projectMemories),
@@ -83,7 +85,7 @@ export function buildContext(input: ContextInput): ContextResult {
       budget.sessionIds.push(s.id),
     );
   }
-  const global = byRelevance(fresh(store.list({ project: null, scope: "global", limit: 40 })), config);
+  const global = byRelevance(fresh(store.list({ access, scope: "global", limit: 40 })), config);
   budget.section("## Global memory", global.slice(0, config.globalMemories), line, keepMemory);
 
   const empty = project ? `No memories yet for ${project.name}.` : "No memories yet.";
@@ -95,12 +97,12 @@ export function buildContext(input: ContextInput): ContextResult {
   };
 }
 
-function pinnedMemories(store: MemoryStore, project: ProjectRef | null): MemoryHit[] {
+function pinnedMemories(store: MemoryStore, access: Access): MemoryHit[] {
   const limit = store.config.maxPinned;
   if (limit === 0) return [];
   const pinned = [
-    ...store.list({ project: null, scope: "global", pinnedOnly: true, limit }),
-    ...(project ? store.list({ project, scope: "project", pinnedOnly: true, limit }) : []),
+    ...store.list({ access, scope: "global", pinnedOnly: true, limit }),
+    ...store.list({ access, scope: "project", pinnedOnly: true, limit }),
   ];
   return pinned.slice(0, limit);
 }
@@ -127,9 +129,9 @@ function listLine(config: RuntimeConfig): (m: MemoryHit) => string {
   };
 }
 
-function pinnedLine(store: MemoryStore): (m: MemoryHit) => string {
+function pinnedLine(store: MemoryStore, access: Access): (m: MemoryHit) => string {
   return (m) =>
-    `- #${m.id} [${m.type}] ${m.title}: ${clipWords(store.get([Number(m.id)])[0]?.content ?? m.preview, 400)}`;
+    `- #${m.id} [${m.type}] ${m.title}: ${clipWords(store.getVisible(access, [Number(m.id)])[0]?.content ?? m.preview, 400)}`;
 }
 
 function formatSession(s: SessionRow): string {
@@ -142,12 +144,13 @@ function formatSession(s: SessionRow): string {
 export function buildSystemPrompt(input: {
   context: string;
   project: ProjectRef | null;
+  projectUnresolved?: ProjectUnresolved | null;
   hasTools: boolean;
   extraInstructions?: string;
 }): string {
   const header = input.project
     ? `Project: ${input.project.name}. Memory is shared across this project's worktrees.`
-    : "No Paseo project is attached; only global memory applies.";
+    : noProjectHeader(input.projectUnresolved ?? null);
   const protocol = input.hasTools
     ? [
         "Memory tools are available on the `memory` MCP server:",
@@ -167,4 +170,17 @@ export function buildSystemPrompt(input: {
     input.context,
     "</paseo-memory>",
   ].join("\n");
+}
+
+const LOOKUP_FAILURE_TEXT: Record<Exclude<ProjectUnresolved, "no_project">, string> = {
+  lookup_failed: "the workspace lookup failed",
+  deadline: "the workspace lookup timed out",
+  page_limit: "the workspace list was too long to search",
+};
+
+function noProjectHeader(unresolved: ProjectUnresolved | null): string {
+  if (unresolved === null || unresolved === "no_project") {
+    return "No Paseo project is attached; only global memory applies.";
+  }
+  return `The Paseo project could not be resolved (${LOOKUP_FAILURE_TEXT[unresolved]}); only global memory applies to this agent.`;
 }

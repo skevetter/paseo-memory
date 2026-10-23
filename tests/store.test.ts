@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
+import { Access } from "../service/access";
 import { buildContext, buildSystemPrompt } from "../service/context";
 import type { Embedder } from "../service/embedder";
 import { redact } from "../service/redact";
@@ -10,7 +11,7 @@ import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
 import { DEFAULT_RUNTIME, EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
-import { dataRepo, hashEmbedder, hashSpec, otherRepo, tempDir } from "./helpers";
+import { dataRepo, hashEmbedder, hashSpec, otherRepo, owner, tempDir } from "./helpers";
 
 let store: MemoryStore;
 beforeEach(() => {
@@ -53,13 +54,17 @@ describe("scopes", () => {
       project: dataRepo,
     });
 
-    const inData = titles(await store.search({ query: "deps pnpm uv sentences", project: dataRepo }));
+    const inData = titles(
+      await store.search({ query: "deps pnpm uv sentences", access: Access.agent(dataRepo.key) }),
+    );
     expect(inData).toContain("Use uv for Python deps");
     expect(inData).toContain("User wants plain sentences");
     expect(inData).not.toContain("Prefer pnpm in devsy");
-    expect(titles(await store.search({ query: "sentences uv", project: dataRepo, scope: "global" }))).toEqual(
-      ["User wants plain sentences"],
-    );
+    expect(
+      titles(
+        await store.search({ query: "sentences uv", access: Access.agent(dataRepo.key), scope: "global" }),
+      ),
+    ).toEqual(["User wants plain sentences"]);
   });
 
   it("shares project memory across worktrees because the key is the project, not the cwd", async () => {
@@ -76,15 +81,16 @@ describe("scopes", () => {
       rootPath: "/home/u/.paseo/worktrees/xyz/apt-7000",
       paseoProjectId: "prj_cccc",
     };
-    expect((await store.search({ query: "graphql docs", project: fromAnotherWorktree }))[0]?.title).toBe(
-      "GraphQL docs live in docs/gql",
-    );
+    expect(
+      (await store.search({ query: "graphql docs", access: Access.agent(fromAnotherWorktree.key) }))[0]
+        ?.title,
+    ).toBe("GraphQL docs live in docs/gql");
   });
 
   it("falls back to global when project scope is requested without a project", async () => {
     const r = await store.save({ title: "t", content: "c", type: "note", scope: "project", project: null });
     expect(r.status).toBe("created");
-    expect(store.list({ project: null, scope: "global" })).toHaveLength(1);
+    expect(store.list({ access: owner, scope: "global" })).toHaveLength(1);
   });
 
   it("resolves a Paseo project id alias and a project key to the stable project", () => {
@@ -108,7 +114,7 @@ describe("dedupe and versions", () => {
     const b = await store.save({ ...base, content: "v2 uses PKCE" });
     expect(a.status).toBe("created");
     expect(b).toEqual({ status: "updated", id: a.id as number });
-    const [row] = store.get([a.id as number]);
+    const [row] = store.getVisible(owner, [a.id as number]);
     expect(row?.content).toBe("v2 uses PKCE");
     expect(row?.revision_count).toBe(2);
   });
@@ -134,9 +140,9 @@ describe("dedupe and versions", () => {
       scope: "global",
       project: null,
     });
-    expect(store.delete(a.id as number)).toBe(true);
-    expect(await store.search({ query: "obsolete", project: null })).toHaveLength(0);
-    expect(store.delete(a.id as number)).toBe(false);
+    expect(store.deleteAuthorized(owner, a.id as number)).toBe("ok");
+    expect(await store.search({ query: "obsolete", access: owner })).toHaveLength(0);
+    expect(store.deleteAuthorized(owner, a.id as number)).toBe("not_found");
   });
 
   it("update re-indexes FTS", async () => {
@@ -147,9 +153,9 @@ describe("dedupe and versions", () => {
       scope: "global",
       project: null,
     });
-    store.update(a.id as number, { content: "memcached chosen" });
-    expect((await store.search({ query: "memcached", project: null }))[0]?.id).toBe(String(a.id));
-    expect(await store.search({ query: "redis", project: null })).toHaveLength(0);
+    store.updateAuthorized(owner, a.id as number, { content: "memcached chosen" });
+    expect((await store.search({ query: "memcached", access: owner }))[0]?.id).toBe(String(a.id));
+    expect(await store.search({ query: "redis", access: owner })).toHaveLength(0);
   });
 
   it("returns the existing memory for a near duplicate of the same type and scope", async () => {
@@ -187,7 +193,7 @@ describe("dedupe and versions", () => {
     const base = { title: "t", type: "note", scope: "global" as const, project: null };
     await expect(store.save({ ...base, content: long })).rejects.toThrow(ContentTooLongError);
     const ok = await store.save({ ...base, content: "x".repeat(MAX_CONTENT_CHARS) });
-    expect(() => store.update(ok.id as number, { content: long })).toThrow(/limit is 4000/);
+    expect(() => store.updateAuthorized(owner, ok.id as number, { content: long })).toThrow(/limit is 4000/);
   });
 });
 
@@ -220,7 +226,7 @@ describe("vector search", () => {
     await store.save({ ...base, title: "Theirs", content: "bbb", scope: "project", project: otherRepo });
     await store.save({ ...base, title: "Shared", content: "ccc", scope: "global", project: null });
     const hits = titles(
-      await store.search({ query: "zzzz nothing matches this keyword", project: dataRepo }),
+      await store.search({ query: "zzzz nothing matches this keyword", access: Access.agent(dataRepo.key) }),
     );
     expect(hits.sort()).toEqual(["Mine", "Shared"]);
   });
@@ -230,7 +236,7 @@ describe("vector search", () => {
     const base = { type: "note", scope: "global" as const, project: null, force: true };
     await store.save({ ...base, title: "Zebra zebra notes", content: "zebra zebra zebra" });
     await store.save({ ...base, title: "Alpha notes", content: "alpha mentions a zebra once" });
-    expect(titles(await store.search({ query: "zebra", project: null }))).toEqual([
+    expect(titles(await store.search({ query: "zebra", access: owner }))).toEqual([
       "Alpha notes",
       "Zebra zebra notes",
     ]);
@@ -240,7 +246,7 @@ describe("vector search", () => {
     const base = { type: "note", scope: "global" as const, project: null, content: "kafka topic retention" };
     await store.save({ ...base, title: "Kafka retention A" });
     const pinned = await store.save({ ...base, title: "Kafka retention B", pinned: true });
-    expect((await store.search({ query: "kafka retention", project: null }))[0]?.id).toBe(String(pinned.id));
+    expect((await store.search({ query: "kafka retention", access: owner }))[0]?.id).toBe(String(pinned.id));
   });
 });
 
@@ -272,8 +278,8 @@ describe("embedding tiers in the store", () => {
     store.setEmbedder(big);
     await store.indexPending();
     expect(big.calls).toBe(callsBefore);
-    const id = Number((await store.search({ query: "memory 1", project: null }))[0]?.id);
-    store.update(id, { content: "rewritten body" });
+    const id = Number((await store.search({ query: "memory 1", access: owner }))[0]?.id);
+    store.updateAuthorized(owner, id, { content: "rewritten body" });
     expect(store.pendingEmbeddings()).toBe(1);
     await store.indexPending();
     expect(store.embeddingModels()).toEqual([
@@ -290,7 +296,7 @@ describe("embedding tiers in the store", () => {
       scope: "global",
       project: null,
     });
-    expect((await store.search({ query: "terraform", project: null }))[0]?.id).toBe(String(saved.id));
+    expect((await store.search({ query: "terraform", access: owner }))[0]?.id).toBe(String(saved.id));
     store.setEmbedder(hashEmbedder());
     await store.indexPending();
     expect(store.pendingEmbeddings()).toBe(0);
@@ -316,7 +322,7 @@ describe("migration", () => {
 
     const upgraded = new MemoryStore({ path });
     try {
-      expect(titles(upgraded.list({ project: null }))).toEqual(["Old memory"]);
+      expect(titles(upgraded.list({ access: owner }))).toEqual(["Old memory"]);
       upgraded.setEmbedder(hashEmbedder());
       expect(upgraded.pendingEmbeddings()).toBe(1);
       await upgraded.indexPending();
@@ -342,10 +348,10 @@ describe("migration", () => {
     db.close();
     const upgraded = new MemoryStore({ path });
     try {
-      const [row] = upgraded.get([1]);
+      const [row] = upgraded.getVisible(owner, [1]);
       expect(row).toMatchObject({ title: "From 1.0", use_count: 0, last_used_at: null, merged_into: null });
       upgraded.markUsed([1]);
-      expect(upgraded.get([1])[0]?.use_count).toBe(1);
+      expect(upgraded.getVisible(owner, [1])[0]?.use_count).toBe(1);
       upgraded.audit.open({ nonce: "n", projectKey: null, provider: "omp", tools: true });
       expect(upgraded.audit.agentFor("n")).toBeNull();
     } finally {
@@ -375,7 +381,11 @@ describe("migration", () => {
     db.close();
     const upgraded = new MemoryStore({ path });
     try {
-      expect(upgraded.get([1])[0]).toMatchObject({ shown_count: 0, opened_count: 0, kept_at: null });
+      expect(upgraded.getVisible(owner, [1])[0]).toMatchObject({
+        shown_count: 0,
+        opened_count: 0,
+        kept_at: null,
+      });
       expect(upgraded.sessions({ projectKey: null, query: "test", limit: 5 }).map((s) => s.id)).toEqual([
         "a1",
       ]);
@@ -415,14 +425,14 @@ describe("migration", () => {
     db.close();
     const upgraded = new MemoryStore({ path });
     try {
-      expect(upgraded.get([3, 5, 7]).map((r) => [r.id, r.title])).toEqual([
+      expect(upgraded.getVisible(owner, [3, 5, 7]).map((r) => [r.id, r.title])).toEqual([
         [3, "Config file"],
         [7, "Retries"],
       ]);
-      expect(titles(await upgraded.search({ query: "backoff", project: null }))).toEqual(["Retries"]);
-      expect(titles(await upgraded.search({ query: "config.ts", project: null }))).toEqual(["Config file"]);
-      expect(await upgraded.search({ query: "zebra", project: null })).toEqual([]);
-      expect(upgraded.detail(5).memory).toBeNull();
+      expect(titles(await upgraded.search({ query: "backoff", access: owner }))).toEqual(["Retries"]);
+      expect(titles(await upgraded.search({ query: "config.ts", access: owner }))).toEqual(["Config file"]);
+      expect(await upgraded.search({ query: "zebra", access: owner })).toEqual([]);
+      expect(upgraded.detailAuthorized(owner, 5).memory).toBeNull();
       expect(upgraded.stats().memories).toBe(2);
     } finally {
       upgraded.close();
@@ -446,7 +456,7 @@ describe("redaction", () => {
       scope: "global",
       project: null,
     });
-    expect(store.get([r.id as number])[0]?.content).toBe("password: [REDACTED]");
+    expect(store.getVisible(owner, [r.id as number])[0]?.content).toBe("password: [REDACTED]");
   });
 });
 
@@ -480,7 +490,11 @@ describe("sessions and context", () => {
     const prompt = buildSystemPrompt({ context: ctx.text, project: dataRepo, hasTools: true });
     expect(prompt.startsWith("<paseo-memory>")).toBe(true);
     expect(prompt).toContain("memory_search");
-    const hits = await store.search({ query: "timezone", project: dataRepo, includeSessions: true });
+    const hits = await store.search({
+      query: "timezone",
+      access: Access.agent(dataRepo.key),
+      includeSessions: true,
+    });
     expect(hits.map((h) => h.kind)).toEqual(["session"]);
   });
 
@@ -516,7 +530,7 @@ describe("context ranking and session capture", () => {
     const at = (title: string) => text.indexOf(title);
     expect(at("Pinned one")).toBeLessThan(at("Often used"));
     expect(at("Often used")).toBeLessThan(at("Rarely used"));
-    expect(store.get([rarely.id as number])[0]?.use_count).toBe(0);
+    expect(store.getVisible(owner, [rarely.id as number])[0]?.use_count).toBe(0);
   });
 
   it("keeps whole words when clipping long memory text", async () => {
@@ -589,11 +603,11 @@ describe("usage", () => {
           .id as number,
       );
     }
-    await store.search({ query: "kafka", project: null, limit: 10 });
-    expect(store.get(ids).every((r) => r.use_count === 0)).toBe(true);
-    const hits = await store.search({ query: "kafka", project: null, limit: 10, track: true });
+    await store.search({ query: "kafka", access: owner, limit: 10 });
+    expect(store.getVisible(owner, ids).every((r) => r.use_count === 0)).toBe(true);
+    const hits = await store.search({ query: "kafka", access: owner, limit: 10, track: true });
     const used = store
-      .get(ids)
+      .getVisible(owner, ids)
       .filter((r) => r.use_count === 1)
       .map((r) => String(r.id));
     expect(used.sort()).toEqual(
@@ -603,7 +617,7 @@ describe("usage", () => {
         .sort(),
     );
     store.markUsed([ids[6] as number, ids[6] as number]);
-    expect(store.get([ids[6] as number])[0]).toMatchObject({
+    expect(store.getVisible(owner, [ids[6] as number])[0]).toMatchObject({
       use_count: 1,
       last_used_at: expect.any(String),
     });
@@ -619,7 +633,7 @@ describe("usage", () => {
     await store.save({ ...base, title: "Grafana A" });
     const b = await store.save({ ...base, title: "Grafana B" });
     for (let i = 0; i < 8; i++) store.markUsed([b.id as number]);
-    expect((await store.search({ query: "grafana dashboards", project: null }))[0]?.id).toBe(String(b.id));
+    expect((await store.search({ query: "grafana dashboards", access: owner }))[0]?.id).toBe(String(b.id));
   });
 
   it("lists unpinned memories nobody used or edited for 60 days as stale", async () => {
@@ -632,7 +646,7 @@ describe("usage", () => {
     now = new Date("2026-02-20T00:00:00Z");
     timed.markUsed([usedLater.id as number]);
     now = new Date("2026-03-15T00:00:00Z");
-    expect(timed.list({ project: null, stale: true }).map((h) => h.id)).toEqual([String(old.id)]);
+    expect(timed.list({ access: owner, stale: true }).map((h) => h.id)).toEqual([String(old.id)]);
     timed.close();
   });
 });
@@ -654,7 +668,7 @@ describe("re-ranking", () => {
 
   it("reorders fused candidates by the re-ranker score", async () => {
     await seed();
-    const fused = titles(await store.search({ query: "deploy", project: null }));
+    const fused = titles(await store.search({ query: "deploy", access: owner }));
     const seen: string[][] = [];
     store.setReranker({
       model: "test/reranker",
@@ -665,23 +679,23 @@ describe("re-ranking", () => {
         );
       },
     });
-    const reranked = titles(await store.search({ query: "deploy", project: null, limit: 2 }));
+    const reranked = titles(await store.search({ query: "deploy", access: owner, limit: 2 }));
     expect(reranked).toEqual(["Deploy freeze dates", "Deploy rollback steps"]);
     expect(seen[0]).toHaveLength(3);
     store.setReranker(null);
-    expect(titles(await store.search({ query: "deploy", project: null }))).toEqual(fused);
+    expect(titles(await store.search({ query: "deploy", access: owner }))).toEqual(fused);
   });
 
   it("keeps the fused order when the re-ranker fails", async () => {
     await seed();
-    const fused = titles(await store.search({ query: "deploy", project: null }));
+    const fused = titles(await store.search({ query: "deploy", access: owner }));
     store.setReranker({
       model: "test/broken",
       score: async () => {
         throw new Error("onnx session failed");
       },
     });
-    expect(titles(await store.search({ query: "deploy", project: null }))).toEqual(fused);
+    expect(titles(await store.search({ query: "deploy", access: owner }))).toEqual(fused);
   });
 
   it("is on by default only for the medium and high tiers", () => {
@@ -698,12 +712,12 @@ describe("curation", () => {
     const a = await store.save({ ...base, title: "Queue", content: "v1 SQS", topicKey: "queue" });
     await store.save({ ...base, title: "Queue", content: "v2 Kafka", topicKey: "queue" });
     const id = a.id as number;
-    expect(store.detail(id).versions.map((v) => v.content)).toEqual(["v1 SQS"]);
-    expect(store.restore(id, 1)).toBe(true);
-    const detail = store.detail(id);
+    expect(store.detailAuthorized(owner, id).versions.map((v) => v.content)).toEqual(["v1 SQS"]);
+    expect(store.restoreAuthorized(owner, id, 1)).toBe("ok");
+    const detail = store.detailAuthorized(owner, id);
     expect(detail.memory?.content).toBe("v1 SQS");
     expect(detail.versions.map((v) => v.content)).toEqual(["v2 Kafka", "v1 SQS"]);
-    expect(store.restore(id, 42)).toBe(false);
+    expect(store.restoreAuthorized(owner, id, 42)).toBe("not_found");
   });
 
   it("merges a duplicate into its target with a pointer and lists duplicates in detail", async () => {
@@ -711,24 +725,29 @@ describe("curation", () => {
     const target = (await store.save({ ...base, title: "Picked Postgres", content: "joins" })).id as number;
     const source = (await store.save({ ...base, title: "Chose Postgres", content: "JSONB", force: true }))
       .id as number;
-    expect(store.detail(source).duplicates).toEqual([
+    expect(store.detailAuthorized(owner, source).duplicates).toEqual([
       { id: target, title: "Picked Postgres", similarity: 1 },
     ]);
-    expect(store.merge(source, source).ok).toBe(false);
-    expect(store.merge(source, target)).toEqual({ ok: true, message: `Merged #${source} into #${target}.` });
-    expect(store.detail(source)).toMatchObject({ memory: null, mergedInto: target });
-    expect(store.detail(target).memory?.content).toBe("joins");
-    expect(await store.search({ query: "zzz", project: dataRepo })).toHaveLength(1);
+    expect(store.mergeAuthorized(owner, source, source).ok).toBe(false);
+    expect(store.mergeAuthorized(owner, source, target)).toEqual({
+      ok: true,
+      message: `Merged #${source} into #${target}.`,
+    });
+    expect(store.detailAuthorized(owner, source)).toMatchObject({ memory: null, mergedInto: target });
+    expect(store.detailAuthorized(owner, target).memory?.content).toBe("joins");
+    expect(await store.search({ query: "zzz", access: Access.agent(dataRepo.key) })).toHaveLength(1);
   });
 
   it("moves a memory between scopes", async () => {
     const id = (await store.save({ ...base, title: "Use uv", content: "uv sync" })).id as number;
-    expect(() => store.update(id, { scope: "project", project: null })).not.toThrow();
-    expect(store.update(id, { scope: "global" })).toBe(true);
-    expect(store.list({ project: null, scope: "global" }).map((h) => h.id)).toEqual([String(id)]);
-    expect(() => store.update(id, { scope: "project" })).toThrow(/needs a project/);
-    expect(store.update(id, { scope: "project", project: otherRepo })).toBe(true);
-    expect(store.list({ project: otherRepo, scope: "project" }).map((h) => h.id)).toEqual([String(id)]);
+    expect(() => store.updateAuthorized(owner, id, { scope: "project", project: null })).not.toThrow();
+    expect(store.updateAuthorized(owner, id, { scope: "global" })).toBe("ok");
+    expect(store.list({ access: owner, scope: "global" }).map((h) => h.id)).toEqual([String(id)]);
+    expect(() => store.updateAuthorized(owner, id, { scope: "project" })).toThrow(/needs a project/);
+    expect(store.updateAuthorized(owner, id, { scope: "project", project: otherRepo })).toBe("ok");
+    expect(store.list({ access: Access.agent(otherRepo.key), scope: "project" }).map((h) => h.id)).toEqual([
+      String(id),
+    ]);
   });
 });
 
@@ -767,12 +786,12 @@ describe("fts query", () => {
       scope: "global",
       project: null,
     });
-    expect((await store.search({ query: "backoff", project: null })).map((h) => h.id)).toEqual([
+    expect((await store.search({ query: "backoff", access: owner })).map((h) => h.id)).toEqual([
       String(saved.id),
     ]);
-    expect(store.update(saved.id as number, { content: "Retries use jitter." })).toBe(true);
-    expect(await store.search({ query: "backoff", project: null })).toEqual([]);
-    expect((await store.search({ query: "jitter", project: null })).map((h) => h.id)).toEqual([
+    expect(store.updateAuthorized(owner, saved.id as number, { content: "Retries use jitter." })).toBe("ok");
+    expect(await store.search({ query: "backoff", access: owner })).toEqual([]);
+    expect((await store.search({ query: "jitter", access: owner })).map((h) => h.id)).toEqual([
       String(saved.id),
     ]);
   });

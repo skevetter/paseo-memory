@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Access } from "../service/access";
 import type { Embedder, TierSpec } from "../service/embedder";
 import type { ProjectRef } from "../service/store";
 import { sha256 } from "../service/text";
@@ -18,6 +19,8 @@ export const otherRepo: ProjectRef = {
   rootPath: "/Users/u/devsy",
   paseoProjectId: "prj_bbbb",
 };
+
+export const owner = Access.owner();
 
 const created: string[] = [];
 

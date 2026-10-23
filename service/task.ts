@@ -1,4 +1,5 @@
 import type { Strictness, TaskSource } from "../shared/service-api";
+import { Access } from "./access";
 import { RERANK_TASK_FLOOR } from "./reranker";
 import type { MemoryHit, MemoryStore, ProjectRef } from "./store";
 import { clipWords } from "./text";
@@ -33,7 +34,8 @@ export async function findTaskMatches(input: TaskSearch): Promise<TaskMatches> {
   const timedOut = Promise.withResolvers<null>();
   const timer = setTimeout(() => timedOut.resolve(null), input.budgetMs);
   try {
-    const search = store.search({ query, project: input.project, scope: "all", limit: limit * 3 });
+    const access = Access.agent(input.project?.key ?? null);
+    const search = store.search({ query, access, scope: "all", limit: limit * 3 });
     const hits = await Promise.race([search, timedOut.promise]);
     if (hits === null) {
       return {

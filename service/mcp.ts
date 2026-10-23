@@ -1,6 +1,16 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { SERVICE_VERSION } from "./version";
 
+/** A failure the model can act on: a stable machine-readable code plus a short message. */
+export class ToolError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -110,14 +120,29 @@ async function callTool(tools: ToolDefinition[], message: JsonRpcRequest, caller
   const name = String(message.params?.name ?? "");
   const tool = tools.find((t) => t.name === name);
   if (!tool) return rpcError(id, -32602, `unknown tool: ${name}`);
-  const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
+  const args = message.params?.arguments ?? {};
+  if (typeof args !== "object" || args === null || Array.isArray(args)) {
+    return rpcError(id, -32602, "tool arguments must be a JSON object");
+  }
   try {
-    const text = await tool.handler(args, caller);
+    const text = await tool.handler(args as Record<string, unknown>, caller);
     return rpcResult(id, { content: [{ type: "text", text }], isError: false });
   } catch (error) {
-    const text = error instanceof Error ? error.message : String(error);
-    return rpcResult(id, { content: [{ type: "text", text }], isError: true });
+    return rpcResult(id, toolFailure(error));
   }
+}
+
+function toolFailure(error: unknown) {
+  if (error instanceof ToolError) {
+    const structuredContent = { error: { code: error.code, message: error.message } };
+    return {
+      content: [{ type: "text", text: `${error.code}: ${error.message}` }],
+      structuredContent,
+      isError: true,
+    };
+  }
+  const text = error instanceof Error ? error.message : String(error);
+  return { content: [{ type: "text", text }], isError: true };
 }
 
 function preflight(req: Request, secret: string): Response | Caller {
