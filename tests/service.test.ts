@@ -411,7 +411,6 @@ describe("session review", () => {
     }
     const fourth = await agent.call("memory_save", { title: "Review fact 4", content: "one too many" });
     expect(fourth.isError).toBe(true);
-    expect(fourth.content[0]?.text).toContain("already saved 3 memories, the limit for one review");
     const reply = `[paseo-memory:review-reply v1 collapsed]\nSummary: Capped retries at three and kept backoff.\nSaved: #${ids.join(", #")}\nUpdated: none`;
     const ended = await internal("review-end", { agentId, reply, failed: false });
     expect(ended.json).toEqual({

@@ -3,82 +3,6 @@ import { Access } from "./access";
 import type { AuditDetail } from "./audit";
 import type { MemoryStore } from "./store";
 
-const WINDOW_MS = 15 * 60_000;
-
-export class ReviewCapError extends Error {
-  constructor(cap: number) {
-    super(
-      `This review already saved ${cap} ${cap === 1 ? "memory" : "memories"}, the limit for one review. ` +
-        "Update an existing memory with memory_update, or finish the review.",
-    );
-  }
-}
-
-interface ReviewWindow {
-  agentId: string;
-  nonce: string;
-  trigger: string;
-  startedAt: string;
-  startedMs: number;
-  saves: number;
-}
-
-export interface ClosedReview {
-  nonce: string;
-  trigger: string;
-  startedAt: string;
-  durationMs: number;
-}
-
-// A review window is open from review-start until its turn ends; saves inside it count toward the cap.
-export class ReviewWindows {
-  private readonly byNonce = new Map<string, ReviewWindow>();
-  private readonly store: MemoryStore;
-  private readonly now: () => Date;
-
-  constructor(store: MemoryStore, now: () => Date = () => new Date()) {
-    this.store = store;
-    this.now = now;
-  }
-
-  open(input: { agentId: string; nonce: string; trigger: string }): void {
-    const now = this.now();
-    this.byNonce.set(input.nonce, {
-      ...input,
-      startedAt: now.toISOString(),
-      startedMs: now.getTime(),
-      saves: 0,
-    });
-  }
-
-  checkSave(nonce: string | null): void {
-    const window = this.active(nonce);
-    const cap = this.store.config.reviewMaxMemories;
-    if (window && window.saves >= cap) throw new ReviewCapError(cap);
-  }
-
-  countSave(nonce: string | null, status: string): void {
-    const window = this.active(nonce);
-    if (window && (status === "created" || status === "updated")) window.saves++;
-  }
-
-  close(agentId: string): ClosedReview | null {
-    const window = [...this.byNonce.values()].find((w) => w.agentId === agentId);
-    if (!window) return null;
-    this.byNonce.delete(window.nonce);
-    const { nonce, trigger, startedAt, startedMs } = window;
-    return { nonce, trigger, startedAt, durationMs: this.now().getTime() - startedMs };
-  }
-
-  private active(nonce: string | null): ReviewWindow | null {
-    const window = nonce ? this.byNonce.get(nonce) : undefined;
-    if (!window) return null;
-    if (this.now().getTime() - window.startedMs <= WINDOW_MS) return window;
-    this.byNonce.delete(window.nonce);
-    return null;
-  }
-}
-
 export interface ReviewEnd {
   agentId: string;
   reply: string | null;
@@ -92,8 +16,8 @@ export interface ReviewOutcome {
   summary: string | null;
 }
 
-export function finishReview(store: MemoryStore, windows: ReviewWindows, end: ReviewEnd): ReviewOutcome {
-  const closed = windows.close(end.agentId);
+export function finishReview(store: MemoryStore, end: ReviewEnd): ReviewOutcome {
+  const closed = store.reviews.close(end.agentId);
   const nonce = closed?.nonce ?? store.audit.nonceFor(end.agentId);
   const base = { trigger: closed?.trigger ?? "unknown", durationMs: closed?.durationMs ?? null };
   if (end.failed || !end.reply) {
@@ -137,7 +61,7 @@ function touchedIds(events: AuditDetail[]): { saved: number[]; updated: number[]
   for (const event of events) {
     if (event.kind === "save" && event.id !== null && event.status === "created") saved.add(event.id);
     if (event.kind === "save" && event.id !== null && event.status === "updated") updated.add(event.id);
-    if (event.kind === "update" && event.ok) updated.add(event.id);
+    if (event.kind === "update" && event.ok && !event.unchanged) updated.add(event.id);
   }
   return { saved: [...saved], updated: [...updated] };
 }

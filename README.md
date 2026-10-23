@@ -7,8 +7,8 @@ Local memory for Paseo agents. One SQLite file stores global and project memory.
 - **Starting memory:** each new agent receives memories that match its first prompt, plus pinned, project, global and recent-session entries, within a character budget.
 - **MCP tools:** `memory_search`, `memory_get`, `memory_save`, `memory_update`, `memory_delete`, `memory_context`.
 - **Session digests:** each turn records the prompt, the reply and the edited files. Tool output is not stored.
-- **Session review:** an idle agent receives one prompt to summarize the session and save up to 3 memories.
-- **Upkeep:** duplicate suggestions, contradiction flags and a stale list.
+- **Session review:** an idle agent receives one prompt to summarize the session and make up to 3 memory changes, counting creates and updates together.
+- **Upkeep:** duplicate suggestions, possible-conflict flags and a stale list. Automatic merges require compatible exact content and namespace; merges retain snapshots and support undo.
 - **Audit:** each agent's injected memories, tool calls and reviews.
 - **UI:** a Memory panel, a settings screen and a `/remember` command.
 

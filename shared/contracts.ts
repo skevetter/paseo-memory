@@ -193,7 +193,23 @@ export const restoreMemoryRpc = defineRpc({
 
 export const mergeMemoryRpc = defineRpc({
   name: "memory.merge",
-  input: z.object({ sourceId: z.number().int(), targetId: z.number().int() }),
+  input: z.object({
+    sourceId: z.number().int(),
+    targetId: z.number().int(),
+    sourceRevision: z.number().int(),
+    targetRevision: z.number().int(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    message: z.string(),
+    mergeId: z.number().nullable(),
+    conflict: z.boolean(),
+  }),
+});
+
+export const undoMergeRpc = defineRpc({
+  name: "memory.merge.undo",
+  input: z.object({ mergeId: z.number().int() }),
   output: z.object({ ok: z.boolean(), message: z.string() }),
 });
 
@@ -231,7 +247,7 @@ export const upkeepRunRpc = defineRpc({
   output: z.object({
     merged: z.number(),
     duplicates: z.number(),
-    contradictions: z.number(),
+    conflicts: z.number(),
     stale: z.number(),
   }),
 });

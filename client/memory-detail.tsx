@@ -11,6 +11,7 @@ import {
   memoryDetailRpc,
   mergeMemoryRpc,
   restoreMemoryRpc,
+  undoMergeRpc,
   updateMemoryRpc,
 } from "../shared/contracts";
 import { formatDate, formatDateTime, plural, QUERY_ROOT, type Styles, useRefresh } from "./panel-styles";
@@ -67,7 +68,12 @@ function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
         <MemoryEditor key={`${memory.id}:${memory.updatedAt}`} memory={memory} props={props} />
         <MemoryFacts memory={memory} s={s} />
         <VersionList memoryId={memory.id} versions={data.versions} s={s} />
-        <DuplicateList memoryId={memory.id} duplicates={data.duplicates} onOpenMemory={onOpenMemory} s={s} />
+        <DuplicateList
+          memoryId={memory.id}
+          revision={memory.recordRevision}
+          duplicates={data.duplicates}
+          s={s}
+        />
       </>
     );
   }
@@ -82,6 +88,26 @@ function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
         accessibilityLabel={`Open memory ${mergedInto}`}
         s={s}
       />
+      {data.mergeId === null ? null : <UndoMerge mergeId={data.mergeId} s={s} />}
+    </>
+  );
+}
+
+function UndoMerge({ mergeId, s }: { mergeId: number; s: Styles }) {
+  const undo = useRpc(undoMergeRpc);
+  const refresh = useRefresh();
+  const mutation = useMutation({ mutationFn: () => undo({ mergeId }), onSuccess: () => void refresh() });
+  return (
+    <>
+      <Link
+        label="Undo merge"
+        disabled={mutation.isPending}
+        onPress={() => mutation.mutate()}
+        accessibilityLabel="Restore this memory as its own entry"
+        s={s}
+      />
+      {mutation.data && !mutation.data.ok ? <Text style={s.danger}>{mutation.data.message}</Text> : null}
+      {mutation.error ? <Text style={s.danger}>{String(mutation.error)}</Text> : null}
     </>
   );
 }
@@ -287,20 +313,23 @@ function VersionList({ memoryId, versions, s }: VersionListProps) {
 
 interface DuplicateListProps {
   memoryId: number;
+  revision: number;
   duplicates: MemoryDetail["duplicates"];
-  onOpenMemory: (id: number) => void;
   s: Styles;
 }
 
-function DuplicateList({ memoryId, duplicates, onOpenMemory, s }: DuplicateListProps) {
+function DuplicateList({ memoryId, revision, duplicates, s }: DuplicateListProps) {
   const merge = useRpc(mergeMemoryRpc);
   const refresh = useRefresh();
   const mutation = useMutation({
-    mutationFn: (targetId: number) => merge({ sourceId: memoryId, targetId }),
-    onSuccess: (result, targetId) => {
-      void refresh();
-      if (result.ok) onOpenMemory(targetId);
-    },
+    mutationFn: (target: { id: number; revision: number }) =>
+      merge({
+        sourceId: memoryId,
+        targetId: target.id,
+        sourceRevision: revision,
+        targetRevision: target.revision,
+      }),
+    onSuccess: () => void refresh(),
   });
   if (duplicates.length === 0) return null;
   return (
@@ -317,7 +346,7 @@ function DuplicateList({ memoryId, duplicates, onOpenMemory, s }: DuplicateListP
           <Link
             label={`Merge into #${d.id}`}
             disabled={mutation.isPending}
-            onPress={() => mutation.mutate(d.id)}
+            onPress={() => mutation.mutate({ id: d.id, revision: d.revision })}
             accessibilityLabel={`Merge this memory into memory ${d.id}`}
             s={s}
           />

@@ -18,7 +18,6 @@ import {
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
 import { type Caller, createMcpHandler } from "./mcp";
 import { loadReranker, RERANK_MODEL, type Reranker, rerankEnabled } from "./reranker";
-import { ReviewWindows } from "./review";
 import { createRoutes, type Routes } from "./routes";
 import { errorText, FatalError } from "./sqlite";
 import { MemoryStore } from "./store";
@@ -81,11 +80,10 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     log,
   });
   const models = initialStates(options);
-  const windows = new ReviewWindows(store);
 
   let mcpUrl = "";
   const status = (): ServiceStatus => serviceStatus(store, models, mcpUrl);
-  const routes = createRoutes({ store, windows, secret, status, mcpUrl: () => mcpUrl });
+  const routes = createRoutes({ store, secret, status, mcpUrl: () => mcpUrl });
   const mcp = createMcpHandler({
     secret,
     instructions: MCP_INSTRUCTIONS,
@@ -93,7 +91,6 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     resolveCaller: (caller) => resolveCaller(store, caller),
     tools: createTools({
       store,
-      windows,
       resolveProject: (caller) => callerProject(store, caller.projectKey),
     }),
   });

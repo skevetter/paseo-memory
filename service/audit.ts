@@ -34,7 +34,7 @@ export type AuditDetail =
   | { kind: "search"; query: string; scope: string; results: { id: string; score: number }[] }
   | { kind: "get"; ids: number[]; found: number[] }
   | { kind: "save"; id: number | null; status: string; candidates: number[] }
-  | { kind: "update" | "delete"; id: number; ok: boolean }
+  | { kind: "update" | "delete"; id: number; ok: boolean; unchanged?: boolean }
   | ({ kind: "review" } & ReviewAudit)
   | { kind: "merge"; source: number; target: number; similarity: number | null; sameTopic: boolean }
   | { kind: "denied"; tool: string; operation: string; ids: number[] }
@@ -295,7 +295,10 @@ class AuditViews {
       case "merge":
         return {
           summary: `merged #${d.source} into #${d.target}${d.sameTopic ? " (same topic)" : ""}`,
-          memories: [this.memory(d.target, d.similarity, "kept")],
+          memories: [
+            this.memory(d.source, d.similarity, "merged"),
+            this.memory(d.target, d.similarity, "kept"),
+          ],
         };
       case "denied":
         return { summary: `${d.tool} refused outside this agent's scope (${d.operation})` };
@@ -303,8 +306,8 @@ class AuditViews {
         return { summary: `${d.tool} rejected malformed input: ${d.fields.join(", ") || "arguments"}` };
       default:
         return {
-          summary: `${d.ok ? `${d.kind}d` : "not found"} #${d.id}`,
-          memories: [this.memory(d.id, null, d.ok ? `${d.kind}d` : "missing")],
+          summary: describeChange(d),
+          memories: [this.memory(d.id, null, d.unchanged ? "unchanged" : d.ok ? `${d.kind}d` : "missing")],
         };
     }
   }
@@ -416,4 +419,10 @@ function sessionIds(d: AuditDetail): string[] {
   if (d.kind === "search")
     return d.results.filter((r) => r.id.startsWith("session:")).map((r) => r.id.slice(8));
   return [];
+}
+
+function describeChange(d: Extract<AuditDetail, { kind: "update" | "delete" }>): string {
+  if (!d.ok) return `not found #${d.id}`;
+  if (d.kind === "update" && d.unchanged) return `no change to #${d.id}`;
+  return `${d.kind}d #${d.id}`;
 }

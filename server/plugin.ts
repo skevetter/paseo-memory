@@ -23,6 +23,7 @@ import {
   searchMemoriesRpc,
   sessionsRpc,
   statusRpc,
+  undoMergeRpc,
   updateMemoryRpc,
   upkeepListRpc,
   upkeepRunRpc,
@@ -465,6 +466,7 @@ function registerRpcs(server: PluginServerContext, state: PluginState): void {
   server.handle(memoryDetailRpc, (input) => call("detail", input, RPC_TIMEOUT_MS));
   server.handle(restoreMemoryRpc, (input) => call("restore", input, RPC_TIMEOUT_MS));
   server.handle(mergeMemoryRpc, (input) => call("merge", input, RPC_TIMEOUT_MS));
+  server.handle(undoMergeRpc, (input) => call("merge-undo", input, RPC_TIMEOUT_MS));
   server.handle(sessionsRpc, (input) => call("sessions", input, RPC_TIMEOUT_MS));
   server.handle(agentAuditRpc, (input) => call("agent-audit", input, RPC_TIMEOUT_MS));
   server.handle(workspaceAgentsRpc, (input) => call("workspace-agents", input, RPC_TIMEOUT_MS));

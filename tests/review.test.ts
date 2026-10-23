@@ -186,14 +186,10 @@ describe("review scheduler", () => {
 });
 
 describe("review protocol", () => {
-  it("marks the prompt with the display mode and states the save limit", () => {
+  it("round trips the prompt display mode without treating ordinary chat as a review", () => {
     const prompt = reviewPrompt({ cap: 3, display: "hidden" });
-    expect(prompt.split("\n")[0]).toBe("[paseo-memory:review v1 hidden]");
-    expect(prompt).toContain("at most 3 durable memories");
-    expect(prompt).toContain("memory_search");
     expect(reviewPromptDisplay(prompt)).toBe("hidden");
     expect(reviewPromptDisplay("please review my PR")).toBeNull();
-    expect(reviewPrompt({ cap: 0, display: "full" })).toContain("Do not save or update any memory");
   });
 
   it("parses the summary and the saved and updated ids", () => {

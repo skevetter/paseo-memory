@@ -9,8 +9,8 @@ An agent reaches global memory and the memory of its own project, never another 
 - New agents receive a memory block in their system prompt: matches for the first prompt, pinned memories, recent project and global memories, and recent sessions.
 - Agents get MCP tools to search, read, save, update and delete memories. Arguments are validated before anything runs: a malformed call returns an `invalid_input` error and changes nothing. An id outside the agent's scope reads as not found, and the audit records the denial without the request text.
 - Each turn records the prompt, the reply and the edited files. Tool output is not stored.
-- An idle agent receives one prompt to summarize its session and save up to 3 memories. The review shows as one collapsed line in the chat.
-- A daily job suggests duplicate merges, flags contradictions and lists stale memories.
+- An idle agent receives one prompt to summarize its session and make up to 3 memory changes. Creates, topic upserts and direct updates share one atomic cap, including concurrent calls. Unchanged, duplicate and failed writes do not use a slot; retrying the same request returns its receipt. The review shows as one collapsed line in the chat.
+- A daily job suggests duplicate merges, flags possible conflicts and lists stale memories. Approximate matches are suggestions only. Automatic merging requires the same canonical title and content, type, namespace, source, agent/provider authority and pin state; it never crosses global/project boundaries. Merges require current revisions, retain both snapshots and can be undone from the merged memory, preserving its ID and history.
 - The Memory panel shows memories, sessions, a review queue and what each agent received.
 
 ## Setup
@@ -34,4 +34,5 @@ The settings screen controls how much memory each agent receives, the session re
 - On first start the plugin runs `bun install` in its directory to fetch its runtime packages, about 480 MB.
 - Embedding and re-ranking models download from Hugging Face on first use, 30 MB to 337 MB per tier. Models run on the host. No memory content leaves the host.
 - Secrets in common formats are redacted before saving.
-- The session review uses one agent turn.
+- The session review uses one agent turn. Its memory-change cap is not a provider-token or cost cap. Each review also allows at most the larger of 20 mutation attempts or twice its change cap, including failed and malformed writes. The cap and receipts survive service restarts. After 15 minutes, the review blocks further changes until its end event; expiry never makes it unrestricted.
+- Review receipts and merge snapshots complete the additive v6 schema. Opening an M02-only v6 database backs it up before adding those tables, without invalidating already-current vectors.

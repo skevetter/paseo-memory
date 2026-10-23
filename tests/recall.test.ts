@@ -3,7 +3,7 @@ import { buildContext, buildSystemPrompt } from "../service/context";
 import type { Embedder } from "../service/embedder";
 import { type MemoryHit, MemoryStore, type SaveInput } from "../service/store";
 import { findTaskMatches, isTaskMatch } from "../service/task";
-import { candidatePairs, runUpkeep, UPKEEP_NONCE, upkeepPairs } from "../service/upkeep";
+import { runUpkeep, UPKEEP_NONCE, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME, type RuntimeConfig } from "../shared/service-api";
 import { dataRepo, hashEmbedder, hashSpec, owner } from "./helpers";
 
@@ -176,29 +176,24 @@ describe("usage feedback", () => {
 });
 
 describe("upkeep", () => {
-  it("suggests a merge into the more used memory and merges it automatically when asked", async () => {
+  it("suggests approximate duplicates without automatically discarding different facts", async () => {
     store.setEmbedder(sameVector("test/upkeep"));
     const older = await saveId({ ...project, type: "decision", title: "Picked Postgres", content: "joins" });
     const used = await saveId({ ...project, type: "decision", title: "Chose Postgres", content: "JSONB" });
     store.markShown([used]);
-    const { duplicates, contradictions } = upkeepPairs(store, dataRepo);
-    expect(contradictions).toEqual([]);
-    expect(duplicates).toHaveLength(1);
-    expect(duplicates[0]).toMatchObject({ targetId: used, similarity: 1, sameTopic: false });
-    expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ duplicates: 1, merged: 0 });
-    expect(store.getVisible(owner, [older])).toHaveLength(1);
-
-    configure({ duplicateMerge: "auto" });
-    expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ duplicates: 1, merged: 1 });
-    expect(store.detailAuthorized(owner, older)).toMatchObject({ memory: null, mergedInto: used });
-    expect(store.audit.eventsSince(UPKEEP_NONCE, "2026-01-01")).toEqual([
-      { kind: "merge", source: older, target: used, similarity: 1, sameTopic: false },
+    const { duplicates, conflicts } = upkeepPairs(store, dataRepo);
+    expect(conflicts).toEqual([]);
+    expect(duplicates).toEqual([
+      expect.objectContaining({ targetId: used, similarity: 1, sameTopic: false, exact: false }),
     ]);
-    expect(candidatePairs(store)).toEqual([]);
+    configure({ duplicateMerge: "auto" });
+    expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ duplicates: 1, merged: 0 });
+    expect(store.getVisible(owner, [older, used])).toHaveLength(2);
+    expect(store.audit.eventsSince(UPKEEP_NONCE, "2026-01-01")).toEqual([]);
   });
 
-  it("flags differing values as contradictions and never merges them", async () => {
-    store.setEmbedder(sameVector("test/contradiction"));
+  it("flags differing values as possible conflicts and never merges them", async () => {
+    store.setEmbedder(sameVector("test/conflict"));
     const a = await saveId({
       ...project,
       type: "config",
@@ -212,25 +207,23 @@ describe("upkeep", () => {
       content: "The service port is 6798",
     });
     configure({ duplicateMerge: "auto" });
-    const { contradictions, duplicates } = upkeepPairs(store, dataRepo);
+    const { conflicts, duplicates } = upkeepPairs(store, dataRepo);
     expect(duplicates).toEqual([]);
-    expect(contradictions).toEqual([
+    expect(conflicts).toEqual([
       expect.objectContaining({ values: { a: ["6797"], b: ["6798"] }, similarity: 1 }),
     ]);
-    expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ contradictions: 1, merged: 0 });
+    expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ conflicts: 1, merged: 0 });
     expect(store.getVisible(owner, [a, b])).toHaveLength(2);
     store.dismissPair(b, a);
-    expect(upkeepPairs(store, dataRepo).contradictions).toEqual([]);
+    expect(upkeepPairs(store, dataRepo).conflicts).toEqual([]);
   });
 
   it("pairs a project and a global memory with the same topic key, and is quiet when off", async () => {
     await store.save({ ...project, title: "Retry cap", content: "3 attempts", topicKey: "billing/retries" });
     await store.save({ ...global, title: "Retry cap", content: "5 attempts", topicKey: "billing/retries" });
-    expect(upkeepPairs(store, dataRepo).contradictions).toEqual([
-      expect.objectContaining({ sameTopic: true }),
-    ]);
+    expect(upkeepPairs(store, dataRepo).conflicts).toEqual([expect.objectContaining({ sameTopic: true })]);
     configure({ duplicateMerge: "off" });
-    expect(upkeepPairs(store, dataRepo)).toEqual({ duplicates: [], contradictions: [] });
+    expect(upkeepPairs(store, dataRepo)).toEqual({ duplicates: [], conflicts: [] });
   });
 
   it("lists unpinned memories untouched for the stale window; keep resets it and archive removes it", async () => {

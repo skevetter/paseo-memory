@@ -81,7 +81,7 @@ function UpkeepSection({ values, save, theme }: SectionProps) {
       <SettingsCard>
         <SettingsSelect
           label="Duplicates"
-          hint="Finds memories that say the same thing. Suggestions appear in the Review tab of the Memory panel."
+          hint="Suggestions appear in the Review tab. Automatic merging requires matching text, type, namespace and authority. It never crosses global/project boundaries. Merges can be undone from the merged memory."
           value={values.duplicateMerge}
           options={MERGE_OPTIONS}
           onValueChange={(duplicateMerge) => save({ duplicateMerge })}

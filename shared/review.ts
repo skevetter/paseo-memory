@@ -18,12 +18,13 @@ export function reviewPrompt(input: { cap: number; display: ReviewDisplay }): st
   const limit =
     input.cap === 0
       ? "Do not save or update any memory in this review; only write the summary."
-      : `Save or update at most ${input.cap} durable ${input.cap === 1 ? "memory" : "memories"}: decisions, root causes, conventions, config, and user corrections. Prefer memory_update or a topic_key over a new memory. Write content as What / Why / Where / Learned in under 800 characters. Never save secrets, credentials, transcripts, or customer data. Saving nothing is fine.`;
+      : `Make at most ${input.cap} memory ${input.cap === 1 ? "change" : "changes"}. Saving a new memory and updating one each count as one; a duplicate or an update that changes nothing does not. Keep to durable facts: decisions, root causes, conventions, config, and user corrections. Prefer memory_update or a topic_key over a new memory. Write content as What / Why / Where / Learned in under 800 characters. Never save secrets, credentials, transcripts, or customer data. Saving nothing is fine.`;
   return [
     `[paseo-memory:review v1 ${input.display}]`,
     "This is an automatic memory review from paseo-memory, not a request from the user. Do not edit files or run commands other than the memory tools.",
     "1. Call memory_search for the main topics of this session before you save anything.",
     `2. ${limit}`,
+    "Stop if a memory tool reports the attempt limit or review expiry. The cap limits memory changes, not provider tokens or cost.",
     "3. Reply in exactly this format and nothing else:",
     `${REPLY_MARKER_TEXT} ${input.display}]`,
     "Summary: <one paragraph on what this session did, decided and learned>",
