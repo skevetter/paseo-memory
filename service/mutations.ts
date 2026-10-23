@@ -825,11 +825,10 @@ export class MemoryMutations {
   }
 
   private forget(principal: MutationPrincipal, current: MemoryRow): MutationResult {
-    const preview = this.options.lifecycle.preview(principal.access, current.id);
+    const { preview, nonces } = this.options.lifecycle.erasurePlan(principal.access, current.id);
     const ids = preview.records.map((r) => r.id);
     const placeholders = ids.map(() => "?").join(",");
     const ts = this.options.now();
-    const nonces = this.options.lifecycle.disclosedNonces(ids);
     for (const ref of preview.records)
       this.db
         .query("INSERT OR IGNORE INTO memory_tombstones VALUES ('memory',?,?,?)")

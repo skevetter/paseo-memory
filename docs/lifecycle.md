@@ -55,6 +55,8 @@ Archive retains content and accessible history. Supersession retains the old cla
 
 Erasure revokes affected signed tool contexts before subsequent reads, writes or receipt replay, including callers without a linked agent and stateless signed credentials. Known agent IDs and content-producing mutation principals remain invalidated too. Closing a review window never restores a forgotten caller's capability; a new authorized context is required.
 
+Known context exposure includes transitive session copies: if Alice reads a fact and Bob later receives Alice's digest through injection, `memory_context` or session search, both contexts are included in the forget preview and revoked. Their controlled digests are erased; unrelated and denied-read contexts are not included merely because they share a project. Cycles are deduplicated. Preview and erasure fail closed before changes when the caller/agent/session graph exceeds 10,000 nodes; they never report a partial erasure as complete. This requires retained disclosure and identity records; it cannot reconstruct unrecorded or externally copied content.
+
 Forgetting cannot retract already attached prompts, host chat history or provider requests. Affected sessions need fresh authorized context for subsequent managed execution; deleting host history or restarting a session is a separate host action. External source systems and previously exported backups are separate copies. This is logical service erasure, not a forensic-erasure promise for SQLite pages, filesystem snapshots or copies held outside Memory.
 
 ## Schema v7 and rollback

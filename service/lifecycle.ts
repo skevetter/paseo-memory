@@ -3,7 +3,7 @@ import type { ForgetPreview, MemoryRef } from "../shared/lifecycle";
 import type { Access } from "./access";
 import { dropVectors } from "./vectors";
 
-const DISCLOSURES_SQL = `WITH disclosed(nonce,memory_id) AS (
+const DISCLOSURES_SQL = `WITH RECURSIVE disclosed(nonce,memory_id) AS (
   SELECT e.nonce,CAST(j.value AS INTEGER) FROM audit_events e,json_each(e.detail,'$.memories') j WHERE e.kind IN ('inject','context')
   UNION SELECT e.nonce,CAST(j.value AS INTEGER) FROM audit_events e,json_each(e.detail,'$.found') j WHERE e.kind='get'
   UNION SELECT e.nonce,CAST(json_extract(j.value,'$.id') AS INTEGER) FROM audit_events e,json_each(e.detail,'$.results') j WHERE e.kind='search'
@@ -65,17 +65,37 @@ export class Lifecycle {
     );
   }
 
-  disclosedNonces(ids: number[]): string[] {
+  private exposedContexts(ids: number[]): { agents: string[]; nonces: string[] } {
     const placeholders = ids.map(() => "?").join(",");
-    const rows = this.db
-      .prepare<{ nonce: string }, number[]>(`${DISCLOSURES_SQL}
-      SELECT DISTINCT nonce FROM disclosed WHERE memory_id IN (${placeholders})
-      UNION SELECT nonce FROM agent_links WHERE agent_id IN (SELECT agent_id FROM memories WHERE id IN (${placeholders}))
-      LIMIT 10001`)
+    const nodes = this.db
+      .prepare<{ kind: string; identifier: string }, number[]>(`${DISCLOSURES_SQL},
+      session_disclosed(nonce,session_id) AS (
+        SELECT e.nonce,CAST(j.value AS TEXT) FROM audit_events e,json_each(e.detail,'$.sessions') j
+          WHERE e.kind IN ('inject','context')
+        UNION SELECT e.nonce,substr(json_extract(j.value,'$.id'),9)
+          FROM audit_events e,json_each(e.detail,'$.results') j
+          WHERE e.kind='search' AND json_extract(j.value,'$.id') LIKE 'session:%'
+      ), exposed(kind,identifier) AS (
+        SELECT 'caller',nonce FROM disclosed WHERE memory_id IN (${placeholders}) AND nonce IS NOT NULL
+        UNION SELECT 'agent',agent_id FROM memories WHERE id IN (${placeholders}) AND agent_id IS NOT NULL
+        UNION SELECT 'agent',a.agent_id FROM exposed x JOIN agent_links a
+          ON x.kind='caller' AND a.nonce=x.identifier WHERE a.agent_id IS NOT NULL
+        UNION SELECT 'caller',a.nonce FROM exposed x JOIN agent_links a
+          ON x.kind='agent' AND a.agent_id=x.identifier
+        UNION SELECT 'session',identifier FROM exposed WHERE kind='agent'
+        UNION SELECT 'session',s.id FROM exposed x JOIN sessions s
+          ON x.kind='agent' AND s.agent_id=x.identifier
+        UNION SELECT 'caller',d.nonce FROM exposed x JOIN session_disclosed d
+          ON x.kind='session' AND d.session_id=x.identifier WHERE d.nonce IS NOT NULL
+        LIMIT 10001
+      ) SELECT kind,identifier FROM exposed`)
       .all(...ids, ...ids);
-    if (rows.length > 10000)
-      throw new Error("Forget affects more than 10000 caller contexts; maintenance is required.");
-    return rows.map((row) => row.nonce);
+    if (nodes.length > 10000)
+      throw new Error("Forget affects more than 10000 context graph nodes; maintenance is required.");
+    return {
+      agents: nodes.filter((node) => node.kind === "agent").map((node) => node.identifier),
+      nonces: nodes.filter((node) => node.kind === "caller").map((node) => node.identifier),
+    };
   }
 
   historicalSourcesValid(ref: MemoryRef, asOf: string): boolean {
@@ -181,6 +201,10 @@ export class Lifecycle {
   }
 
   preview(access: Access, id: number): ForgetPreview {
+    return this.erasurePlan(access, id).preview;
+  }
+
+  erasurePlan(access: Access, id: number): { preview: ForgetPreview; nonces: string[] } {
     if (access.kind !== "owner") throw new Error("Only the owner can preview source erasure.");
     const root = this.db
       .query<{ scope: "global" | "project"; project_key: string | null }, [number]>(
@@ -214,23 +238,20 @@ export class Lifecycle {
       WHERE l.memory_id IN (${placeholders}) OR EXISTS (SELECT 1 FROM memories m WHERE m.id IN (${placeholders})
         AND e.source_kind='memory' AND e.source_ref LIKE ('memory:' || m.id || '@%'))`)
       .all(...ids, ...ids);
-    const affectedAgentIds = this.db
-      .prepare<{ agent_id: string }, number[]>(`${DISCLOSURES_SQL}
-      SELECT DISTINCT a.agent_id FROM agent_links a JOIN disclosed d ON d.nonce=a.nonce
-      WHERE a.agent_id IS NOT NULL AND d.memory_id IN (${placeholders})
-      UNION SELECT agent_id FROM memories WHERE agent_id IS NOT NULL AND id IN (${placeholders})`)
-      .all(...ids, ...ids)
-      .map((a) => a.agent_id);
+    const contexts = this.exposedContexts(ids);
     return {
-      records,
-      evidenceIds: [...new Set(evidence.map((e) => e.evidence_id))],
-      sources: [...new Set(evidence.map((e) => e.source_ref))],
-      affectedAgentIds,
-      limits: [
-        "External sources and exported backups are separate copies.",
-        "Already attached prompts, host history and provider requests cannot be retracted. Affected sessions need fresh authorized context; host-history deletion or restart is separate.",
-        "Affected Memory session digests and audit disclosures are purged. Capture and standalone review stay blocked for those agent IDs; start a fresh agent context.",
-      ],
+      nonces: contexts.nonces,
+      preview: {
+        records,
+        evidenceIds: [...new Set(evidence.map((e) => e.evidence_id))],
+        sources: [...new Set(evidence.map((e) => e.source_ref))],
+        affectedAgentIds: contexts.agents,
+        limits: [
+          "External sources and exported backups are separate copies.",
+          "Already attached prompts, host history and provider requests cannot be retracted. Affected sessions need fresh authorized context; host-history deletion or restart is separate.",
+          "Affected Memory session digests and audit disclosures are purged. Capture and standalone review stay blocked for those agent IDs; start a fresh agent context.",
+        ],
+      },
     };
   }
 }
