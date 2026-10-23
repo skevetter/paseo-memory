@@ -3,7 +3,7 @@ import type { ProjectRef, SearchScope } from "../shared/service-api";
 import { isUsableReply } from "../shared/turns";
 import type { Access, SqlFilter } from "./access";
 import { redact } from "./redact";
-import { clip, ftsQuery, RRF_K } from "./text";
+import { clip, ftsQuery, RRF_K, sha256 } from "./text";
 
 export interface SessionRow {
   id: string;
@@ -45,6 +45,7 @@ export interface TurnInput {
 export interface SessionHit {
   kind: "session";
   id: string;
+  version: string;
   title: string;
   type: "session";
   scope: "project";
@@ -161,10 +162,30 @@ export function currentSessionHits(
   return new Map(rows.map((row) => [row.id, toSessionHit(row, 0)]));
 }
 
+export function sessionVersion(row: SessionRow): string {
+  return sha256(
+    JSON.stringify([
+      row.id,
+      row.agent_id,
+      row.project_key,
+      row.title,
+      row.provider,
+      row.first_prompt,
+      row.last_prompt,
+      row.last_reply,
+      row.summary,
+      row.outcomes,
+      row.updated_at,
+      row.reviewed_at,
+    ]),
+  );
+}
+
 function toSessionHit(row: SessionRow & { project_name: string | null }, score: number): SessionHit {
   return {
     kind: "session",
     id: row.id,
+    version: sessionVersion(row),
     title: row.title ?? clip(row.first_prompt ?? "session", 80),
     type: "session",
     scope: "project",

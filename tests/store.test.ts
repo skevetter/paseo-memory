@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { Access } from "../service/access";
-import { buildContext, buildSystemPrompt } from "../service/context";
+import { retrieveContext } from "../service/context";
 import type { Embedder } from "../service/embedder";
 import { redact } from "../service/redact";
 import { rerankEnabled } from "../service/reranker";
@@ -10,7 +10,7 @@ import { openDatabase } from "../service/sqlite";
 import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
-import { DEFAULT_RUNTIME, EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
+import { EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
 import {
   dataRepo,
   hashEmbedder,
@@ -492,42 +492,19 @@ describe("sessions and context", () => {
       assistantText: "Root cause was a timezone assumption; fixed in tests/ingest_test.py",
       files: ["tests/ingest_test.py"],
     });
-    const ctx = buildContext({ store, project: dataRepo });
-    expect(ctx.text).toContain("Pinned convention");
-    expect(ctx.text).toContain("timezone assumption");
+    const ctx = await retrieveContext({ store, project: dataRepo });
+    expect(ctx.contextText).toContain("Pinned convention");
+    expect(ctx.contextText).toContain("timezone assumption");
     expect(ctx.sessionIds).toEqual(["agent-1"]);
-    expect(buildContext({ store, project: dataRepo, excludeAgentId: "agent-1" }).text).not.toContain(
-      "timezone",
-    );
-    const prompt = buildSystemPrompt({ context: ctx.text, project: dataRepo, hasTools: true });
-    expect(prompt.startsWith("<paseo-memory>")).toBe(true);
-    expect(prompt).toContain("memory_search");
+    expect(
+      (await retrieveContext({ store, project: dataRepo, excludeAgentId: "agent-1" })).sessionIds,
+    ).toEqual([]);
     const hits = await store.search({
       query: "timezone",
       access: Access.agent(dataRepo.key),
       includeSessions: true,
     });
     expect(hits.map((h) => h.kind)).toEqual(["session"]);
-  });
-
-  it("respects the context budget", async () => {
-    for (let i = 0; i < 40; i++) {
-      await store.save({
-        title: `Memory number ${i} about things`,
-        content: "x".repeat(50),
-        type: "note",
-        scope: "project",
-        project: dataRepo,
-      });
-    }
-    store.configure({ ...DEFAULT_RUNTIME, contextBudgetChars: 600, detailLevel: "summaries" });
-    const ctx = buildContext({ store, project: dataRepo });
-    expect(ctx.text.length).toBeLessThanOrEqual(600);
-    expect(ctx.memoryIds.length).toBeGreaterThan(0);
-    for (const id of ctx.memoryIds) expect(ctx.text).toContain(`#${id} [note] Memory number`);
-    for (const line of ctx.text.split("\n").filter((l) => l.startsWith("- "))) {
-      expect(line).toMatch(/about things \(just now\): x+$/);
-    }
   });
 });
 
@@ -538,25 +515,11 @@ describe("context ranking and session capture", () => {
     const often = await store.save({ ...base, title: "Often used" });
     await store.save({ ...base, title: "Pinned one", pinned: true });
     for (let i = 0; i < 5; i++) store.markUsed([often.id as number]);
-    const text = buildContext({ store, project: dataRepo }).text;
+    const text = (await retrieveContext({ store, project: dataRepo })).contextText;
     const at = (title: string) => text.indexOf(title);
     expect(at("Pinned one")).toBeLessThan(at("Often used"));
     expect(at("Often used")).toBeLessThan(at("Rarely used"));
     expect(store.getVisible(owner, [rarely.id as number])[0]?.use_count).toBe(0);
-  });
-
-  it("keeps whole words when clipping long memory text", async () => {
-    const content = `${"alpha beta gamma ".repeat(40)}omega`;
-    await store.save({
-      title: "Long pinned",
-      content,
-      type: "note",
-      scope: "global",
-      project: null,
-      pinned: true,
-    });
-    const line = buildContext({ store, project: null }).text.split("\n")[1] ?? "";
-    expect(line).toMatch(/^- #\d+ \[note\] Long pinned: alpha beta gamma .*(alpha|beta|gamma)…$/);
   });
 
   it("does not record failed turns", () => {

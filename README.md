@@ -4,7 +4,7 @@ Local memory for Paseo agents. One SQLite file stores global and project memory.
 
 ## Features
 
-- **Starting memory:** each new agent receives memories that match its first prompt, plus pinned, project, global and recent-session entries, within a character budget.
+- **Starting memory:** owner-controlled retrieval profiles bound tokens, characters, bytes, candidates, items and inference time. Stable constraints precede task facts; canonical references and evidence are packed with the complete serialized wrapper. [Retrieval policy and measurement](docs/retrieval.md).
 - **MCP tools:** `memory_search`, `memory_get`, `memory_save`, `memory_update`, `memory_delete`, `memory_mutate`, `memory_context`. Agent assertions and corrections become candidates until authorized promotion.
 - **Session digests:** each turn records the prompt, the reply and the edited files. Tool output is not stored.
 - **Session review:** an idle agent receives one prompt to summarize the session and make up to 3 memory changes, counting creates and updates together.

@@ -37,7 +37,10 @@ const toolResult = z.object({
   result: z.object({
     isError: z.boolean().optional(),
     content: z.array(z.object({ text: z.string() })),
-    structuredContent: z.object({ error: z.object({ code: z.string() }) }).optional(),
+    structuredContent: z
+      .object({ error: z.object({ code: z.string() }).optional() })
+      .passthrough()
+      .optional(),
   }),
 });
 async function tool(input: { name: string; args: unknown; nonce: string; project?: ProjectRef }) {
@@ -174,7 +177,7 @@ it("forgets Alice-to-Bob digest disclosures without erasing unrelated or unautho
           : { title: "Copied forgotten source", content: "Synthetic source isolated fact", scope: "project" },
       nonce: "bob",
     });
-    expect(denied.structuredContent?.error.code).toBe("context_invalidated");
+    expect(denied.structuredContent?.error?.code).toBe("context_invalidated");
   }
   expect(
     (

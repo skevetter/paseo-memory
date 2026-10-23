@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { z } from "zod";
 import { type RunningService, serviceKey, startService } from "../service/app";
-import type { Caller } from "../service/mcp";
+import type { Caller, ToolOutput } from "../service/mcp";
 import { mutationRequestId, ownerMutation } from "../service/mutations";
 import { MemoryStore } from "../service/store";
 import { createTools } from "../service/tools";
@@ -11,11 +11,18 @@ import { silentLogger } from "../shared/log";
 import { DEFAULT_RUNTIME, MAX_CONTENT_CHARS, SERVICE_KEY_HEADER } from "../shared/service-api";
 import { hashEmbedder, hashSpec, owner, tempDir } from "./helpers";
 
+function parseMutationReceipt(output: string | ToolOutput) {
+  return MutationResultSchema.parse(JSON.parse(typeof output === "string" ? output : output.text));
+}
+
 const resultSchema = z.object({
   result: z.object({
     isError: z.boolean(),
     content: z.array(z.object({ text: z.string() })),
-    structuredContent: z.object({ error: z.object({ code: z.string() }) }).optional(),
+    structuredContent: z
+      .object({ error: z.object({ code: z.string() }).optional() })
+      .passthrough()
+      .optional(),
   }),
 });
 type ToolResult = z.infer<typeof resultSchema>["result"];
@@ -113,7 +120,7 @@ describe("atomic review mutation limits over MCP", () => {
     expect(created.state).toBe("candidate");
     expect(
       (await call("memory_save", { ...save("Topic"), content: "over cap", topic_key: "topic" }))
-        .structuredContent?.error.code,
+        .structuredContent?.error?.code,
     ).toBe("review_cap_reached");
     expect(current(id)?.content).toBe("after");
     expect(current(created.memoryRef.id)?.content).toBe("durable fact about Topic");
@@ -133,7 +140,7 @@ describe("atomic review mutation limits over MCP", () => {
     const result = receipt(await call("memory_save", { ...save("Topic"), topic_key: "topic" }));
     expect(result.memoryRef).toEqual({ id: Number(original.id), revision: 2 });
     expect(
-      (await call("memory_update", { id: original.id, content: "third" })).structuredContent?.error.code,
+      (await call("memory_update", { id: original.id, content: "third" })).structuredContent?.error?.code,
     ).toBe("review_cap_reached");
     expect(current(Number(original.id))?.content).toBe("durable fact about Topic");
   });
@@ -141,11 +148,11 @@ describe("atomic review mutation limits over MCP", () => {
   it("permits no memory changes at cap zero", async () => {
     const id = await seed();
     await begin(0);
-    expect((await call("memory_save", save("Blocked"))).structuredContent?.error.code).toBe(
+    expect((await call("memory_save", save("Blocked"))).structuredContent?.error?.code).toBe(
       "review_cap_reached",
     );
     expect(
-      (await call("memory_update", { id, content: "must not persist" })).structuredContent?.error.code,
+      (await call("memory_update", { id, content: "must not persist" })).structuredContent?.error?.code,
     ).toBe("review_cap_reached");
     expect(current(id)).toMatchObject({ content: "before", record_revision: 1 });
   });
@@ -163,7 +170,7 @@ describe("atomic review mutation limits over MCP", () => {
       expect(current(item.value.memoryRef.id)?.title).toBe(args[item.index]?.title);
     for (const item of accepted)
       expect(await call("memory_save", args[item.index], 100 + item.index)).toEqual(item.result);
-    expect((await call("memory_save", save("Unrelated"), 200)).structuredContent?.error.code).toBe(
+    expect((await call("memory_save", save("Unrelated"), 200)).structuredContent?.error?.code).toBe(
       "review_cap_reached",
     );
   });
@@ -177,7 +184,7 @@ describe("atomic review mutation limits over MCP", () => {
     expect(results[0]).toEqual(results[1]);
     const saved = receipt(results[0] as ToolResult);
     expect(current(saved.memoryRef.id)).toMatchObject({ title: "Idempotent", record_revision: 1 });
-    expect((await call("memory_save", save("Unrelated"), 100)).structuredContent?.error.code).toBe(
+    expect((await call("memory_save", save("Unrelated"), 100)).structuredContent?.error?.code).toBe(
       "review_cap_reached",
     );
   });
@@ -199,7 +206,7 @@ describe("review attempts, no-ops and degraded models", () => {
     const corrected = receipt(await call("memory_update", { id, content: "actual correction" }));
     expect(corrected.memoryRef.revision).toBe(2);
     expect(current(id)?.content).toBe("actual correction");
-    expect((await call("memory_save", save("Over cap"))).structuredContent?.error.code).toBe(
+    expect((await call("memory_save", save("Over cap"))).structuredContent?.error?.code).toBe(
       "review_cap_reached",
     );
     expect(await call("memory_update", unchangedArgs, 71)).toEqual(unchanged);
@@ -212,7 +219,7 @@ describe("review attempts, no-ops and degraded models", () => {
       expect((await call("memory_update", { id: 99999, content: "missing" })).isError).toBe(true);
       expect((await call("memory_save", { title: "Missing content" })).isError).toBe(true);
     }
-    expect((await call("memory_save", save("Too many attempts"))).structuredContent?.error.code).toBe(
+    expect((await call("memory_save", save("Too many attempts"))).structuredContent?.error?.code).toBe(
       "review_attempt_limit",
     );
     expect(service.store.stats().memories).toBe(0);
@@ -263,7 +270,7 @@ describe("persisted review capabilities", () => {
       store = new MemoryStore({ path, now: () => now, log: silentLogger });
       await expect(invoke("restart")).rejects.toMatchObject({ code: "review_closed" });
       store.reviews.close("agent");
-      const result = MutationResultSchema.parse(JSON.parse(await invoke("after-end")));
+      const result = parseMutationReceipt(await invoke("after-end"));
       expect(store.lifecycleDetail(owner, result.memoryRef.id)?.state).toBe("candidate");
     } finally {
       store.close();
@@ -284,7 +291,7 @@ describe("persisted review capabilities", () => {
     try {
       store.reviews.open({ agentId: "agent", nonce: "nonce", trigger: "idle", cap: 1 });
       const original = await invoke("original");
-      const result = MutationResultSchema.parse(JSON.parse(original));
+      const result = parseMutationReceipt(original);
       store.close();
       store = new MemoryStore({ path, log: silentLogger });
       expect(await invoke("original")).toBe(original);

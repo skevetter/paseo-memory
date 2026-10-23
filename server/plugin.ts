@@ -404,6 +404,7 @@ async function injectMemory(
       includeTools,
       task: settings.injectContext ? agentTask(state, config, project) : null,
       taskBudgetMs: Math.max(0, remaining - CONTEXT_RESERVE_MS),
+      assemblyPrefix: config.systemPrompt ?? "",
     },
     remaining,
   );
@@ -434,10 +435,10 @@ function withInjection(
   if (injected.mcpServer) {
     next.mcpServers = { ...config.mcpServers, [MCP_KEY]: { type: "http", ...injected.mcpServer } };
   }
-  if (injected.systemPrompt) {
+  if (injected.context?.contextText) {
     next.systemPrompt = config.systemPrompt
-      ? `${config.systemPrompt}\n\n${injected.systemPrompt}`
-      : injected.systemPrompt;
+      ? `${config.systemPrompt}\n\n${injected.context.contextText}`
+      : injected.context.contextText;
   }
   const env = injected.nonce ? { ...request.env, [NONCE_ENV]: injected.nonce } : request.env;
   return { ...request, config: next, ...(env ? { env } : {}) };

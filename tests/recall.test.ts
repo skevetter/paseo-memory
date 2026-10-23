@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { buildContext, buildSystemPrompt } from "../service/context";
+import { retrieveContext } from "../service/context";
 import type { Embedder } from "../service/embedder";
-import { type MemoryHit, MemoryStore, type SaveInput } from "../service/store";
-import { findTaskMatches, isTaskMatch } from "../service/task";
+import { MemoryStore, type SaveInput } from "../service/store";
+import { isTaskMatch } from "../service/task";
 import { runUpkeep, UPKEEP_NONCE, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME, type RuntimeConfig } from "../shared/service-api";
 import { dataRepo, hashEmbedder, hashSpec, owner } from "./helpers";
@@ -22,13 +22,14 @@ const sameVector = (model: string): Embedder => ({
   embed: async (texts) => texts.map(() => Float32Array.from([1, 0, 0, 0])),
 });
 
-describe("starting memory sections", () => {
-  it("caps each section by its own count and lists pinned memories first", async () => {
+describe("starting memory selection", () => {
+  it("respects owner section counts and reports unselected pins", async () => {
+    const pins: number[] = [];
     for (let i = 0; i < 4; i++)
-      await store.save({ ...global, title: `Pinned ${i}`, content: "p", pinned: true });
+      pins.push(await saveId({ ...global, title: `Pinned ${i}`, content: "p", pinned: true }));
     for (let i = 0; i < 6; i++) await store.save({ ...project, title: `Project note ${i}`, content: "c" });
     for (let i = 0; i < 5; i++) await store.save({ ...global, title: `Global note ${i}`, content: "g" });
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 4; i++)
       store.recordTurn({
         agentId: `agent-${i}`,
         project: dataRepo,
@@ -39,45 +40,39 @@ describe("starting memory sections", () => {
         assistantText: `done ${i}`,
         files: [],
       });
-    }
     configure({ maxPinned: 2, projectMemories: 3, globalMemories: 1, recentSessions: 2 });
-    const ctx = buildContext({ store, project: dataRepo });
-    const count = (prefix: string) => ctx.text.split("\n").filter((l) => l.includes(prefix)).length;
-    expect(count("] Pinned ")).toBe(2);
-    expect(count("Project note")).toBe(3);
-    expect(count("Global note")).toBe(1);
-    expect(ctx.sessionIds).toHaveLength(2);
-    expect(ctx.text.indexOf("## Pinned")).toBeLessThan(ctx.text.indexOf("## Project memory"));
-
-    configure({ maxPinned: 0, projectMemories: 0, globalMemories: 0, recentSessions: 0 });
-    expect(buildContext({ store, project: dataRepo }).text).toBe(`No memories yet for ${dataRepo.name}.`);
-  });
-
-  it("shows titles only by default and short summaries when asked, within the budget", async () => {
-    await store.save({ ...project, title: "Kafka retention", content: "Seven days on every topic." });
-    expect(buildContext({ store, project: dataRepo }).text).toMatch(/\] Kafka retention \(just now\)$/m);
-    configure({ detailLevel: "summaries" });
-    expect(buildContext({ store, project: dataRepo }).text).toContain(
-      "Kafka retention (just now): Seven days",
+    const result = await retrieveContext({ store, project: dataRepo });
+    const selected = store.getVisible(
+      owner,
+      result.memoryRefs.map((ref) => ref.id),
     );
-    configure({ contextBudgetChars: 500, detailLevel: "summaries" });
-    for (let i = 0; i < 30; i++)
-      await store.save({ ...project, title: `Note ${i}`, content: "x".repeat(80) });
-    expect(buildContext({ store, project: dataRepo }).text.length).toBeLessThanOrEqual(500);
+    expect(selected.filter((row) => row.pinned).map((row) => row.id)).toEqual(pins.slice(0, 2));
+    expect(selected.filter((row) => row.title.startsWith("Project note")).map((row) => row.scope)).toEqual([
+      "project",
+      "project",
+      "project",
+    ]);
+    expect(selected.filter((row) => row.title.startsWith("Global note")).map((row) => row.scope)).toEqual([
+      "global",
+    ]);
+    expect(result.sessionIds).toHaveLength(2);
+    expect(result.omittedPins).toBe(2);
+    configure({ maxPinned: 0, projectMemories: 0, globalMemories: 0, recentSessions: 0 });
+    expect((await retrieveContext({ store, project: dataRepo })).contextText).toBe("");
   });
 
-  it("appends the extra instructions to the memory instructions", () => {
-    const prompt = buildSystemPrompt({
-      context: "ctx",
-      project: dataRepo,
-      hasTools: true,
-      extraInstructions: "  Save release decisions as global memories.  ",
-    });
-    const lines = prompt.split("\n");
-    expect(lines.indexOf("Save release decisions as global memories.")).toBeLessThan(lines.indexOf("ctx"));
+  it("keeps fact bodies reference-only until the owner or caller requests allowed detail", async () => {
+    await store.save({ ...project, title: "Kafka retention", content: "Seven days on every topic." });
+    expect((await retrieveContext({ store, project: dataRepo })).contextText).not.toContain(
+      "Seven days on every topic.",
+    );
     expect(
-      buildSystemPrompt({ context: "ctx", project: null, hasTools: false, extraInstructions: " " }),
-    ).not.toMatch(/\n\n\n/);
+      (await retrieveContext({ store, project: dataRepo, request: { detail: "compact" } })).contextText,
+    ).toContain("Seven days on every topic.");
+    configure({ detailLevel: "summaries" });
+    expect((await retrieveContext({ store, project: dataRepo })).contextText).toContain(
+      "Seven days on every topic.",
+    );
   });
 });
 
@@ -89,47 +84,34 @@ describe("task matches", () => {
       title: "Gateway limits",
       content: "Payment retries stop after three attempts because the gateway rate limits us",
     });
-    await saveId({ ...project, title: "Mobile stack", content: "Frontend uses React Native for the app" });
-    return match;
+    const other = await saveId({
+      ...project,
+      title: "Mobile stack",
+      content: "Frontend uses React Native for the app",
+    });
+    await store.indexPending();
+    return { match, other };
   };
   const task = { query: "why do payment retries stop after three attempts", source: "prompt" as const };
 
-  it("puts memories that match the task above the general lists, without listing them twice", async () => {
-    const match = await seed();
-    const found = await findTaskMatches({ store, project: dataRepo, task, budgetMs: 1000 });
-    expect(found.hits.map((h) => Number(h.id))).toEqual([match]);
-    expect(found.note).toBeNull();
-    const ctx = buildContext({ store, project: dataRepo, task: found });
-    const lines = ctx.text.split("\n");
-    expect(lines[0]).toBe("## Relevant to this task");
-    expect(lines[1]).toContain(`#${match} [note] Gateway limits`);
-    expect(ctx.text.match(/Gateway limits/g)).toHaveLength(1);
-    expect(ctx.taskIds).toEqual([match]);
-    expect(ctx.text).toContain("## Project memory");
+  it("selects task facts once while retaining permitted general context", async () => {
+    const { match, other } = await seed();
+    const result = await retrieveContext({ store, project: dataRepo, task });
+    expect(result.taskIds).toEqual([match]);
+    expect(result.memoryRefs.filter((ref) => ref.id === match)).toEqual([{ id: match, revision: 1 }]);
+    expect(result.memoryRefs).toContainEqual({ id: other, revision: 1 });
   });
 
-  it("keeps the task section empty below the floor, when turned off, and when the search is slow", async () => {
+  it("does not classify unrelated or owner-disabled retrieval as task matches", async () => {
     await seed();
     const unrelated = { query: "kubernetes ingress annotations", source: "names" as const };
-    const none = await findTaskMatches({ store, project: dataRepo, task: unrelated, budgetMs: 1000 });
-    expect(none).toMatchObject({ hits: [], note: "No memory was close enough to this task." });
+    expect((await retrieveContext({ store, project: dataRepo, task: unrelated })).taskIds).toEqual([]);
     configure({ taskMatches: 0 });
-    expect((await findTaskMatches({ store, project: dataRepo, task, budgetMs: 1000 })).hits).toEqual([]);
-    configure({});
-    store.setEmbedder({
-      spec: hashSpec("test/stalled", 4),
-      embed: () => Promise.withResolvers<Float32Array[]>().promise,
-    });
-    const late = await findTaskMatches({ store, project: dataRepo, task, budgetMs: 1 });
-    expect(late.hits).toEqual([]);
-    expect(late.note).toContain("took longer than 1 ms");
-    expect(buildContext({ store, project: dataRepo, task: late }).text).not.toContain(
-      "## Relevant to this task",
-    );
+    expect((await retrieveContext({ store, project: dataRepo, task })).taskIds).toEqual([]);
   });
 
   it("needs both the re-ranker and the vector score to clear their floors, and keyword hits only without a model", () => {
-    const hit = { relevance: 0.5, similarity: 0.6 } as MemoryHit;
+    const hit = { relevance: 0.5, similarity: 0.6 };
     const floor = { rerank: 0.4, vector: 0.56, keywordOnly: false };
     expect(isTaskMatch(hit, floor)).toBe(true);
     expect(isTaskMatch({ ...hit, relevance: 0.3 }, floor)).toBe(false);
@@ -168,8 +150,10 @@ describe("usage feedback", () => {
     for (let i = 0; i < 10; i++) store.markShown([first, second]);
     store.markOpened([second]);
     expect(await order()).toEqual([String(second), String(first)]);
-    const text = () => buildContext({ store, project: null }).text;
-    expect(text().indexOf(`#${second} `)).toBeLessThan(text().indexOf(`#${first} `));
+    expect((await retrieveContext({ store, project: null })).memoryRefs.map((ref) => ref.id)).toEqual([
+      second,
+      first,
+    ]);
     configure({ usageRanking: false });
     expect(await order()).toEqual([String(first), String(second)]);
   });

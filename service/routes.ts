@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { RetrievalResult } from "../shared/retrieval";
 import type {
   MemoryItem,
   ProjectRef,
@@ -9,13 +10,15 @@ import type {
   SessionItem,
 } from "../shared/service-api";
 import { Access } from "./access";
-import { buildContext, buildSystemPrompt } from "./context";
+import { retrievalAudit, retrievalScore } from "./audit";
+import { retrieveContext } from "./context";
+import type { ContextTokenizer } from "./context-budget";
 import { signCaller } from "./mcp";
 import { MutationError, mutationRequestId, ownerMutation } from "./mutations";
 import { redact } from "./redact";
 import { finishReview } from "./review";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
-import { findTaskMatches, type TaskMatches } from "./task";
+import type { TaskInput } from "./task";
 import { clip } from "./text";
 import { lastUpkeepRun, runUpkeep, upkeepPairs } from "./upkeep";
 
@@ -27,10 +30,14 @@ export interface RouteContext {
   secret: string;
   mcpUrl(): string;
   status(): ServiceStatus;
+  tokenizers?: ReadonlyMap<string, ContextTokenizer>;
 }
 
 export type Routes = {
-  [R in ServiceRoute]: (input: ServiceParsedInput<R>) => Promise<ServiceOutputs[R]> | ServiceOutputs[R];
+  [R in ServiceRoute]: (
+    input: ServiceParsedInput<R>,
+    signal?: AbortSignal,
+  ) => Promise<ServiceOutputs[R]> | ServiceOutputs[R];
 };
 
 export function createRoutes(ctx: RouteContext): Routes {
@@ -44,7 +51,7 @@ export function createRoutes(ctx: RouteContext): Routes {
       store.configure(input);
       return { ok: true };
     },
-    "agent-context": (input) => agentContext(ctx, input),
+    "agent-context": (input, signal) => agentContext(ctx, input, signal),
     "link-agent": (input) => {
       store.audit.link(input);
       return { ok: true };
@@ -229,49 +236,52 @@ function upkeepRoutes(
 async function agentContext(
   ctx: RouteContext,
   input: ServiceParsedInput<"agent-context">,
+  signal?: AbortSignal,
 ): Promise<ServiceOutputs["agent-context"]> {
   const { project, provider } = input;
   const { store } = ctx;
   if (project) store.upsertProject(project);
   const nonce = randomBytes(12).toString("base64url");
   store.audit.open({ nonce, projectKey: project?.key ?? null, provider, tools: input.includeTools });
-  let systemPrompt: string | null = null;
-  if (input.includeContext) {
-    const task = input.task
-      ? await findTaskMatches({ store, project, task: input.task, budgetMs: input.taskBudgetMs })
-      : null;
-    const context = buildContext({ store, project, task });
-    systemPrompt = buildSystemPrompt({
-      context: context.text,
-      project,
-      projectUnresolved: input.projectUnresolved,
-      hasTools: input.includeTools,
-      extraInstructions: store.config.extraInstructions,
-    });
-    store.markShown(context.memoryIds);
-    store.audit.record(nonce, {
-      kind: "inject",
-      memories: context.memoryIds,
-      sessions: context.sessionIds,
-      chars: systemPrompt.length,
-      budget: store.config.contextBudgetChars,
-      task: task && taskAudit(task, context.taskIds),
-    });
-  }
+  const context = input.includeContext
+    ? await retrieveContext({
+        store,
+        project,
+        task: input.task,
+        request: input.retrieval,
+        signal,
+        projectUnresolved: input.projectUnresolved,
+        hasTools: input.includeTools,
+        assemblyPrefix: input.assemblyPrefix,
+        maxLatencyMs: input.taskBudgetMs,
+        tokenizer: ctx.tokenizers?.get(provider),
+        complete: (result, scores, policy) => {
+          store.markShown(result.memoryRefs.map((ref) => ref.id));
+          store.audit.record(nonce, {
+            kind: "inject",
+            memories: result.memoryRefs.map((ref) => ref.id),
+            sessions: result.sessionIds,
+            chars: result.usage.chars,
+            budget: policy.limits.maxChars,
+            retrieval: retrievalAudit(result),
+            task: input.task && taskAudit(input.task, result, scores),
+          });
+        },
+      })
+    : null;
   const caller = { projectKey: project?.key ?? null, agentId: null, provider, nonce };
   const mcpServer = input.includeTools
     ? { url: ctx.mcpUrl(), headers: signCaller(ctx.secret, caller) }
     : null;
-  return { systemPrompt, mcpServer, nonce };
+  return { context, mcpServer, nonce };
 }
 
-function taskAudit(task: TaskMatches, injectedIds: number[]) {
-  const scores = new Map(task.hits.map((h) => [Number(h.id), h.relevance ?? h.similarity ?? h.score]));
+function taskAudit(task: TaskInput, result: RetrievalResult, scores: ReadonlyMap<string, number>) {
   return {
     query: clip(redact(task.query), 200),
     source: task.source,
-    matches: injectedIds.map((id) => ({ id, score: Math.round((scores.get(id) ?? 0) * 1000) / 1000 })),
-    note: task.note,
+    matches: result.taskIds.map((id) => ({ id, score: retrievalScore(scores, `memory:${id}`) })),
+    note: result.fallbackReason,
   };
 }
 

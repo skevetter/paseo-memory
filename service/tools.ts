@@ -1,13 +1,16 @@
 import { z } from "zod";
-import { type LifecycleDetail, type MutationRequest, MutationRequestSchema } from "../shared/lifecycle";
+import { type MutationRequest, MutationRequestSchema } from "../shared/lifecycle";
+import { RetrievalRequestSchema, type RetrievalResult } from "../shared/retrieval";
 import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
 import { Access } from "./access";
-import { buildContext } from "./context";
-import { type Caller, type ToolDefinition, ToolError, type ToolRequest } from "./mcp";
+import { retrievalAudit, retrievalScore } from "./audit";
+import { candidateContextEntry, retrieveContext } from "./context";
+import type { ContextTokenizer } from "./context-budget";
+import { type Caller, type ToolDefinition, ToolError, type ToolOutput, type ToolRequest } from "./mcp";
 import { canonicalBody, MutationError, type MutationPrincipal } from "./mutations";
 import { type Reservation, ReviewLimitError, type ReviewOpKind } from "./review-ledger";
-import { ContentTooLongError, type MemoryStore, type ProjectRef, type SearchHit } from "./store";
-import { age, sha256 } from "./text";
+import { type CandidateRead, ContentTooLongError, type MemoryStore, type ProjectRef } from "./store";
+import { sha256 } from "./text";
 
 export const MCP_INSTRUCTIONS = [
   "paseo-memory: durable memory shared by every Paseo agent on this host.",
@@ -23,11 +26,11 @@ export const MCP_INSTRUCTIONS = [
 export interface ToolContext {
   store: MemoryStore;
   resolveProject(caller: Caller): ProjectRef | null;
+  tokenizers?: ReadonlyMap<string, ContextTokenizer>;
 }
 
 const MAX_TITLE_CHARS = 200;
-const MAX_QUERY_CHARS = 1000;
-const SEARCH_DEADLINE_MS = 20_000;
+const MAX_QUERY_CHARS = 500;
 const MAX_TOPIC_CHARS = 200;
 // Bounds the request; the real content limit is enforced by the store with a message the model can act on.
 const MAX_CONTENT_INPUT_CHARS = MAX_CONTENT_CHARS * 25;
@@ -37,6 +40,7 @@ const memoryId = z.number().int().positive();
 const title = z.string().trim().min(1).max(MAX_TITLE_CHARS);
 const topicKey = z.string().trim().min(1).max(MAX_TOPIC_CHARS);
 const content = z.string().trim().min(1).max(MAX_CONTENT_INPUT_CHARS);
+const retrievalOptions = RetrievalRequestSchema.omit({ ids: true, query: true });
 
 const searchInput = z.strictObject({
   query: z.string().max(MAX_QUERY_CHARS).describe("What to look for."),
@@ -44,9 +48,13 @@ const searchInput = z.strictObject({
   type: memoryType.optional(),
   limit: z.number().int().min(1).max(25).optional(),
   include_sessions: z.boolean().optional().describe("Also search recent agent session digests."),
+  retrieval: retrievalOptions.optional(),
 });
 
-const getInput = z.strictObject({ ids: z.array(memoryId).min(1).max(20) });
+const getInput = z.strictObject({
+  ids: z.array(memoryId).min(1).max(20),
+  retrieval: retrievalOptions.optional(),
+});
 
 const saveInput = z.strictObject({
   title: title.describe("Short, searchable title."),
@@ -83,7 +91,7 @@ const deleteInput = z.strictObject({
   expected_revision: memoryId.optional(),
   request_id: z.string().min(1).max(200).optional(),
 });
-const contextInput = z.strictObject({});
+const contextInput = RetrievalRequestSchema;
 
 const MUTATION_TOOLS: Partial<Record<string, true>> = {
   memory_save: true,
@@ -107,7 +115,7 @@ interface ToolSpec<S extends z.ZodType> {
     caller: Caller,
     access: Access,
     request: InvocationRequest,
-  ): Promise<string> | string;
+  ): Promise<string | ToolOutput> | string | ToolOutput;
 }
 
 // Arguments are parsed before any handler logic runs, so a malformed call can never reach the store.
@@ -325,108 +333,132 @@ function searchTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_search",
     description:
-      "Search durable memory by meaning and keywords. Returns compact hits; call memory_get for full content. " +
-      "scope: all (project + global, default), project, or global. Search before saving to avoid duplicates.",
+      "Search authorized current memory within owner budgets. Compact references and structured retrieval diagnostics are returned; request an owner-allowed richer profile for more detail.",
     schema: searchInput,
-    async run(args, _caller, access, request) {
+    async run(args, caller, _access, request) {
       const scope = args.scope ?? "all";
-      const signal = AbortSignal.timeout(SEARCH_DEADLINE_MS);
-      const hits = await ctx.store.search({
-        query: args.query,
-        access,
+      const result = await retrieveContext({
+        store: ctx.store,
+        project: ctx.resolveProject(caller),
+        mode: "search",
         scope,
         type: args.type,
-        limit: args.limit ?? 8,
         includeSessions: args.include_sessions === true,
-        track: true,
-        signal,
+        excludeAgentId: caller.agentId,
+        signal: request.signal,
+        tokenizer: ctx.tokenizers?.get(caller.provider ?? ""),
+        authorize: () => authorizeInvocation(ctx, caller, request),
+        request: {
+          ...args.retrieval,
+          query: args.query,
+          detail: args.retrieval?.detail ?? "compact",
+          budget: {
+            ...args.retrieval?.budget,
+            maxItems: Math.min(args.limit ?? 8, args.retrieval?.budget?.maxItems ?? 25),
+          },
+        },
+        complete: (result, scores) => {
+          ctx.store.markShown(result.memoryRefs.slice(0, 5).map((ref) => ref.id));
+          ctx.store.audit.record(request.auditNonce, {
+            kind: "search",
+            query: args.query,
+            scope,
+            results: [
+              ...result.memoryRefs.map((ref) => ({
+                id: String(ref.id),
+                score: retrievalScore(scores, `memory:${ref.id}`),
+              })),
+              ...result.sessionIds.map((id) => ({
+                id: `session:${id}`,
+                score: retrievalScore(scores, `session:${id}`),
+              })),
+            ],
+            retrieval: retrievalAudit(result),
+          });
+        },
       });
-      if (signal.aborted)
-        throw new ToolError("search_timeout", "The search took too long. Try a narrower query.");
-      ctx.store.audit.record(request.auditNonce, {
-        kind: "search",
-        query: args.query,
-        scope,
-        results: hits.map((h) => ({
-          id: h.kind === "session" ? `session:${h.id}` : h.id,
-          score: Math.round(h.score * 10_000) / 10_000,
-        })),
-      });
-      return hits.length === 0 ? "No matching memories." : hits.map(formatHit).join("\n");
+      return retrievalOutput(result);
     },
   });
 }
 
-function formatHit(h: SearchHit): string {
-  if (h.kind === "session")
-    return `session:${h.id} [session] ${h.title} (${age(h.updatedAt)})\n  ${h.preview}`;
-  return `#${h.id} [${h.type}/${h.scope}${h.pinned ? "/pinned" : ""}] ${h.title} (${age(h.updatedAt)})\n  ${h.preview}`;
+function retrievalOutput(result: RetrievalResult): ToolOutput {
+  const { contextText, ...metadata } = result;
+  return { text: contextText, structuredContent: { retrieval: metadata } };
 }
 
 function getTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_get",
-    description: "Get full content for memory ids returned by memory_search.",
+    description:
+      "Fetch bounded authorized detail by ID, including your own proposals. Owner retrieval policies control expansion; omissions and provenance are reported in structured metadata.",
     schema: getInput,
-    run({ ids }, caller, access, request) {
-      const rows = ctx.store.getVisible(access, ids);
+    async run(args, caller, access, request) {
       recordDenied(ctx, request.auditNonce, {
         tool: "memory_get",
         operation: "read",
-        ids: ctx.store.deniedIds(access, ids),
+        ids: ctx.store.deniedIds(access, args.ids),
       });
-      const found = new Set(rows.map((r) => r.id));
+      const candidates = new Map<number, CandidateRead>();
       const principal = agentPrincipal(caller, access, request.principalId);
-      const candidates = ids.flatMap((id) => {
-        if (found.has(id)) return [];
-        const receipt = ownCandidateReceipt(ctx.store.lifecycleDetail(access, id), principal);
-        if (!receipt) return [];
-        found.add(id);
-        return [receipt];
+      const result = await retrieveContext({
+        store: ctx.store,
+        project: ctx.resolveProject(caller),
+        mode: "get",
+        signal: request.signal,
+        tokenizer: ctx.tokenizers?.get(caller.provider ?? ""),
+        authorize: () => authorizeInvocation(ctx, caller, request),
+        request: { ...args.retrieval, ids: args.ids, detail: args.retrieval?.detail ?? "full" },
+        candidate: (id, policy) => {
+          const read = ctx.store.readCandidate(access, principal.actorId, id);
+          if (!read) return null;
+          const entry = candidateContextEntry(read, policy);
+          if (entry) candidates.set(id, read);
+          return entry;
+        },
+        complete: (result) => recordGet(ctx, { request, ids: args.ids, result }),
       });
-      ctx.store.markUsed([...found]);
-      const shown = ctx.store.audit.shownTo(request.auditNonce);
-      ctx.store.markOpened([...found].filter((id) => shown.has(id)));
-      ctx.store.audit.record(request.auditNonce, { kind: "get", ids, found: [...found] });
-      const merged = ids.flatMap((id) => {
-        const target = found.has(id) ? null : ctx.store.mergedIntoVisible(access, id);
-        return target === null ? [] : [`#${id} was merged into #${target}; fetch #${target} instead.`];
-      });
-      if (rows.length === 0 && merged.length === 0 && candidates.length === 0)
-        return "No memories found for those ids.";
-      const bodies = rows.map((r) => {
-        const lifecycle = ctx.store.lifecycleDetail(access, r.id);
-        return (
-          `#${r.id} [${r.type}/${r.scope}${r.pinned ? "/pinned" : ""}] ${r.title}\n` +
-          `project: ${r.project_name ?? "(global)"}  topic_key: ${r.topic_key ?? "-"}  updated: ${r.updated_at}\n` +
-          `memoryRef: ${JSON.stringify(lifecycle?.memoryRef)}  state: ${lifecycle?.state}  verification: ${lifecycle?.verificationStatus}\n` +
-          `validFrom: ${lifecycle?.validFrom ?? "-"}  validUntil: ${lifecycle?.validUntil ?? "-"}\n` +
-          `evidence: ${JSON.stringify(lifecycle?.evidence ?? [])}\n\n${r.content}`
-        );
-      });
-      return [...merged, ...bodies, ...candidates].join("\n\n---\n\n");
+      const output = retrievalOutput(result);
+      return {
+        ...output,
+        structuredContent: {
+          ...output.structuredContent,
+          records: result.memoryRefs.flatMap((ref) => {
+            const read = candidates.get(ref.id);
+            return read
+              ? [
+                  {
+                    memoryRef: ref,
+                    state: read.memory.state,
+                    recordKind: read.memory.record_kind,
+                    verificationStatus: read.memory.verification_status,
+                  },
+                ]
+              : [];
+          }),
+          redirects: args.ids.flatMap((id) => {
+            const targetId = ctx.store.mergedIntoVisible(access, id);
+            return targetId === null ? [] : [{ id, targetId }];
+          }),
+        },
+      };
     },
   });
 }
 
-function ownCandidateReceipt(detail: LifecycleDetail | null, principal: MutationPrincipal): string | null {
-  if (detail?.state !== "candidate") return null;
-  const origin = detail.revisions.find((revision) => revision.revision === 1);
-  if (origin?.actorId !== principal.actorId) return null;
-  const snapshot = detail.revisions.find(
-    (revision) => revision.revision === detail.memoryRef.revision,
-  )?.snapshot;
-  if (!snapshot || typeof snapshot.title !== "string" || typeof snapshot.content !== "string") return null;
-  return JSON.stringify({
-    memoryRef: detail.memoryRef,
-    state: detail.state,
-    recordKind: detail.recordKind,
-    verificationStatus: detail.verificationStatus,
-    validFrom: detail.validFrom,
-    validUntil: detail.validUntil,
-    title: snapshot.title,
-    content: snapshot.content,
-    evidence: detail.evidence,
+function recordGet(
+  ctx: ToolContext,
+  input: { request: InvocationRequest; ids: number[]; result: RetrievalResult },
+): void {
+  const found = input.result.memoryRefs.map((ref) => ref.id);
+  ctx.store.markUsed(found);
+  const shown = ctx.store.audit.shownTo(input.request.auditNonce);
+  ctx.store.markOpened(found.filter((id) => shown.has(id)));
+  ctx.store.audit.record(input.request.auditNonce, {
+    kind: "get",
+    ids: input.ids,
+    found,
+    retrieval: retrievalAudit(input.result),
   });
 }
 
@@ -660,25 +692,30 @@ function contextTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_context",
     description:
-      "Return the memory digest for this project: pinned global and project memories, the project's most " +
-      "used and recent memories, and recent agent sessions. Use after context compaction or when starting " +
-      "unfamiliar work.",
+      "Retrieve an owner-budgeted project/global context bundle. Query or explicit IDs take bounded fast paths; request only an owner-allowed profile. Metadata reports references, counts, omissions and fallback.",
     schema: contextInput,
-    run(_args, caller, _access, request) {
-      const context = buildContext({
+    async run(args, caller, _access, request) {
+      const context = await retrieveContext({
         store: ctx.store,
         project: ctx.resolveProject(caller),
+        request: args,
         excludeAgentId: caller.agentId,
+        signal: request.signal,
+        tokenizer: ctx.tokenizers?.get(caller.provider ?? ""),
+        authorize: () => authorizeInvocation(ctx, caller, request),
+        complete: (result, _scores, policy) => {
+          ctx.store.markShown(result.memoryRefs.map((ref) => ref.id));
+          ctx.store.audit.record(request.auditNonce, {
+            kind: "context",
+            memories: result.memoryRefs.map((ref) => ref.id),
+            sessions: result.sessionIds,
+            chars: result.usage.chars,
+            budget: policy.limits.maxChars,
+            retrieval: retrievalAudit(result),
+          });
+        },
       });
-      ctx.store.markShown(context.memoryIds);
-      ctx.store.audit.record(request.auditNonce, {
-        kind: "context",
-        memories: context.memoryIds,
-        sessions: context.sessionIds,
-        chars: context.text.length,
-        budget: ctx.store.config.contextBudgetChars,
-      });
-      return context.text;
+      return retrievalOutput(context);
     },
   });
 }

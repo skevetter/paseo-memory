@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
 import { join } from "node:path";
 import { Access } from "../service/access";
-import { buildContext } from "../service/context";
+import { retrieveContext } from "../service/context";
 import { MutationError, mutationRequestId, ownerMutation } from "../service/mutations";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore } from "../service/store";
@@ -53,7 +53,9 @@ it("expires a temporary exception without a read refreshing factual validity", a
   at = new Date("2026-10-02T00:00:00.000Z");
   expect(store.getVisible(owner, [temporary.memoryRef.id])).toEqual([]);
   expect(await store.search({ access: owner, query: "deploy exception" })).toEqual([]);
-  expect(buildContext({ store, project: null }).memoryIds).not.toContain(temporary.memoryRef.id);
+  expect((await retrieveContext({ store, project: null })).memoryRefs.map((ref) => ref.id)).not.toContain(
+    temporary.memoryRef.id,
+  );
   expect(store.lifecycleDetail(owner, temporary.memoryRef.id)?.verifiedAt).toBeNull();
   expect(store.historical(owner, temporary.memoryRef.id, "2026-10-01T12:00:00.000Z")?.title).toBe(
     "Temporary deploy exception",
@@ -415,7 +417,9 @@ it("revalidates a corrected summary with only fresh supporting revisions", async
   expect((await store.search({ access: owner, query: "Deployment digest" })).map((hit) => hit.id)).toContain(
     String(summary.memoryRef.id),
   );
-  expect(buildContext({ store, project: null }).memoryIds).toContain(summary.memoryRef.id);
+  expect((await retrieveContext({ store, project: null })).memoryRefs.map((ref) => ref.id)).toContain(
+    summary.memoryRef.id,
+  );
   expect(store.provenance.getVisible(owner, summary.evidenceRefs).map((e) => e.sourceRef)).toEqual([
     `memory:${source.memoryRef.id}@1`,
   ]);

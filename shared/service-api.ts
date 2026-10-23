@@ -10,6 +10,12 @@ import {
   TimestampSchema,
   VerificationSchema,
 } from "./lifecycle";
+import {
+  DEFAULT_RETRIEVAL_POLICY,
+  RetrievalPolicySettingsSchema,
+  RetrievalRequestSchema,
+  type RetrievalResult,
+} from "./retrieval";
 
 export const SERVICE_KEY_HEADER = "x-paseo-memory-key";
 export const SERVICE_KEY_LABEL = "paseo-memory/internal-api/v1";
@@ -38,6 +44,7 @@ export type ReviewDisplay = (typeof REVIEW_DISPLAYS)[number];
 
 export const RuntimeConfigSchema = z.object({
   contextBudgetChars: z.number().int().min(500),
+  retrievalPolicy: RetrievalPolicySettingsSchema.default(DEFAULT_RETRIEVAL_POLICY),
   maxPinned: z.number().int().min(0),
   taskMatches: z.number().int().min(0),
   taskStrictness: z.enum(STRICTNESS_LEVELS),
@@ -55,6 +62,7 @@ export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 
 export const DEFAULT_RUNTIME: RuntimeConfig = {
   contextBudgetChars: 6000,
+  retrievalPolicy: DEFAULT_RETRIEVAL_POLICY,
   maxPinned: 10,
   taskMatches: 5,
   taskStrictness: "medium",
@@ -141,6 +149,8 @@ export const serviceInputs = {
       .nullable()
       .default(null),
     taskBudgetMs: z.number().int().min(0).default(0),
+    retrieval: RetrievalRequestSchema.optional(),
+    assemblyPrefix: z.string().max(200000).default(""),
   }),
   "link-agent": z.object({
     nonce: z.string().min(1),
@@ -475,7 +485,7 @@ export interface ServiceOutputs {
   "source-forget": { forgotten: number };
   configure: { ok: true };
   "agent-context": {
-    systemPrompt: string | null;
+    context: RetrievalResult | null;
     mcpServer: { url: string; headers: Record<string, string> } | null;
     nonce: string | null;
   };
