@@ -4,6 +4,7 @@ import { Access } from "../service/access";
 import { type RunningService, serviceKey, startService } from "../service/app";
 import { MemoryStore } from "../service/store";
 import { silentLogger } from "../shared/log";
+import { RetrievalResultSchema } from "../shared/retrieval";
 import { AgentAuditSchema, SERVICE_KEY_HEADER } from "../shared/service-api";
 import { dataRepo, hashEmbedder, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
 
@@ -24,7 +25,14 @@ const ToolResult = z.object({
   result: z.object({
     content: z.array(z.object({ text: z.string() })),
     isError: z.boolean(),
-    structuredContent: z.object({ error: z.object({ code: z.string(), message: z.string() }) }).optional(),
+    structuredContent: z
+      .object({
+        error: z.object({ code: z.string(), message: z.string() }).optional(),
+        redirects: z.array(z.object({ id: z.number(), targetId: z.number() })).optional(),
+        retrieval: RetrievalResultSchema.omit({ contextText: true }).optional(),
+      })
+      .passthrough()
+      .optional(),
   }),
 });
 
@@ -126,10 +134,10 @@ describe("scope=all follows the signed project", () => {
     const none = await lost.call("memory_search", { query: "walrus", include_sessions: true });
     expect(none.content[0]?.text).not.toContain("walrus session");
     const inA = await agent(dataRepo);
-    const text = (await inA.call("memory_search", { query: "walrus", include_sessions: true })).content[0]
-      ?.text;
-    expect(text).toContain("session:session-a");
-    expect(text).not.toContain("session:session-b");
+    const result = await inA.call("memory_search", { query: "walrus", include_sessions: true });
+    expect(result.structuredContent?.retrieval?.sessionIds).toEqual(["session-a"]);
+    expect(result.content[0]?.text).toContain("walrus answer that is long enough");
+    expect(result.content[0]?.text).not.toContain("walrus session session-b");
   });
 });
 
@@ -140,9 +148,9 @@ describe("id based tools", () => {
       "Beta project secret",
     );
     const update = await inA.call("memory_update", { id: ids.b, title: "Hijacked" });
-    expect(update.structuredContent?.error.code).toBe("scope_denied");
+    expect(update.structuredContent?.error?.code).toBe("scope_denied");
     const removed = await inA.call("memory_delete", { id: ids.b });
-    expect(removed.structuredContent?.error.code).toBe("scope_denied");
+    expect(removed.structuredContent?.error?.code).toBe("scope_denied");
     const detail = z
       .object({ memory: z.object({ title: z.string() }).nullable() })
       .parse(await internal("detail", { id: ids.b }));
@@ -157,7 +165,7 @@ describe("id based tools", () => {
     expect((await lost.call("memory_get", { ids: [ids.a] })).content[0]?.text).not.toContain(
       "Alpha project secret",
     );
-    expect((await lost.call("memory_delete", { id: ids.a })).structuredContent?.error.code).toBe(
+    expect((await lost.call("memory_delete", { id: ids.a })).structuredContent?.error?.code).toBe(
       "scope_denied",
     );
   });
@@ -167,9 +175,11 @@ describe("id based tools", () => {
     const target = await seed("Beta duplicate target", "project", otherRepo);
     expect(await internal("merge", mergeRequest(service.store, source, target))).toMatchObject({ ok: true });
     const inA = await agent(dataRepo);
-    expect((await inA.call("memory_get", { ids: [source] })).content[0]?.text).not.toContain(`#${target}`);
+    expect((await inA.call("memory_get", { ids: [source] })).structuredContent?.redirects).toEqual([]);
     const inB = await agent(otherRepo);
-    expect((await inB.call("memory_get", { ids: [source] })).content[0]?.text).toContain(`#${target}`);
+    expect((await inB.call("memory_get", { ids: [source] })).structuredContent?.redirects).toEqual([
+      { id: source, targetId: target },
+    ]);
   });
 });
 
@@ -218,7 +228,7 @@ describe("tool input validation", () => {
     const count = service.store.stats().memories;
     const result = await inA.call(tool, args);
     expect(result.isError).toBe(true);
-    expect(result.structuredContent?.error.code).toBe("invalid_input");
+    expect(result.structuredContent?.error?.code).toBe("invalid_input");
     expect(service.store.stats().memories).toBe(count);
     expect(service.store.getVisible(owner, [ids.a, ids.b, ids.global]).map((r) => r.title)).toEqual([
       "Alpha project secret",

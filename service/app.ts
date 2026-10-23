@@ -15,6 +15,7 @@ import {
   type ServiceStatus,
   serviceInputs,
 } from "../shared/service-api";
+import type { ContextTokenizer } from "./context-budget";
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
 import { type Caller, createMcpHandler } from "./mcp";
 import { MutationError } from "./mutations";
@@ -42,6 +43,7 @@ export interface ServiceOptions {
   log?: Logger;
   loadEmbedder?: (tier: EmbeddingTier, modelsDir: string) => Promise<Embedder>;
   loadReranker?: (modelsDir: string) => Promise<Reranker>;
+  contextTokenizers?: ReadonlyMap<string, ContextTokenizer>;
 }
 
 export interface RunningService {
@@ -84,7 +86,13 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
 
   let mcpUrl = "";
   const status = (): ServiceStatus => serviceStatus(store, models, mcpUrl);
-  const routes = createRoutes({ store, secret, status, mcpUrl: () => mcpUrl });
+  const routes = createRoutes({
+    store,
+    secret,
+    status,
+    mcpUrl: () => mcpUrl,
+    tokenizers: options.contextTokenizers,
+  });
   const mcp = createMcpHandler({
     secret,
     instructions: MCP_INSTRUCTIONS,
@@ -93,6 +101,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     tools: createTools({
       store,
       resolveProject: (caller) => callerProject(store, caller.projectKey),
+      tokenizers: options.contextTokenizers,
     }),
   });
   const internal = createInternalHandler(routes, serviceKey(secret), log);
@@ -218,8 +227,8 @@ function createInternalHandler(routes: Routes, key: string, log: Logger): Handle
     const parsed = serviceInputs[route].safeParse(await req.json().catch(() => undefined));
     if (!parsed.success) return Response.json({ error: parsed.error.message }, { status: 400 });
     try {
-      const handler = routes[route] as (input: unknown) => unknown;
-      return Response.json(await handler(parsed.data));
+      const handler = routes[route] as (input: unknown, signal?: AbortSignal) => unknown;
+      return Response.json(await handler(parsed.data, req.signal));
     } catch (error) {
       return internalErrorResponse(error, route, log);
     }

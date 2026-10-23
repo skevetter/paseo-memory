@@ -29,7 +29,7 @@ interface MutationOptions {
   lifecycle: Lifecycle;
   reviews: ReviewLedger;
   now: () => string;
-  changed: () => void;
+  changed: (operation: MutationRequest["operation"]) => void;
 }
 interface CompatibilityRequest {
   operation: ParsedMutation["operation"];
@@ -111,7 +111,7 @@ export class MemoryMutations {
     const request = MutationRequestSchema.parse(input);
     try {
       const result = this.db.transaction(() => this.commit(principal, request, reservation))();
-      this.options.changed();
+      this.options.changed(request.operation);
       return result;
     } catch (error) {
       if (reservation) this.options.reviews.release(reservation);

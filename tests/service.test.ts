@@ -4,6 +4,7 @@ import { type RunningService, serviceKey, startService } from "../service/app";
 import { signCaller, verifyCaller } from "../service/mcp";
 import { MutationResultSchema } from "../shared/lifecycle";
 import { silentLogger } from "../shared/log";
+import { RetrievalResultSchema } from "../shared/retrieval";
 import { AgentAuditSchema, MAX_CONTENT_CHARS, SERVICE_KEY_HEADER } from "../shared/service-api";
 import { dataRepo, hashEmbedder, tempDir } from "./helpers";
 
@@ -197,11 +198,11 @@ describe("internal api", () => {
     });
     const context = z
       .object({
-        systemPrompt: z.string(),
+        context: RetrievalResultSchema,
         mcpServer: z.object({ url: z.string(), headers: z.object({ Authorization: z.string() }) }),
       })
       .parse(json);
-    expect(context.systemPrompt).toContain("Pinned in UI");
+    expect(context.context.contextText).toContain("Pinned in UI");
     expect(context.mcpServer.url).toBe(service.mcpUrl);
     expect(verifyCaller(service.secret, context.mcpServer.headers.Authorization)).toEqual({
       projectKey: dataRepo.key,
@@ -225,7 +226,10 @@ const ToolResult = z.object({
   result: z.object({
     content: z.array(z.object({ text: z.string() })),
     isError: z.boolean(),
-    structuredContent: z.object({ error: z.object({ code: z.string() }) }).optional(),
+    structuredContent: z
+      .object({ error: z.object({ code: z.string() }).optional() })
+      .passthrough()
+      .optional(),
   }),
 });
 
@@ -277,7 +281,7 @@ describe("agent audit", () => {
       content: "x".repeat(MAX_CONTENT_CHARS + 1),
     });
     expect(tooLong.isError).toBe(true);
-    expect(tooLong.structuredContent?.error.code).toBe("content_too_long");
+    expect(tooLong.structuredContent?.error?.code).toBe("content_too_long");
 
     await internal("link-agent", {
       nonce: ctx.nonce,
@@ -319,7 +323,7 @@ describe("agent audit", () => {
 
 const ContextOutput = z.object({
   nonce: z.string(),
-  systemPrompt: z.string(),
+  context: RetrievalResultSchema,
   mcpServer: z.object({ headers: z.record(z.string(), z.string()) }),
 });
 
@@ -370,11 +374,8 @@ describe("task-aware start", () => {
       query: "why do payment retries stop after three attempts",
       source: "prompt",
     });
-    const block = agent.systemPrompt.split("\n");
-    const heading = block.indexOf("## Relevant to this task");
-    expect(heading).toBeGreaterThan(0);
-    expect(block[heading + 1]).toContain(`#${id} [config] Gateway limits`);
-    expect(heading).toBeLessThan(block.findIndex((l) => l.startsWith("## Pinned")));
+    expect(agent.context.taskIds).toContain(id);
+    expect(agent.context.memoryRefs.filter((ref) => ref.id === id)).toEqual([{ id, revision: 1 }]);
     const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId: "agent-task" })).json);
     expect(audit.injected?.task).toMatchObject({
       query: "why do payment retries stop after three attempts",
@@ -456,7 +457,7 @@ describe("session review", () => {
       expect(session?.outcomes).toContain(`Review fact ${index + 1}`);
     }
     const next = await startAgent("agent-next", null);
-    expect(next.systemPrompt).toContain("Capped retries at three and kept backoff.");
+    expect(next.context.contextText).toContain("Capped retries at three and kept backoff.");
     const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId })).json);
     const review = audit.events.find((e) => e.kind === "review");
     expect(review).toMatchObject({ text: "Capped retries at three and kept backoff." });
@@ -517,7 +518,7 @@ it("counts preflight and admitted failures once, and never recharges an authoriz
   expect(replay).toEqual(first);
   expect(service.store.reviews.info(reviewer.nonce)).toMatchObject({ attempts: 5, committed: 1 });
   const conflict = await reviewer.call("memory_save", { ...mutation, content: "Different retry body" });
-  expect(conflict.structuredContent?.error.code).toBe("request_conflict");
+  expect(conflict.structuredContent?.error?.code).toBe("request_conflict");
   expect(service.store.reviews.info(reviewer.nonce)).toMatchObject({ attempts: 6, committed: 1 });
 
   const unresolved = await startAgent("unresolved-project-review", null, null);
@@ -526,6 +527,6 @@ it("counts preflight and admitted failures once, and never recharges an authoriz
     title: "No project",
     content: "Cannot assign this scope",
   });
-  expect(denied.structuredContent?.error.code).toBe("scope_denied");
+  expect(denied.structuredContent?.error?.code).toBe("scope_denied");
   expect(service.store.reviews.info(unresolved.nonce)).toMatchObject({ attempts: 1, committed: 0 });
 });

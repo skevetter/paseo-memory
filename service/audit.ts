@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { RetrievalResult } from "../shared/retrieval";
 import type { AgentAudit, AuditEvent, AuditKind, TaskSource, WorkspaceAgent } from "../shared/service-api";
 import { redact } from "./redact";
 import { clip } from "./text";
@@ -6,7 +7,7 @@ import { clip } from "./text";
 export interface TaskAudit {
   query: string;
   source: TaskSource;
-  matches: { id: number; score: number }[];
+  matches: { id: number; score: number | null }[];
   note: string | null;
 }
 
@@ -16,6 +17,7 @@ export interface Injection {
   chars: number;
   budget: number;
   task?: TaskAudit | null;
+  retrieval?: RetrievalAudit;
 }
 
 export interface ReviewAudit {
@@ -31,14 +33,65 @@ export interface ReviewAudit {
 // Search results are memory ids ("12") or session ids ("session:<agent id>").
 export type AuditDetail =
   | ({ kind: "inject" | "context" } & Injection)
-  | { kind: "search"; query: string; scope: string; results: { id: string; score: number }[] }
-  | { kind: "get"; ids: number[]; found: number[] }
+  | {
+      kind: "search";
+      query: string;
+      scope: string;
+      results: { id: string; score: number | null }[];
+      retrieval?: RetrievalAudit;
+    }
+  | { kind: "get"; ids: number[]; found: number[]; retrieval?: RetrievalAudit }
   | { kind: "save"; id: number | null; status: string; candidates: number[] }
   | { kind: "update" | "delete"; id: number; ok: boolean; unchanged?: boolean }
   | ({ kind: "review" } & ReviewAudit)
   | { kind: "merge"; source: number; target: number; similarity: number | null; sameTopic: boolean }
   | { kind: "denied"; tool: string; operation: string; ids: number[] }
   | { kind: "invalid"; tool: string; fields: string[] };
+
+export type RetrievalAudit = Pick<
+  RetrievalResult,
+  | "retrievalId"
+  | "memoryRefs"
+  | "evidenceRefs"
+  | "usage"
+  | "truncated"
+  | "omittedCount"
+  | "omittedPins"
+  | "fallbackReason"
+  | "policyRevision"
+  | "indexGeneration"
+>;
+export function retrievalAudit(result: RetrievalResult): RetrievalAudit {
+  const {
+    retrievalId,
+    memoryRefs,
+    evidenceRefs,
+    usage,
+    truncated,
+    omittedCount,
+    omittedPins,
+    fallbackReason,
+    policyRevision,
+    indexGeneration,
+  } = result;
+  return {
+    retrievalId,
+    memoryRefs,
+    evidenceRefs,
+    usage,
+    truncated,
+    omittedCount,
+    omittedPins,
+    fallbackReason,
+    policyRevision,
+    indexGeneration,
+  };
+}
+
+export function retrievalScore(scores: ReadonlyMap<string, number>, key: string): number | null {
+  const score = scores.get(key);
+  return score !== undefined && Number.isFinite(score) ? score : null;
+}
 
 interface LinkRow {
   nonce: string;

@@ -6,6 +6,7 @@ import {
   MutationRequestSchema,
   MutationResultSchema,
 } from "./lifecycle";
+import { RetrievalPolicySettingsSchema } from "./retrieval";
 import {
   AgentAuditSchema,
   DEFAULT_RUNTIME,
@@ -78,6 +79,7 @@ const settingsSchema = z.object({
   injectMcp: z.boolean().default(true),
   autoCapture: z.boolean().default(true),
   contextBudgetChars: ranged("contextBudgetChars", DEFAULT_RUNTIME.contextBudgetChars),
+  retrievalPolicy: RetrievalPolicySettingsSchema.default(DEFAULT_RUNTIME.retrievalPolicy),
   maxPinned: ranged("maxPinned", DEFAULT_RUNTIME.maxPinned),
   taskMatches: ranged("taskMatches", DEFAULT_RUNTIME.taskMatches),
   taskStrictness: z.enum(STRICTNESS_LEVELS).default(DEFAULT_RUNTIME.taskStrictness),
@@ -128,6 +130,7 @@ export type MemorySettings = z.output<typeof settingsSchema>;
 export function runtimeConfig(settings: MemorySettings): RuntimeConfig {
   return {
     contextBudgetChars: settings.contextBudgetChars,
+    retrievalPolicy: settings.retrievalPolicy,
     maxPinned: settings.maxPinned,
     taskMatches: settings.taskMatches,
     taskStrictness: settings.taskStrictness,

@@ -1,3 +1,4 @@
+import type { RecordKind } from "../shared/retrieval";
 import type { SearchScope } from "../shared/service-api";
 import { currentLifecycleSql } from "./lifecycle";
 
@@ -69,7 +70,7 @@ export class Access {
   }
 
   /** SQL over `memories m` for the namespaces `scope` resolves to. */
-  memoryFilter(scope: SearchScope, type?: string, at?: string): SqlFilter {
+  memoryFilter(scope: SearchScope, type?: string, at?: string, recordKinds?: RecordKind[]): SqlFilter {
     const where = ["m.deleted_at IS NULL", currentLifecycleSql("m", at ? "?" : undefined)];
     const params: (string | number)[] = [];
     if (at) params.push(at);
@@ -85,6 +86,10 @@ export class Access {
       where.push("m.type = ?");
       params.push(type);
     }
+    if (recordKinds) {
+      where.push(recordKinds.length ? `m.record_kind IN (${recordKinds.map(() => "?").join(",")})` : "0");
+      params.push(...recordKinds);
+    }
     return { where: where.join(" AND "), params };
   }
 
@@ -92,8 +97,11 @@ export class Access {
   sessionFilter(scope: SearchScope): SqlFilter | null {
     const { projects } = this.reach(scope);
     if (projects.kind === "none") return null;
-    if (projects.kind === "every") return { where: "1", params: [] };
-    return { where: "s.project_key = ?", params: [projects.key] };
+    const current = `NOT EXISTS (SELECT 1 FROM memory_tombstones t WHERE
+      (t.kind='session' AND t.identifier=s.agent_id)
+      OR (t.kind='caller' AND t.identifier IN (SELECT nonce FROM agent_links WHERE agent_id=s.agent_id)))`;
+    if (projects.kind === "every") return { where: current, params: [] };
+    return { where: `s.project_key = ? AND ${current}`, params: [projects.key] };
   }
 }
 

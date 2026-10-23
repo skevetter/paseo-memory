@@ -6,13 +6,15 @@ An agent reaches global memory and the memory of its own project, never another 
 
 ## How it works
 
-- New agents receive a memory block in their system prompt: matches for the first prompt, pinned memories, recent project and global memories, and recent sessions.
+- New agents receive one owner-budgeted memory block: bounded stable pins/preferences, task facts, project/global facts and permitted unverified session digests. Explicit reads and context tools use the same retrieval pipeline and current canonical references.
 - Agents get MCP tools to search, read, propose and correct memories. Arguments and namespace grants are checked before a write. New assertions and corrections remain candidates until authorized promotion; they are not automatically injected as facts. Missing and inaccessible IDs return the same unavailable result, and denial audits omit request content.
 - Each turn records the prompt, the reply and the edited files. Tool output is not stored.
 - An idle agent receives one prompt to summarize its session and make up to 3 memory changes. Creates, topic upserts and direct updates share one atomic cap, including concurrent calls. Unchanged, duplicate and failed writes do not use a slot; retrying the same request returns its receipt. The review shows as one collapsed line in the chat.
 - A daily job suggests duplicate merges, flags possible conflicts and lists stale memories. Approximate matches remain suggestions. Automatic merging requires equal canonical text, type, namespace, source/agent/provider authority, pin state, record kind, verification and validity. Merges and undo use current revisions, preserve IDs and retain complete history and evidence lineage.
 - The Memory panel shows memories, sessions, a review queue and what each agent received.
 - Canonical revisions disclose evidence, verification and validity through the lifecycle API. Expired, archived, superseded, rejected and needs-recheck records are excluded from normal recall. Changing a source invalidates dependent summaries; a summary cannot outlive its source.
+
+Retrieval profiles constrain detail, kinds, candidates, items, tokens, characters, bytes and inference time. The measured block includes instructions, citations and its known preceding system prompt. Token counts are labeled estimates unless a trusted matching tokenizer is available; unknown later provider/tool framing remains reserved overhead, not an exact full-provider-prompt guarantee. [Policy, API and measurement limits](docs/retrieval.md).
 
 ## Setup
 

@@ -367,7 +367,7 @@ describe("search after async work", () => {
     expect((await search).map((h) => h.title)).toEqual(["reranked survivor"]);
   });
 
-  it("returns current text, not the text seen when the candidates were fetched", async () => {
+  it("omits a revision changed during reranking rather than attach a stale relevance score", async () => {
     const store = openStore(":memory:");
     const id = await seed(store, "reranked editable", everywhere);
     await seed(store, "reranked other", everywhere);
@@ -378,8 +378,7 @@ describe("search after async work", () => {
     store.updateAuthorized(owner, id, { title: "reranked corrected title" });
     call.release();
     const titles = (await search).map((h) => h.title);
-    expect(titles).toContain("reranked corrected title");
-    expect(titles).not.toContain("reranked editable");
+    expect(titles).toEqual(["reranked other"]);
   });
 
   it("drops late results when the caller aborts and does not track usage", async () => {

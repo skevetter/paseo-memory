@@ -11,16 +11,25 @@ export class ToolError extends Error {
   }
 }
 
+export interface ToolOutput {
+  text: string;
+  structuredContent?: Record<string, unknown>;
+}
 export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  handler(args: Record<string, unknown>, caller: Caller, request: ToolRequest): Promise<string> | string;
+  handler(
+    args: Record<string, unknown>,
+    caller: Caller,
+    request: ToolRequest,
+  ): Promise<string | ToolOutput> | string | ToolOutput;
 }
 
 /** Identifies one call so a retried request can be recognised; null for requests without an id. */
 export interface ToolRequest {
   id: string | null;
+  signal?: AbortSignal;
 }
 
 export interface Caller {
@@ -47,7 +56,11 @@ interface JsonRpcRequest {
 }
 
 type RpcId = string | number | null;
-type MethodHandler = (message: JsonRpcRequest, caller: Caller) => Promise<unknown> | unknown;
+type MethodHandler = (
+  message: JsonRpcRequest,
+  caller: Caller,
+  signal: AbortSignal,
+) => Promise<unknown> | unknown;
 
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_BODY_BYTES = 1_000_000;
@@ -116,11 +129,16 @@ function methodTable(options: McpOptions): Record<string, MethodHandler> {
           inputSchema: t.inputSchema,
         })),
       }),
-    "tools/call": (message, caller) => callTool(options.tools, message, caller),
+    "tools/call": (message, caller, signal) => callTool(options.tools, message, caller, signal),
   };
 }
 
-async function callTool(tools: ToolDefinition[], message: JsonRpcRequest, caller: Caller): Promise<unknown> {
+async function callTool(
+  tools: ToolDefinition[],
+  message: JsonRpcRequest,
+  caller: Caller,
+  signal: AbortSignal,
+): Promise<unknown> {
   const id = message.id ?? null;
   const name = String(message.params?.name ?? "");
   const tool = tools.find((t) => t.name === name);
@@ -130,10 +148,17 @@ async function callTool(tools: ToolDefinition[], message: JsonRpcRequest, caller
     return rpcError(id, -32602, "tool arguments must be a JSON object");
   }
   try {
-    const text = await tool.handler(args as Record<string, unknown>, caller, {
+    const output = await tool.handler(args as Record<string, unknown>, caller, {
       id: id === null ? null : String(id),
+      signal,
     });
-    return rpcResult(id, { content: [{ type: "text", text }], isError: false });
+    const { text, structuredContent } =
+      typeof output === "string" ? { text: output, structuredContent: undefined } : output;
+    return rpcResult(id, {
+      content: [{ type: "text", text }],
+      ...(structuredContent ? { structuredContent } : {}),
+      isError: false,
+    });
   } catch (error) {
     return rpcResult(id, toolFailure(error));
   }
@@ -179,24 +204,26 @@ function dispatch(
   methods: Record<string, MethodHandler>,
   message: JsonRpcRequest,
   caller: Caller,
+  signal: AbortSignal,
 ): Promise<unknown> | unknown {
   const method = Object.hasOwn(methods, message.method) ? methods[message.method] : undefined;
   if (message.id !== undefined && message.id !== null) {
     return method
-      ? method(message, caller)
+      ? method(message, caller, signal)
       : rpcError(message.id, -32601, `method not found: ${message.method}`);
   }
-  return method && message.method !== "ping" ? method(message, caller) : null;
+  return method && message.method !== "ping" ? method(message, caller, signal) : null;
 }
 
 async function collectResponses(
   methods: Record<string, MethodHandler>,
   batch: JsonRpcRequest[],
   caller: Caller,
+  signal: AbortSignal,
 ): Promise<unknown[]> {
   const responses: unknown[] = [];
   for (const item of batch) {
-    const response = await dispatch(methods, item, caller);
+    const response = await dispatch(methods, item, caller, signal);
     if (response !== null) responses.push(response);
   }
   return responses;
@@ -220,6 +247,6 @@ export function createMcpHandler(options: McpOptions): (req: Request) => Promise
     const message = parseBody(await req.text());
     if (message instanceof Response) return message;
     const batch = Array.isArray(message) ? message : [message];
-    return respond(message, await collectResponses(methods, batch, caller));
+    return respond(message, await collectResponses(methods, batch, caller, req.signal));
   };
 }
