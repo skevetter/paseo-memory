@@ -5,6 +5,7 @@ import { buildContext } from "../service/context";
 import { MutationError, mutationRequestId, ownerMutation } from "../service/mutations";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore } from "../service/store";
+import { sha256 } from "../service/text";
 import type { MutationRequest, MutationResult } from "../shared/lifecycle";
 import { dataRepo, otherRepo, owner, tempDir } from "./helpers";
 
@@ -159,23 +160,55 @@ it("invalidates dependent facts and cancels exact queued evidence jobs on correc
 
 it("bounds propagation and suppresses deep dependencies while queued work survives restart", () => {
   const source = create("Chain root");
-  let previous = source;
-  for (let i = 0; i < 140; i++) {
-    previous = mutate({
-      requestId: `chain-${i}`,
-      operation: "create",
-      change: { title: `Derived ${i}`, content: `Derived node ${i}`, recordKind: "derived_summary" },
-      evidence: [
-        { sourceKind: "memory", sourceRef: `memory:${previous.memoryRef.id}@1`, includeExcerpt: false },
-      ],
-    });
+  let previousId = source.memoryRef.id;
+  const fixture = openDatabase(store.path).db;
+  try {
+    const insert =
+      fixture.query(`INSERT INTO memories(title,content,type,scope,content_hash,record_kind,state,verification_status,verified_at,created_at,updated_at)
+      VALUES (?,?,'pattern','global',?,'derived_summary','active','verified',?,?,?)`);
+    const link = fixture.query(
+      "INSERT INTO memory_relations VALUES (?,1,?,1,'derived_from','owner',?,'verified')",
+    );
+    fixture.transaction(() => {
+      for (let i = 0; i < 140; i++) {
+        const title = `Derived ${i}`,
+          content = `Derived node ${i}`;
+        const id = Number(
+          insert.run(
+            title,
+            content,
+            sha256(`pattern\n${title}\n${content}`),
+            at.toISOString(),
+            at.toISOString(),
+            at.toISOString(),
+          ).lastInsertRowid,
+        );
+        link.run(previousId, id, at.toISOString());
+        previousId = id;
+      }
+    })();
+    expect(store.getVisible(owner, [previousId])[0]?.title).toBe("Derived 139");
+    change(source, { content: "Root corrected" });
+    expect(store.lifecycleDetail(owner, previousId)?.state).toBe("active");
+    expect(store.getVisible(owner, [previousId])).toEqual([]);
+    const pending = fixture
+      .query<{ memory_id: number; revision: number }, []>(
+        "SELECT memory_id,revision FROM lifecycle_invalidations ORDER BY memory_id LIMIT 1",
+      )
+      .get();
+    expect(pending).toEqual({ memory_id: source.memoryRef.id + 1, revision: 1 });
+    const path = store.path;
+    store.close();
+    store = new MemoryStore({ path, now: () => at });
+    expect(store.getVisible(owner, [previousId])).toEqual([]);
+    expect(
+      fixture
+        .query("SELECT memory_id,revision FROM lifecycle_invalidations ORDER BY memory_id LIMIT 1")
+        .get(),
+    ).toEqual(pending);
+  } finally {
+    fixture.close();
   }
-  change(source, { content: "Root corrected" });
-  expect(store.getVisible(owner, [previous.memoryRef.id])).toEqual([]);
-  const path = store.path;
-  store.close();
-  store = new MemoryStore({ path, now: () => at });
-  expect(store.getVisible(owner, [previous.memoryRef.id])).toEqual([]);
 });
 
 it("forgets source/dependent text, versions, excerpts and indexes and blocks replay resurrection", async () => {
