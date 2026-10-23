@@ -30,7 +30,11 @@ class Gate<T> {
 
   push(item: T): void {
     if (this.auto) this.auto(item);
-    else this.takers.shift()?.(item) ?? this.waiting.push(item);
+    else {
+      const take = this.takers.shift();
+      if (take) take(item);
+      else this.waiting.push(item);
+    }
   }
 
   next(): Promise<T> {

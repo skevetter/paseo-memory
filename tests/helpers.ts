@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Access } from "../service/access";
 import type { Embedder, TierSpec } from "../service/embedder";
-import type { ProjectRef } from "../service/store";
+import type { MemoryStore, ProjectRef } from "../service/store";
 import { sha256 } from "../service/text";
 
 export const dataRepo: ProjectRef = {
@@ -68,4 +68,9 @@ export function hashEmbedder(model = "test/hash", dims = 64): Embedder & { calls
     },
   };
   return embedder;
+}
+
+export function mergeRequest(store: MemoryStore, sourceId: number, targetId: number) {
+  const revision = (id: number) => store.getVisible(owner, [id])[0]?.record_revision ?? -1;
+  return { sourceId, targetId, sourceRevision: revision(sourceId), targetRevision: revision(targetId) };
 }

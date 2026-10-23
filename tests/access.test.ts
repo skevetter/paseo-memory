@@ -5,7 +5,7 @@ import { type RunningService, serviceKey, startService } from "../service/app";
 import { MemoryStore } from "../service/store";
 import { silentLogger } from "../shared/log";
 import { AgentAuditSchema, SERVICE_KEY_HEADER } from "../shared/service-api";
-import { dataRepo, hashEmbedder, otherRepo, owner, tempDir } from "./helpers";
+import { dataRepo, hashEmbedder, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
 
 let service: RunningService;
 beforeAll(async () => {
@@ -162,7 +162,7 @@ describe("id based tools", () => {
   it("does not reveal the target of a merge the caller cannot see", async () => {
     const source = await seed("Beta duplicate source", "project", otherRepo);
     const target = await seed("Beta duplicate target", "project", otherRepo);
-    expect(await internal("merge", { sourceId: source, targetId: target })).toMatchObject({ ok: true });
+    expect(await internal("merge", mergeRequest(service.store, source, target))).toMatchObject({ ok: true });
     const inA = await agent(dataRepo);
     expect((await inA.call("memory_get", { ids: [source] })).content[0]?.text).toBe(
       "No memories found for those ids.",
@@ -254,19 +254,17 @@ describe("store grants", () => {
   beforeAll(async () => {
     store = new MemoryStore({ path: ":memory:" });
     store.setEmbedder(hashEmbedder("test/grants"));
-    const save = async (title: string, scope: "global" | "project", project: typeof dataRepo | null) =>
-      Number(
-        (
-          await store.save({
-            title,
-            content: `walnut pantry ${title}`,
-            type: "note",
-            scope,
-            project,
-            force: true,
-          })
-        ).id,
-      );
+    const save = async (title: string, scope: "global" | "project", project: typeof dataRepo | null) => {
+      const result = await store.save({
+        title,
+        content: `walnut pantry ${title}`,
+        type: "note",
+        scope,
+        project,
+        force: true,
+      });
+      return Number(result.id);
+    };
     memory.a = await save("grant alpha", "project", dataRepo);
     memory.b = await save("grant beta", "project", otherRepo);
     memory.global = await save("grant global", "global", null);
@@ -319,7 +317,9 @@ describe("store grants", () => {
   it("lets only the owner restore and merge, and needs both ends authorized", () => {
     const inA = Access.agent(dataRepo.key);
     expect(store.restoreAuthorized(inA, memory.a, 1)).toBe("denied");
-    expect(store.mergeAuthorized(inA, memory.a, memory.global)).toMatchObject({ ok: false });
+    expect(store.mergeAuthorized(inA, mergeRequest(store, memory.a, memory.global))).toMatchObject({
+      ok: false,
+    });
     expect(store.getVisible(owner, [memory.a, memory.global])).toHaveLength(2);
   });
 
@@ -331,12 +331,13 @@ describe("store grants", () => {
       );
     const source = await save("merge source", otherRepo);
     const target = await save("merge target", otherRepo);
-    expect(store.mergeAuthorized(owner, source, target)).toMatchObject({ ok: true });
+    expect(store.mergeAuthorized(owner, mergeRequest(store, source, target))).toMatchObject({ ok: true });
     expect(store.mergedIntoVisible(Access.agent(otherRepo.key), source)).toBe(target);
     expect(store.mergedIntoVisible(Access.agent(dataRepo.key), source)).toBeNull();
     expect(store.detailAuthorized(Access.agent(dataRepo.key), source)).toEqual({
       memory: null,
       mergedInto: null,
+      mergeId: null,
       archived: false,
       versions: [],
       duplicates: [],

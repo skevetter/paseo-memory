@@ -8,12 +8,22 @@ import {
   type RuntimeConfig,
   type SearchScope,
 } from "../shared/service-api";
-import type { Access, MutationOutcome, Namespace, Scope, SqlFilter } from "./access";
+import type {
+  Access,
+  MergeRequest,
+  MergeResult,
+  MutationOutcome,
+  Namespace,
+  Scope,
+  SqlFilter,
+} from "./access";
 import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { type IndexHealth, IndexRetry, type IndexRetryOptions } from "./index-retry";
 import { redact } from "./redact";
 import { RERANK_CANDIDATES, type Reranker } from "./reranker";
+import { type Reservation, ReviewLedger } from "./review-ledger";
+import { formatSave } from "./save-receipt";
 import { migrate } from "./schema";
 import {
   currentSessionHits,
@@ -204,6 +214,7 @@ type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "merged_into" | "arc
 const HIDDEN_DETAIL: MemoryDetail = {
   memory: null,
   mergedInto: null,
+  mergeId: null,
   archived: false,
   versions: [],
   duplicates: [],
@@ -218,6 +229,7 @@ export class MemoryStore {
   readonly sqliteVersion: string;
   readonly sqliteVecVersion: string;
   readonly audit: AuditLog;
+  readonly reviews: ReviewLedger;
   private readonly db: Database;
   private readonly now: () => Date;
   private readonly log: Logger;
@@ -242,6 +254,7 @@ export class MemoryStore {
     this.sqliteVecVersion = opened.sqliteVecVersion;
     migrate(this.db);
     this.audit = new AuditLog(this.db, () => this.ts());
+    this.reviews = new ReviewLedger(this.db, this.now);
   }
 
   close(): void {
@@ -308,8 +321,11 @@ export class MemoryStore {
     return row ? { key, name: row.name, rootPath: row.root_path, paseoProjectId: null } : null;
   }
 
-  async save(input: SaveInput): Promise<SaveResult> {
-    if (input.content.length > MAX_CONTENT_CHARS) throw new ContentTooLongError(input.content.length);
+  async save(input: SaveInput, reservation?: Reservation): Promise<SaveResult> {
+    if (input.content.length > MAX_CONTENT_CHARS) {
+      reservation && this.reviews.release(reservation);
+      throw new ContentTooLongError(input.content.length);
+    }
     const title = redact(input.title).trim().slice(0, 200);
     const content = redact(input.content).trim();
     if (!title || !content) throw new Error("title and content are required");
@@ -326,7 +342,15 @@ export class MemoryStore {
       vector,
     };
     // Everything below is synchronous, so no other request interleaves with the checks.
-    return this.db.transaction(() => this.saveNow(draft))();
+    return this.settled(
+      reservation,
+      () => this.saveNow(draft),
+      (result) => ({
+        consumed: result.status === "created" || result.status === "updated",
+        memoryId: result.id,
+        receipt: formatSave(result, scope === "project" ? input.project : null),
+      }),
+    );
   }
 
   getVisible(access: Access, ids: number[]): MemoryWithProject[] {
@@ -396,28 +420,49 @@ export class MemoryStore {
     return target && access.allows("read", namespaceOf(target)) ? removed.merged_into : null;
   }
 
-  updateAuthorized(access: Access, id: number, patch: MemoryPatch): MutationOutcome {
-    const existing = this.rowsById([id])[0];
-    if (!existing) return "not_found";
-    if (!access.allows("write", namespaceOf(existing))) return "denied";
-    const next = patched(existing, patch);
-    if (!access.allows("write", { scope: next.scope, projectKey: next.projectKey })) return "denied";
-    this.applyUpdate(existing, patch);
-    return "ok";
+  updateAuthorized(
+    access: Access,
+    id: number,
+    patch: MemoryPatch,
+    reservation?: Reservation,
+  ): MutationOutcome {
+    return this.settled(
+      reservation,
+      () => {
+        const existing = this.rowsById([id])[0];
+        if (!existing) return "not_found";
+        if (!access.allows("write", namespaceOf(existing))) return "denied";
+        const next = patched(existing, patch);
+        if (!access.allows("write", { scope: next.scope, projectKey: next.projectKey })) return "denied";
+        return this.applyUpdate(existing, patch) ? "ok" : "unchanged";
+      },
+      (outcome) => ({
+        consumed: outcome === "ok",
+        memoryId: id,
+        receipt:
+          outcome === "unchanged"
+            ? `unchanged: #${id} already says this`
+            : outcome === "ok"
+              ? `updated: #${id}`
+              : `not found: #${id}`,
+      }),
+    );
   }
 
-  private applyUpdate(existing: MemoryRow, patch: MemoryPatch): void {
+  // Returns false when the patch changes nothing, so callers do not count a revision or a review slot for it.
+  private applyUpdate(existing: MemoryRow, patch: MemoryPatch): boolean {
     if (patch.content !== undefined && patch.content.length > MAX_CONTENT_CHARS) {
       throw new ContentTooLongError(patch.content.length);
     }
     const next = patched(existing, patch);
     const { textChanged, reindex, changed } = classifyChange(existing, next);
+    if (!changed) return false;
     if (textChanged) this.snapshot(existing);
     if (next.project) this.upsertProject(next.project);
     this.db
       .query(
         `UPDATE memories SET title = ?, content = ?, type = ?, pinned = ?, topic_key = ?, content_hash = ?,
-         scope = ?, project_key = ?, revision_count = revision_count + ?, record_revision = record_revision + ?,
+         scope = ?, project_key = ?, revision_count = revision_count + ?, record_revision = record_revision + 1,
          index_generation = index_generation + ?, updated_at = ? WHERE id = ?`,
       )
       .run(
@@ -430,7 +475,6 @@ export class MemoryStore {
         next.scope,
         next.projectKey,
         textChanged ? 1 : 0,
-        changed ? 1 : 0,
         reindex ? 1 : 0,
         this.ts(),
         existing.id,
@@ -439,20 +483,49 @@ export class MemoryStore {
       dropVectors(this.db, existing.id);
       this.scheduleIndex();
     }
+    return true;
   }
 
-  deleteAuthorized(access: Access, id: number, hard = false): MutationOutcome {
-    const existing = this.rowsById([id])[0];
-    if (!existing) return "not_found";
-    if (!access.allows("delete", namespaceOf(existing))) return "denied";
-    if (hard) this.db.query(`DELETE FROM memories WHERE id = ?`).run(id);
-    else {
-      this.db
-        .query(`UPDATE memories SET deleted_at = ?, record_revision = record_revision + 1 WHERE id = ?`)
-        .run(this.ts(), id);
+  private settled<T>(
+    reservation: Reservation | undefined,
+    run: () => T,
+    outcome: (value: T) => { consumed: boolean; memoryId: number | null; receipt?: string },
+  ): T {
+    try {
+      return this.db.transaction(() => {
+        if (reservation) this.reviews.assertActive(reservation);
+        const value = run();
+        if (reservation) this.reviews.settle(reservation, outcome(value));
+        return value;
+      })();
+    } catch (error) {
+      if (reservation) this.reviews.release(reservation);
+      throw error;
     }
-    dropVectors(this.db, id);
-    return "ok";
+  }
+
+  deleteAuthorized(access: Access, id: number, hard = false, reservation?: Reservation): MutationOutcome {
+    return this.settled(
+      reservation,
+      () => {
+        const existing = this.rowsById([id])[0];
+        if (!existing) return "not_found";
+        if (!access.allows("delete", namespaceOf(existing))) return "denied";
+        if (hard) this.db.query(`DELETE FROM memories WHERE id = ?`).run(id);
+        else {
+          this.db
+            .query(`UPDATE memories SET deleted_at = ?, record_revision = record_revision + 1 WHERE id = ?`)
+            .run(this.ts(), id);
+        }
+        dropVectors(this.db, id);
+        return "ok";
+      },
+      (outcome) => ({
+        consumed: outcome === "ok",
+        memoryId: id,
+        receipt: outcome === "ok" ? `deleted: #${id}` : `not found: #${id}`,
+      }),
+    );
   }
 
   restoreAuthorized(access: Access, id: number, version: number): MutationOutcome {
@@ -465,24 +538,112 @@ export class MemoryStore {
       )
       .get(id, version);
     if (!old) return "not_found";
-    this.applyUpdate(existing, { title: old.title, content: old.content });
-    return "ok";
+    return this.applyUpdate(existing, { title: old.title, content: old.content }) ? "ok" : "unchanged";
   }
 
-  mergeAuthorized(access: Access, sourceId: number, targetId: number): { ok: boolean; message: string } {
-    if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
-    const live = this.rowsById([sourceId, targetId]);
-    // A denied pair reads like a missing one so ids in other namespaces are not confirmed.
-    if (live.length < 2 || live.some((row) => !access.allows("merge", namespaceOf(row)))) {
-      return { ok: false, message: "Both memories must exist." };
-    }
+  /**
+   * Soft-deletes `sourceId` into `targetId`. Both revisions must still be the ones the caller looked at, and both
+   * snapshots are recorded so the merge can be undone.
+   */
+  mergeAuthorized(access: Access, request: MergeRequest, actor: "owner" | "upkeep" = "owner"): MergeResult {
+    const result = this.db.transaction((): MergeResult => {
+      const { sourceId, targetId } = request;
+      if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
+      const rows = this.rowsById([sourceId, targetId]);
+      const source = rows.find((row) => row.id === sourceId);
+      const target = rows.find((row) => row.id === targetId);
+      // A denied pair reads like a missing one so ids in other namespaces are not confirmed.
+      if (!source || !target || rows.some((row) => !access.allows("merge", namespaceOf(row)))) {
+        return { ok: false, message: "Both memories must exist." };
+      }
+      if (
+        source.record_revision !== request.sourceRevision ||
+        target.record_revision !== request.targetRevision
+      ) {
+        return {
+          ok: false,
+          conflict: true,
+          message: "A memory changed since you looked at it. Reload and check again.",
+        };
+      }
+      const mergeId = this.recordMerge(source, target, actor);
+      return { ok: true, mergeId, message: `Merged #${sourceId} into #${targetId}.` };
+    })();
+    if (result.ok) this.scheduleIndex();
+    return result;
+  }
+
+  private recordMerge(source: MemoryRow, target: MemoryRow, actor: string): number {
+    const ts = this.ts();
+    const merge = this.db
+      .query(
+        `INSERT INTO memory_merges (source_id, target_id, relation, actor, source_snapshot, target_snapshot, created_at)
+         VALUES (?, ?, 'duplicate_of', ?, ?, ?, ?)`,
+      )
+      .run(source.id, target.id, actor, JSON.stringify(source), JSON.stringify(target), ts);
     this.db
       .query(
         `UPDATE memories SET deleted_at = ?, merged_into = ?, record_revision = record_revision + 1 WHERE id = ?`,
       )
-      .run(this.ts(), targetId, sourceId);
-    dropVectors(this.db, sourceId);
-    return { ok: true, message: `Merged #${sourceId} into #${targetId}.` };
+      .run(ts, target.id, source.id);
+    dropVectors(this.db, source.id);
+    return Number(merge.lastInsertRowid);
+  }
+
+  /** Brings a merged memory back under its own id, with its history, and queues it for indexing again. */
+  undoMergeAuthorized(access: Access, mergeId: number): { ok: boolean; message: string } {
+    const merge = this.db
+      .query<{ source_id: number; target_id: number; undone_at: string | null }, [number]>(
+        `SELECT source_id, target_id, undone_at FROM memory_merges WHERE id = ?`,
+      )
+      .get(mergeId);
+    const source = merge ? this.removed(merge.source_id) : null;
+    const target = merge ? this.removed(merge.target_id) : null;
+    if (!merge || !source || !target || !access.allows("merge", namespaceOf(source))) {
+      return { ok: false, message: "That merge does not exist." };
+    }
+    if (merge.undone_at !== null || source.merged_into !== merge.target_id) {
+      return { ok: false, message: "That merge was already undone." };
+    }
+    if (!access.allows("merge", namespaceOf(target)))
+      return { ok: false, message: "That merge does not exist." };
+    const full = this.db
+      .query<MemoryRow, [number]>(`SELECT * FROM memories WHERE id = ?`)
+      .get(merge.source_id);
+    if (!full) return { ok: false, message: "That merge does not exist." };
+    const clash = full.topic_key !== null && this.topicHolder(full) !== null;
+    if (clash) return { ok: false, message: `Another memory now uses the topic key "${full.topic_key}".` };
+    this.db.transaction(() => {
+      this.snapshot(full);
+      this.db
+        .query(
+          `UPDATE memories SET deleted_at = NULL, merged_into = NULL, revision_count = revision_count + 1,
+           record_revision = record_revision + 1, index_generation = index_generation + 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(this.ts(), full.id);
+      this.db.query(`UPDATE memory_merges SET undone_at = ? WHERE id = ?`).run(this.ts(), mergeId);
+    })();
+    this.scheduleIndex();
+    return { ok: true, message: `Restored #${merge.source_id}.` };
+  }
+
+  private topicHolder(row: MemoryRow): number | null {
+    const holder = this.db
+      .query<{ id: number }, [string, string, string, number]>(
+        `SELECT id FROM memories WHERE scope = ? AND ifnull(project_key, '') = ? AND topic_key = ?
+         AND deleted_at IS NULL AND id != ?`,
+      )
+      .get(row.scope, row.project_key ?? "", row.topic_key ?? "", row.id);
+    return holder?.id ?? null;
+  }
+
+  private openMerge(sourceId: number): { id: number } | null {
+    return this.db
+      .query<{ id: number }, [number]>(
+        `SELECT id FROM memory_merges WHERE source_id = ? AND undone_at IS NULL ORDER BY id DESC LIMIT 1`,
+      )
+      .get(sourceId);
   }
 
   detailAuthorized(access: Access, id: number): MemoryDetail {
@@ -496,9 +657,11 @@ export class MemoryStore {
       )
       .all(id)
       .map((v) => ({ version: v.version, title: v.title, content: v.content, createdAt: v.created_at }));
+    const mergedInto = removed ? this.visibleMergeTarget(access, removed) : null;
     return {
       memory: row ? memoryDetail(row) : null,
-      mergedInto: removed ? this.visibleMergeTarget(access, removed) : null,
+      mergedInto,
+      mergeId: mergedInto === null ? null : (this.openMerge(id)?.id ?? null),
       archived: Boolean(removed?.archived_at),
       versions,
       duplicates: row ? this.similarTo(row, access) : [],
@@ -708,6 +871,8 @@ export class MemoryStore {
       )
       .get(draft.scope, draft.projectKey ?? "", draft.topicKey);
     if (!existing) return null;
+    // Saving the same text to a topic again is a duplicate, not a revision.
+    if (existing.content_hash === draft.hash && (!draft.input.pinned || existing.pinned === 1)) return null;
     this.snapshot(existing);
     const { input } = draft;
     this.db
@@ -764,7 +929,7 @@ export class MemoryStore {
     vector: Float32Array,
     partition: string,
     options: { excludeId?: number; access?: Access } = {},
-  ): { id: number; title: string; type: string; similarity: number }[] {
+  ): { id: number; title: string; type: string; similarity: number; revision: number }[] {
     if (!this.vectors) return [];
     const threshold = this.vectors.spec.duplicateThreshold;
     const near = this.vectors
@@ -775,7 +940,13 @@ export class MemoryStore {
       const row = rows.get(n.id);
       if (!row || (options.access && !options.access.allows("read", namespaceOf(row)))) return [];
       return [
-        { id: n.id, title: row.title, type: row.type, similarity: Math.round(n.similarity * 1000) / 1000 },
+        {
+          id: n.id,
+          title: row.title,
+          type: row.type,
+          similarity: Math.round(n.similarity * 1000) / 1000,
+          revision: row.record_revision,
+        },
       ];
     });
   }
@@ -785,7 +956,7 @@ export class MemoryStore {
     const vector = this.vectors?.vector(row.id, row.content_hash, row.index_generation);
     if (!vector) return [];
     return this.closeMatches(vector, partition, { excludeId: row.id, access }).map(
-      ({ id, title, similarity }) => ({ id, title, similarity }),
+      ({ id, title, similarity, revision }) => ({ id, title, similarity, revision }),
     );
   }
 
@@ -1273,5 +1444,6 @@ function memoryDetail(row: MemoryWithProject): NonNullable<MemoryDetail["memory"
     openedCount: row.opened_count,
     lastUsedAt: row.last_used_at,
     revisionCount: row.revision_count,
+    recordRevision: row.record_revision,
   };
 }

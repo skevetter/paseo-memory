@@ -95,4 +95,21 @@ export class Access {
   }
 }
 
-export type MutationOutcome = "ok" | "not_found" | "denied";
+// "unchanged" means the request was allowed but would not have altered the memory.
+export type MutationOutcome = "ok" | "unchanged" | "not_found" | "denied";
+
+// The revisions are the ones the caller looked at; the merge is refused if either memory changed since.
+export interface MergeRequest {
+  sourceId: number;
+  targetId: number;
+  sourceRevision: number;
+  targetRevision: number;
+}
+
+export interface MergeResult {
+  ok: boolean;
+  message: string;
+  mergeId?: number;
+  /** True when a memory changed after the caller read it; the merge was not applied. */
+  conflict?: boolean;
+}

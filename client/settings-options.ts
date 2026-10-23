@@ -37,7 +37,7 @@ export const DISPLAY_OPTIONS: Options<"reviewDisplay"> = [
 export const MERGE_OPTIONS: Options<"duplicateMerge"> = [
   { label: "Off", value: "off" },
   { label: "Suggest in the Review tab", value: "suggest" },
-  { label: "Merge automatically", value: "auto" },
+  { label: "Merge exact duplicates automatically", value: "auto" },
 ];
 
 export const RERANK_OPTIONS: Options<"rerank"> = [

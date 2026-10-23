@@ -15,7 +15,12 @@ export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  handler(args: Record<string, unknown>, caller: Caller): Promise<string> | string;
+  handler(args: Record<string, unknown>, caller: Caller, request: ToolRequest): Promise<string> | string;
+}
+
+/** Identifies one call so a retried request can be recognised; null for requests without an id. */
+export interface ToolRequest {
+  id: string | null;
 }
 
 export interface Caller {
@@ -125,7 +130,9 @@ async function callTool(tools: ToolDefinition[], message: JsonRpcRequest, caller
     return rpcError(id, -32602, "tool arguments must be a JSON object");
   }
   try {
-    const text = await tool.handler(args as Record<string, unknown>, caller);
+    const text = await tool.handler(args as Record<string, unknown>, caller, {
+      id: id === null ? null : String(id),
+    });
     return rpcResult(id, { content: [{ type: "text", text }], isError: false });
   } catch (error) {
     return rpcResult(id, toolFailure(error));

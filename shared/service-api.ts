@@ -165,7 +165,13 @@ export const serviceInputs = {
   delete: z.object({ id: z.number().int() }),
   detail: z.object({ id: z.number().int() }),
   restore: z.object({ id: z.number().int(), version: z.number().int() }),
-  merge: z.object({ sourceId: z.number().int(), targetId: z.number().int() }),
+  merge: z.object({
+    sourceId: z.number().int(),
+    targetId: z.number().int(),
+    sourceRevision: z.number().int(),
+    targetRevision: z.number().int(),
+  }),
+  "merge-undo": z.object({ mergeId: z.number().int() }),
   sessions: z.object({
     query: z.string(),
     paseoProjectId: z.string().nullable(),
@@ -216,14 +222,18 @@ export const MemoryDetailSchema = z.object({
       openedCount: z.number(),
       lastUsedAt: z.string().nullable(),
       revisionCount: z.number(),
+      recordRevision: z.number(),
     })
     .nullable(),
   mergedInto: z.number().nullable(),
+  mergeId: z.number().nullable(),
   archived: z.boolean(),
   versions: z.array(
     z.object({ version: z.number(), title: z.string(), content: z.string(), createdAt: z.string() }),
   ),
-  duplicates: z.array(z.object({ id: z.number(), title: z.string(), similarity: z.number() })),
+  duplicates: z.array(
+    z.object({ id: z.number(), title: z.string(), similarity: z.number(), revision: z.number() }),
+  ),
 });
 export type MemoryDetail = z.infer<typeof MemoryDetailSchema>;
 
@@ -314,6 +324,7 @@ const PairMemorySchema = z.object({
   preview: z.string(),
   updatedAt: z.string(),
   useCount: z.number(),
+  revision: z.number(),
 });
 
 export const UpkeepListSchema = z.object({
@@ -327,14 +338,17 @@ export const UpkeepListSchema = z.object({
       similarity: z.number().nullable(),
       sameTopic: z.boolean(),
       targetId: z.number(),
+      // The same text, namespace and authority: the only kind automatic merging may touch.
+      exact: z.boolean(),
     }),
   ),
-  contradictions: z.array(
+  conflicts: z.array(
     z.object({
       a: PairMemorySchema,
       b: PairMemorySchema,
       similarity: z.number().nullable(),
       sameTopic: z.boolean(),
+      reason: z.enum(["values", "negation"]),
       values: z.object({ a: z.array(z.string()), b: z.array(z.string()) }),
     }),
   ),
@@ -415,13 +429,14 @@ export interface ServiceOutputs {
   delete: { ok: boolean };
   detail: MemoryDetail;
   restore: { ok: boolean };
-  merge: { ok: boolean; message: string };
+  merge: { ok: boolean; message: string; mergeId: number | null; conflict: boolean };
+  "merge-undo": { ok: boolean; message: string };
   sessions: { items: SessionItem[] };
   "review-start": { ok: boolean; reason: string | null; cap: number };
   "review-end": { ok: boolean; saved: number[]; updated: number[]; summary: string | null };
   "review-skip": { ok: true };
   "upkeep-list": UpkeepList;
-  "upkeep-run": { merged: number; duplicates: number; contradictions: number; stale: number };
+  "upkeep-run": { merged: number; duplicates: number; conflicts: number; stale: number };
   keep: { ok: boolean };
   archive: { ok: boolean };
   "dismiss-pair": { ok: true };

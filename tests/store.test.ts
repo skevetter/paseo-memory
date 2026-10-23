@@ -11,7 +11,7 @@ import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
 import { DEFAULT_RUNTIME, EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
-import { dataRepo, hashEmbedder, hashSpec, otherRepo, owner, tempDir } from "./helpers";
+import { dataRepo, hashEmbedder, hashSpec, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
 
 let store: MemoryStore;
 beforeEach(() => {
@@ -726,10 +726,10 @@ describe("curation", () => {
     const source = (await store.save({ ...base, title: "Chose Postgres", content: "JSONB", force: true }))
       .id as number;
     expect(store.detailAuthorized(owner, source).duplicates).toEqual([
-      { id: target, title: "Picked Postgres", similarity: 1 },
+      { id: target, title: "Picked Postgres", similarity: 1, revision: 1 },
     ]);
-    expect(store.mergeAuthorized(owner, source, source).ok).toBe(false);
-    expect(store.mergeAuthorized(owner, source, target)).toEqual({
+    expect(store.mergeAuthorized(owner, mergeRequest(store, source, source)).ok).toBe(false);
+    expect(store.mergeAuthorized(owner, mergeRequest(store, source, target))).toMatchObject({
       ok: true,
       message: `Merged #${source} into #${target}.`,
     });

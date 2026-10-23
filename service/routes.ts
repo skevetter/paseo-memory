@@ -12,7 +12,7 @@ import { Access } from "./access";
 import { buildContext, buildSystemPrompt } from "./context";
 import { signCaller } from "./mcp";
 import { redact } from "./redact";
-import { finishReview, type ReviewWindows } from "./review";
+import { finishReview } from "./review";
 import { errorText } from "./sqlite";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
 import { findTaskMatches, type TaskMatches } from "./task";
@@ -24,7 +24,6 @@ const OWNER = Access.owner();
 
 export interface RouteContext {
   store: MemoryStore;
-  windows: ReviewWindows;
   secret: string;
   mcpUrl(): string;
   status(): ServiceStatus;
@@ -75,8 +74,20 @@ export function createRoutes(ctx: RouteContext): Routes {
     update: (input) => updateFromUi(store, input),
     delete: (input) => ({ ok: store.deleteAuthorized(OWNER, input.id) === "ok" }),
     detail: (input) => store.detailAuthorized(OWNER, input.id),
-    restore: (input) => ({ ok: store.restoreAuthorized(OWNER, input.id, input.version) === "ok" }),
-    merge: (input) => store.mergeAuthorized(OWNER, input.sourceId, input.targetId),
+    restore: (input) => {
+      const outcome = store.restoreAuthorized(OWNER, input.id, input.version);
+      return { ok: outcome === "ok" || outcome === "unchanged" };
+    },
+    merge: (input) => {
+      const result = store.mergeAuthorized(OWNER, input);
+      return {
+        ok: result.ok,
+        message: result.message,
+        mergeId: result.mergeId ?? null,
+        conflict: result.conflict ?? false,
+      };
+    },
+    "merge-undo": (input) => store.undoMergeAuthorized(OWNER, input.mergeId),
     sessions: (input) => {
       const projectKey = projectOf(input.paseoProjectId)?.key ?? null;
       return { items: store.sessions({ projectKey, query: input.query, limit: input.limit }).map(toSession) };
@@ -88,16 +99,16 @@ export function createRoutes(ctx: RouteContext): Routes {
 }
 
 function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-end" | "review-skip"> {
-  const { store, windows } = ctx;
+  const { store } = ctx;
   return {
     "review-start": (input) => {
       const cap = store.config.reviewMaxMemories;
       const nonce = store.audit.toolNonceFor(input.agentId);
       if (!nonce) return { ok: false, reason: "This agent has no memory tools.", cap };
-      windows.open({ agentId: input.agentId, nonce, trigger: input.trigger });
+      store.reviews.open({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
       return { ok: true, reason: null, cap };
     },
-    "review-end": (input) => finishReview(store, windows, input),
+    "review-end": (input) => finishReview(store, input),
     "review-skip": (input) => {
       store.audit.record(store.audit.nonceFor(input.agentId), {
         kind: "review",
@@ -213,7 +224,7 @@ function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): 
       scope: input.scope,
       project: known ?? input.project ?? null,
     });
-    const ok = outcome === "ok";
+    const ok = outcome === "ok" || outcome === "unchanged";
     return { ok, message: ok ? "Saved." : "This memory no longer exists." };
   } catch (error) {
     return { ok: false, message: errorText(error) };

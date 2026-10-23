@@ -127,8 +127,8 @@ export function SessionReviewSection({ values, save, theme }: SectionProps) {
         ) : null}
         <SettingsStepper
           setting="reviewMaxMemories"
-          label="Memories per review"
-          hint="The most memories one review can save or update."
+          label="Memory changes per review"
+          hint="The most changes one review can make. A new memory or an update counts as one; duplicates, updates that change nothing and failed calls do not. This limits memory changes, not tokens or cost."
           {...shared}
         />
         <SettingsSelect

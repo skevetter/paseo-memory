@@ -16,7 +16,14 @@ export class SchemaTooNewError extends FatalError {
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
   if (current > SCHEMA_VERSION) throw new SchemaTooNewError(current, SCHEMA_VERSION);
-  if (current === SCHEMA_VERSION) return;
+  if (current === SCHEMA_VERSION) {
+    const reviews = db.query(`SELECT name FROM sqlite_master WHERE name = 'review_windows'`).get();
+    if (!reviews) {
+      backupBeforeMigration(db, current);
+      db.transaction(() => db.run(REVIEW_SQL))();
+    }
+    return;
+  }
   if (current > 0) backupBeforeMigration(db, current);
   db.transaction(() => {
     if (current === 1) dropV1Vectors(db);
@@ -31,6 +38,7 @@ export function migrate(db: Database): void {
     addColumns(db, "memories", V6_MEMORY_COLUMNS);
     addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
     db.run(V6_SQL);
+    db.run(REVIEW_SQL);
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
@@ -60,6 +68,26 @@ const V6_EMBEDDING_COLUMNS: [string, string][] = [
 const V6_SQL = `
   UPDATE memories SET record_revision = revision_count;
   UPDATE memory_embeddings SET index_generation = 0, model_fingerprint = '';
+`;
+
+// M03 completes the additive v6 schema without resetting M02's generations on already-upgraded databases.
+const REVIEW_SQL = `
+  CREATE TABLE IF NOT EXISTS review_windows (
+    nonce TEXT PRIMARY KEY, window_id TEXT NOT NULL, agent_id TEXT NOT NULL, trigger TEXT NOT NULL, cap INTEGER NOT NULL,
+    max_attempts INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL, closed_at TEXT);
+  CREATE INDEX IF NOT EXISTS ix_review_windows_agent ON review_windows(agent_id, closed_at);
+  CREATE TABLE IF NOT EXISTS review_ops (
+    nonce TEXT NOT NULL, request_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('save', 'update', 'delete')),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'committed', 'completed', 'released')),
+    memory_id INTEGER, receipt TEXT, created_at TEXT NOT NULL, settled_at TEXT,
+    PRIMARY KEY (nonce, request_key));
+  CREATE TABLE IF NOT EXISTS memory_merges (
+    id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, relation TEXT NOT NULL,
+    actor TEXT NOT NULL, source_snapshot TEXT NOT NULL, target_snapshot TEXT NOT NULL,
+    created_at TEXT NOT NULL, undone_at TEXT);
+  CREATE INDEX IF NOT EXISTS ix_memory_merges_source ON memory_merges(source_id, undone_at);
 `;
 
 const V3_MEMORY_COLUMNS: [string, string][] = [

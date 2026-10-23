@@ -2,17 +2,17 @@ import { z } from "zod";
 import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
 import { Access } from "./access";
 import { buildContext } from "./context";
-import { type Caller, type ToolDefinition, ToolError } from "./mcp";
-import type { ReviewWindows } from "./review";
+import { type Caller, type ToolDefinition, ToolError, type ToolRequest } from "./mcp";
+import { type Reservation, ReviewLimitError, type ReviewOpKind } from "./review-ledger";
+import { formatSave } from "./save-receipt";
 import {
   ContentTooLongError,
   type MemoryStore,
   type ProjectRef,
   type SaveInput,
-  type SaveResult,
   type SearchHit,
 } from "./store";
-import { age } from "./text";
+import { age, sha256 } from "./text";
 
 export const MCP_INSTRUCTIONS = [
   "paseo-memory: durable memory shared by every Paseo agent on this host.",
@@ -27,7 +27,6 @@ export const MCP_INSTRUCTIONS = [
 
 export interface ToolContext {
   store: MemoryStore;
-  windows: ReviewWindows;
   resolveProject(caller: Caller): ProjectRef | null;
 }
 
@@ -84,7 +83,7 @@ interface ToolSpec<S extends z.ZodType> {
   name: string;
   description: string;
   schema: S;
-  run(args: z.output<S>, caller: Caller, access: Access): Promise<string> | string;
+  run(args: z.output<S>, caller: Caller, access: Access, request: ToolRequest): Promise<string> | string;
 }
 
 // Arguments are parsed before any handler logic runs, so a malformed call can never reach the store.
@@ -94,24 +93,36 @@ function defineTool<S extends z.ZodType>(ctx: ToolContext, spec: ToolSpec<S>): T
     name: spec.name,
     description: spec.description,
     inputSchema,
-    async handler(raw, caller) {
-      const parsed = spec.schema.safeParse(raw);
-      if (!parsed.success) {
-        ctx.store.audit.record(caller.nonce, {
-          kind: "invalid",
-          tool: spec.name,
-          fields: parsed.error.issues.flatMap(issueFields),
-        });
-        throw new ToolError("invalid_input", describeIssues(parsed.error));
-      }
+    async handler(raw, caller, request) {
       try {
-        return await spec.run(parsed.data, caller, Access.agent(caller.projectKey));
+        const args = parseArguments(ctx, spec, raw, caller);
+        return await spec.run(args, caller, Access.agent(caller.projectKey), request);
       } catch (error) {
         if (error instanceof ContentTooLongError) throw new ToolError("content_too_long", error.message);
+        if (error instanceof ReviewLimitError) throw new ToolError(error.code, error.message);
         throw error;
       }
     },
   };
+}
+
+function parseArguments<S extends z.ZodType>(
+  ctx: ToolContext,
+  spec: ToolSpec<S>,
+  raw: unknown,
+  caller: Caller,
+): z.output<S> {
+  const parsed = spec.schema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  ctx.store.audit.record(caller.nonce, {
+    kind: "invalid",
+    tool: spec.name,
+    fields: parsed.error.issues.flatMap(issueFields),
+  });
+  if (spec.name === "memory_save" || spec.name === "memory_update" || spec.name === "memory_delete") {
+    ctx.store.reviews.rejectAttempt(caller.nonce);
+  }
+  throw new ToolError("invalid_input", describeIssues(parsed.error));
 }
 
 function issueFields(issue: z.core.$ZodIssue): string[] {
@@ -133,6 +144,76 @@ function recordDenied(
 ): void {
   if (denial.ids.length === 0) return;
   ctx.store.audit.record(caller.nonce, { kind: "denied", ...denial });
+}
+
+class MutationGate {
+  private readonly pending = new Map<string, Promise<string>>();
+  private readonly store: MemoryStore;
+
+  constructor(store: MemoryStore) {
+    this.store = store;
+  }
+
+  /**
+   * Runs a memory change under the review cap. Outside a review the change just runs. Inside one it needs a
+   * reservation, and a repeat of the same request returns the first answer instead of changing memory again.
+   */
+  async run(
+    caller: Caller,
+    request: ToolRequest,
+    change: { kind: ReviewOpKind; tool: string; args: unknown },
+    work: (reservation: Reservation | undefined) => Promise<string> | string,
+  ): Promise<string> {
+    const key = sha256(
+      JSON.stringify(request.id === null ? [change.tool, change.args] : ["request", request.id]),
+    );
+    const admission = this.store.reviews.admit(caller.nonce, key, change.kind);
+    if (admission.kind === "unrestricted") return work(undefined);
+    if (admission.kind === "replay") {
+      if (admission.receipt === null)
+        throw new ToolError("missing_receipt", "The completed request has no receipt.");
+      return admission.receipt;
+    }
+    const windowId = admission.kind === "in_flight" ? admission.windowId : admission.reservation.windowId;
+    const flightKey = `${caller.nonce}:${windowId}:${key}`;
+    if (admission.kind === "in_flight") {
+      const flight = this.pending.get(flightKey);
+      if (flight) return flight;
+      throw new ToolError("request_in_flight", "This request is already running. Wait for its answer.");
+    }
+    const { reservation } = admission;
+    const flight = this.finish(reservation, work);
+    this.pending.set(flightKey, flight);
+    try {
+      return await flight;
+    } finally {
+      this.pending.delete(flightKey);
+    }
+  }
+
+  private async finish(
+    reservation: Reservation,
+    work: (reservation: Reservation) => Promise<string> | string,
+  ): Promise<string> {
+    try {
+      const receipt = await work(reservation);
+      this.store.reviews.attachReceipt(reservation, receipt);
+      return receipt;
+    } finally {
+      // A no-op when the store already settled the reservation in its own transaction.
+      this.store.reviews.release(reservation);
+    }
+  }
+}
+
+const gates = new WeakMap<MemoryStore, MutationGate>();
+
+function gateFor(store: MemoryStore): MutationGate {
+  const existing = gates.get(store);
+  if (existing) return existing;
+  const created = new MutationGate(store);
+  gates.set(store, created);
+  return created;
 }
 
 export function createTools(ctx: ToolContext): ToolDefinition[] {
@@ -224,25 +305,30 @@ function saveTool(ctx: ToolContext): ToolDefinition {
       "existing entry for the same topic. A near-identical memory of the same type is not saved again: the " +
       "result names it so you can call memory_update instead.",
     schema: saveInput,
-    async run(args, caller) {
-      const project = ctx.resolveProject(caller);
-      const scope = args.scope === "global" ? "global" : "project";
-      if (scope === "project" && !project) {
-        return "This agent is not attached to a Paseo project, so project memory is unavailable. Use scope=global or skip.";
-      }
-      ctx.windows.checkSave(caller.nonce);
-      const result = await ctx.store.save(toSaveInput(args, { scope, project, caller }));
-      ctx.windows.countSave(caller.nonce, result.status);
-      const candidates = result.status === "possible_duplicate" ? result.candidates.map((c) => c.id) : [];
-      ctx.store.audit.record(caller.nonce, {
-        kind: "save",
-        id: result.id,
-        status: result.status,
-        candidates,
-      });
-      return formatSave(result, scope === "project" ? project : null);
+    run(args, caller, _access, request) {
+      const change = { kind: "save", tool: "memory_save", args } as const;
+      return gateFor(ctx.store).run(caller, request, change, (reservation) =>
+        performSave(ctx, args, caller, reservation),
+      );
     },
   });
+}
+
+async function performSave(
+  ctx: ToolContext,
+  args: z.output<typeof saveInput>,
+  caller: Caller,
+  reservation: Reservation | undefined,
+): Promise<string> {
+  const project = ctx.resolveProject(caller);
+  const scope = args.scope === "global" ? "global" : "project";
+  if (scope === "project" && !project) {
+    return "This agent is not attached to a Paseo project, so project memory is unavailable. Use scope=global or skip.";
+  }
+  const result = await ctx.store.save(toSaveInput(args, { scope, project, caller }), reservation);
+  const candidates = result.status === "possible_duplicate" ? result.candidates.map((c) => c.id) : [];
+  ctx.store.audit.record(caller.nonce, { kind: "save", id: result.id, status: result.status, candidates });
+  return formatSave(result, scope === "project" ? project : null);
 }
 
 function toSaveInput(
@@ -264,22 +350,6 @@ function toSaveInput(
   };
 }
 
-function formatSave(result: SaveResult, project: ProjectRef | null): string {
-  if (result.status === "near_duplicate") {
-    return (
-      `near_duplicate: not saved. #${result.id} "${result.title}" already says this (similarity ${result.similarity}). ` +
-      `Call memory_update with id ${result.id} to change it.`
-    );
-  }
-  if (result.status === "possible_duplicate") {
-    const candidates = result.candidates
-      .map((c) => `#${c.id} ${c.title} (similarity ${c.similarity})`)
-      .join("\n");
-    return `possible_duplicate: not saved. Similar memories:\n${candidates}\nUpdate one with memory_update, or retry with force=true.`;
-  }
-  return `${result.status}: #${result.id} (${project ? `project: ${project.name}` : "global"})`;
-}
-
 function updateTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_update",
@@ -287,19 +357,36 @@ function updateTool(ctx: ToolContext): ToolDefinition {
       "Update a memory by id (title, content, type, pinned, topic_key). Prior text is kept as a version. " +
       `Content over ${MAX_CONTENT_CHARS} characters is rejected.`,
     schema: updateInput,
-    run(args, caller, access) {
+    run(args, caller, access, request) {
       const { id } = args;
-      const outcome = ctx.store.updateAuthorized(access, id, {
+      const patch = {
         title: args.title,
         content: args.content,
         type: args.type,
         pinned: args.pinned,
         topicKey: args.topic_key,
-      });
-      if (outcome === "denied")
-        recordDenied(ctx, caller, { tool: "memory_update", operation: "write", ids: [id] });
-      else ctx.store.audit.record(caller.nonce, { kind: "update", id, ok: outcome === "ok" });
-      return outcome === "ok" ? `updated: #${id}` : `not found: #${id}`;
+      };
+      return gateFor(ctx.store).run(
+        caller,
+        request,
+        { kind: "update", tool: "memory_update", args },
+        (reservation) => {
+          const outcome = ctx.store.updateAuthorized(access, id, patch, reservation);
+          if (outcome === "denied") {
+            recordDenied(ctx, caller, { tool: "memory_update", operation: "write", ids: [id] });
+          } else {
+            const ok = outcome === "ok" || outcome === "unchanged";
+            ctx.store.audit.record(caller.nonce, {
+              kind: "update",
+              id,
+              ok,
+              unchanged: outcome === "unchanged",
+            });
+          }
+          if (outcome === "unchanged") return `unchanged: #${id} already says this`;
+          return outcome === "ok" ? `updated: #${id}` : `not found: #${id}`;
+        },
+      );
     },
   });
 }
@@ -309,12 +396,19 @@ function deleteTool(ctx: ToolContext): ToolDefinition {
     name: "memory_delete",
     description: "Delete a memory that is wrong or obsolete (soft delete).",
     schema: deleteInput,
-    run({ id }, caller, access) {
-      const outcome = ctx.store.deleteAuthorized(access, id);
-      if (outcome === "denied")
-        recordDenied(ctx, caller, { tool: "memory_delete", operation: "delete", ids: [id] });
-      else ctx.store.audit.record(caller.nonce, { kind: "delete", id, ok: outcome === "ok" });
-      return outcome === "ok" ? `deleted: #${id}` : `not found: #${id}`;
+    run({ id }, caller, access, request) {
+      return gateFor(ctx.store).run(
+        caller,
+        request,
+        { kind: "delete", tool: "memory_delete", args: { id } },
+        (reservation) => {
+          const outcome = ctx.store.deleteAuthorized(access, id, false, reservation);
+          if (outcome === "denied")
+            recordDenied(ctx, caller, { tool: "memory_delete", operation: "delete", ids: [id] });
+          else ctx.store.audit.record(caller.nonce, { kind: "delete", id, ok: outcome === "ok" });
+          return outcome === "ok" ? `deleted: #${id}` : `not found: #${id}`;
+        },
+      );
     },
   });
 }

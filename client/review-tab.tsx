@@ -16,7 +16,13 @@ import { formatDateTime, plural, QUERY_ROOT, type Styles, useRefresh } from "./p
 import { Chip, Link, QueryState } from "./panel-ui";
 
 type Duplicate = UpkeepList["duplicates"][number];
-type Contradiction = UpkeepList["contradictions"][number];
+type Conflict = UpkeepList["conflicts"][number];
+interface MergeInput {
+  sourceId: number;
+  targetId: number;
+  sourceRevision: number;
+  targetRevision: number;
+}
 type PairMemory = Duplicate["a"];
 type Action = UseMutationResult<unknown, Error, () => Promise<unknown>>;
 
@@ -53,7 +59,7 @@ export function ReviewTab({ projectId, onOpenMemory, s }: ReviewTabProps) {
       {list ? (
         <>
           <DuplicateSection list={list} action={action} onOpenMemory={onOpenMemory} s={s} />
-          <ContradictionSection list={list} action={action} onOpenMemory={onOpenMemory} s={s} />
+          <ConflictSection list={list} action={action} onOpenMemory={onOpenMemory} s={s} />
           <StaleSection list={list} action={action} onOpenMemory={onOpenMemory} s={s} />
         </>
       ) : null}
@@ -74,7 +80,7 @@ function CheckNow({ lastRunAt, s }: { lastRunAt: string | null; s: Styles }) {
           active
           disabled={check.isPending}
           onPress={() => check.mutate()}
-          accessibilityLabel="Check memories for duplicates, contradictions and stale entries"
+          accessibilityLabel="Check memories for duplicates, possible conflicts and stale entries"
           s={s}
         />
         <Text style={s.muted}>
@@ -84,7 +90,7 @@ function CheckNow({ lastRunAt, s }: { lastRunAt: string | null; s: Styles }) {
       {found ? (
         <Text style={s.muted}>
           Merged {found.merged}. Found {plural(found.duplicates, "possible duplicate", "possible duplicates")}
-          , {plural(found.contradictions, "contradiction", "contradictions")} and{" "}
+          , {plural(found.conflicts, "possible conflict", "possible conflicts")} and{" "}
           {plural(found.stale, "stale memory", "stale memories")}.
         </Text>
       ) : null}
@@ -123,6 +129,14 @@ function pairMeta(pair: Pick<Duplicate, "similarity" | "sameTopic">): string {
   return parts.join(" · ");
 }
 
+async function mergeOrFail(
+  merge: (input: MergeInput) => Promise<{ ok: boolean; message: string }>,
+  input: MergeInput,
+): Promise<void> {
+  const result = await merge(input);
+  if (!result.ok) throw new Error(result.message);
+}
+
 function DuplicateSection({ list, action, onOpenMemory, s }: SectionProps) {
   const dismiss = useRpc(dismissPairRpc);
   const merge = useRpc(mergeMemoryRpc);
@@ -136,17 +150,25 @@ function DuplicateSection({ list, action, onOpenMemory, s }: SectionProps) {
         <Text style={s.muted}>No possible duplicates.</Text>
       ) : null}
       {list.duplicates.map((pair) => {
-        const sourceId = pair.targetId === pair.a.id ? pair.b.id : pair.a.id;
+        const [source, target] = pair.targetId === pair.a.id ? [pair.b, pair.a] : [pair.a, pair.b];
+        const expected = { sourceRevision: source.revision, targetRevision: target.revision };
         return (
           <View key={`${pair.a.id}:${pair.b.id}`} style={s.card}>
             <PairTitles a={pair.a} b={pair.b} onOpenMemory={onOpenMemory} s={s} />
-            <Text style={s.muted}>{pairMeta(pair)}</Text>
+            <Text style={s.muted}>
+              {[pair.exact ? "same text" : "similar text", pairMeta(pair)].filter(Boolean).join(" · ")}
+            </Text>
             <View style={s.row}>
               <Link
-                label={`Merge into #${pair.targetId}`}
+                label={`Merge into #${target.id}`}
                 disabled={action.isPending}
-                onPress={() => action.mutate(() => merge({ sourceId, targetId: pair.targetId }))}
-                accessibilityLabel={`Merge memory ${sourceId} into memory ${pair.targetId}`}
+                onPress={() =>
+                  action.mutate(async () => {
+                    await mergeOrFail(merge, { sourceId: source.id, targetId: target.id, ...expected });
+                    onOpenMemory(source.id);
+                  })
+                }
+                accessibilityLabel={`Merge memory ${source.id} into memory ${target.id}`}
                 s={s}
               />
               <Link
@@ -164,17 +186,20 @@ function DuplicateSection({ list, action, onOpenMemory, s }: SectionProps) {
   );
 }
 
-function ContradictionSection({ list, action, onOpenMemory, s }: SectionProps) {
+function ConflictSection({ list, action, onOpenMemory, s }: SectionProps) {
   const dismiss = useRpc(dismissPairRpc);
   return (
     <View style={s.section}>
-      <Text style={s.heading}>Possible contradictions</Text>
-      <Text style={s.muted}>These memories disagree on a value. They are never merged automatically.</Text>
-      {list.contradictions.length === 0 ? <Text style={s.muted}>No possible contradictions.</Text> : null}
-      {list.contradictions.map((pair) => (
+      <Text style={s.heading}>Possible conflicts</Text>
+      <Text style={s.muted}>
+        These memories may disagree. The check compares numbers, quoted values and negation words, so it can
+        be wrong. They are never merged automatically.
+      </Text>
+      {list.conflicts.length === 0 ? <Text style={s.muted}>No possible conflicts.</Text> : null}
+      {list.conflicts.map((pair) => (
         <View key={`${pair.a.id}:${pair.b.id}`} style={s.card}>
           <PairTitles a={pair.a} b={pair.b} onOpenMemory={onOpenMemory} s={s} />
-          <ContradictionValues pair={pair} s={s} />
+          <ConflictValues pair={pair} s={s} />
           <Link
             label="Keep both"
             disabled={action.isPending}
@@ -188,16 +213,22 @@ function ContradictionSection({ list, action, onOpenMemory, s }: SectionProps) {
   );
 }
 
-function ContradictionValues({ pair, s }: { pair: Contradiction; s: Styles }) {
+function ConflictValues({ pair, s }: { pair: Conflict; s: Styles }) {
   const meta = pairMeta(pair);
   return (
     <>
-      <Text style={s.text}>
-        #{pair.a.id} says {pair.values.a.join(", ")}
-      </Text>
-      <Text style={s.text}>
-        #{pair.b.id} says {pair.values.b.join(", ")}
-      </Text>
+      {pair.reason === "values" ? (
+        <>
+          <Text style={s.text}>
+            #{pair.a.id} says {pair.values.a.join(", ")}
+          </Text>
+          <Text style={s.text}>
+            #{pair.b.id} says {pair.values.b.join(", ")}
+          </Text>
+        </>
+      ) : (
+        <Text style={s.text}>One of them may say the opposite of the other.</Text>
+      )}
       {meta ? <Text style={s.muted}>{meta}</Text> : null}
     </>
   );
