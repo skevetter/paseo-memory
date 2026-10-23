@@ -11,10 +11,12 @@ import {
 import type { Access, MutationOutcome, Namespace, Scope, SqlFilter } from "./access";
 import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
+import { type IndexHealth, IndexRetry, type IndexRetryOptions } from "./index-retry";
 import { redact } from "./redact";
 import { RERANK_CANDIDATES, type Reranker } from "./reranker";
 import { migrate } from "./schema";
 import {
+  currentSessionHits,
   listSessions,
   recordTurn,
   type SessionHit,
@@ -26,9 +28,17 @@ import {
 } from "./sessions";
 import { errorText, openDatabase } from "./sqlite";
 import { clip, ftsQuery, RRF_K, sha256 } from "./text";
-import { dropVectors, type Neighbor, scopeKey, VectorIndex, type VectorTarget, vecTables } from "./vectors";
+import {
+  dropVectors,
+  type Neighbor,
+  STALE_VECTOR_SQL,
+  scopeKey,
+  VectorIndex,
+  type VectorTarget,
+  vecTables,
+} from "./vectors";
 
-export type { ProjectRef, Scope, SearchScope, SessionRow };
+export type { IndexHealth, ProjectRef, Scope, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
 
 const USED_TOP_N = 5;
@@ -85,6 +95,8 @@ export interface MemoryRow {
   archived_at: string | null;
   merged_into: number | null;
   deleted_at: string | null;
+  index_generation: number;
+  record_revision: number;
 }
 
 export type MemoryWithProject = MemoryRow & { project_name: string | null };
@@ -144,6 +156,8 @@ export interface SearchInput {
   limit?: number;
   includeSessions?: boolean;
   track?: boolean;
+  /** Late results are dropped once this aborts; backends that cannot cancel finish on their own. */
+  signal?: AbortSignal;
 }
 
 export interface MemoryPatch {
@@ -167,6 +181,7 @@ export interface StoreOptions {
   sqlitePath?: string | null;
   now?: () => Date;
   log?: Logger;
+  indexRetry?: IndexRetryOptions;
 }
 
 interface SaveDraft {
@@ -180,7 +195,10 @@ interface SaveDraft {
   vector: Float32Array | null;
 }
 
-type IndexRow = Pick<MemoryRow, "id" | "title" | "content" | "scope" | "project_key" | "content_hash">;
+type IndexRow = Pick<
+  MemoryRow,
+  "id" | "title" | "content" | "scope" | "project_key" | "content_hash" | "index_generation"
+>;
 type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "merged_into" | "archived_at">;
 
 const HIDDEN_DETAIL: MemoryDetail = {
@@ -208,6 +226,7 @@ export class MemoryStore {
   private reranker: Reranker | null = null;
   private indexing: Promise<void> | null = null;
   private indexAgain = false;
+  private readonly retry: IndexRetry;
   private closed = false;
   config: RuntimeConfig = DEFAULT_RUNTIME;
 
@@ -215,6 +234,7 @@ export class MemoryStore {
     this.path = options.path;
     this.now = options.now ?? (() => new Date());
     this.log = options.log ?? silentLogger;
+    this.retry = new IndexRetry(options.indexRetry);
     const opened = openDatabase(options.path, options.sqlitePath ?? null);
     this.db = opened.db;
     this.sqliteLibrary = opened.sqliteLibrary;
@@ -236,6 +256,7 @@ export class MemoryStore {
   setEmbedder(embedder: Embedder | null): void {
     this.embedder = embedder;
     this.vectors = embedder ? new VectorIndex(this.db, embedder.spec, () => this.ts()) : null;
+    this.retry.clear();
     if (!embedder) return;
     this.setMeta("embedding_model", embedder.spec.model);
     this.setMeta("embedding_dims", String(embedder.spec.dims));
@@ -354,7 +375,11 @@ export class MemoryStore {
     if (!existing) return "not_found";
     if (!access.allows("delete", namespaceOf(existing))) return "denied";
     const ts = this.ts();
-    this.db.query(`UPDATE memories SET deleted_at = ?, archived_at = ? WHERE id = ?`).run(ts, ts, id);
+    this.db
+      .query(
+        `UPDATE memories SET deleted_at = ?, archived_at = ?, record_revision = record_revision + 1 WHERE id = ?`,
+      )
+      .run(ts, ts, id);
     dropVectors(this.db, id);
     return "ok";
   }
@@ -386,13 +411,14 @@ export class MemoryStore {
       throw new ContentTooLongError(patch.content.length);
     }
     const next = patched(existing, patch);
-    const textChanged = next.title !== existing.title || next.content !== existing.content;
+    const { textChanged, reindex, changed } = classifyChange(existing, next);
     if (textChanged) this.snapshot(existing);
     if (next.project) this.upsertProject(next.project);
     this.db
       .query(
         `UPDATE memories SET title = ?, content = ?, type = ?, pinned = ?, topic_key = ?, content_hash = ?,
-         scope = ?, project_key = ?, revision_count = revision_count + ?, updated_at = ? WHERE id = ?`,
+         scope = ?, project_key = ?, revision_count = revision_count + ?, record_revision = record_revision + ?,
+         index_generation = index_generation + ?, updated_at = ? WHERE id = ?`,
       )
       .run(
         next.title,
@@ -404,10 +430,12 @@ export class MemoryStore {
         next.scope,
         next.projectKey,
         textChanged ? 1 : 0,
+        changed ? 1 : 0,
+        reindex ? 1 : 0,
         this.ts(),
         existing.id,
       );
-    if (next.hash !== existing.content_hash || next.projectKey !== existing.project_key) {
+    if (reindex) {
       dropVectors(this.db, existing.id);
       this.scheduleIndex();
     }
@@ -418,7 +446,11 @@ export class MemoryStore {
     if (!existing) return "not_found";
     if (!access.allows("delete", namespaceOf(existing))) return "denied";
     if (hard) this.db.query(`DELETE FROM memories WHERE id = ?`).run(id);
-    else this.db.query(`UPDATE memories SET deleted_at = ? WHERE id = ?`).run(this.ts(), id);
+    else {
+      this.db
+        .query(`UPDATE memories SET deleted_at = ?, record_revision = record_revision + 1 WHERE id = ?`)
+        .run(this.ts(), id);
+    }
     dropVectors(this.db, id);
     return "ok";
   }
@@ -445,7 +477,9 @@ export class MemoryStore {
       return { ok: false, message: "Both memories must exist." };
     }
     this.db
-      .query(`UPDATE memories SET deleted_at = ?, merged_into = ? WHERE id = ?`)
+      .query(
+        `UPDATE memories SET deleted_at = ?, merged_into = ?, record_revision = record_revision + 1 WHERE id = ?`,
+      )
       .run(this.ts(), targetId, sourceId);
     dropVectors(this.db, sourceId);
     return { ok: true, message: `Merged #${sourceId} into #${targetId}.` };
@@ -495,18 +529,36 @@ export class MemoryStore {
   }
 
   async search(input: SearchInput): Promise<SearchHit[]> {
+    const { signal } = input;
+    if (signal?.aborted) return [];
     const scope = input.scope ?? "all";
     const limit = input.limit ?? 8;
     const query = input.query.trim();
     if (!query) return this.list({ access: input.access, scope, limit });
-    const queryVector = await this.embedOne(query, "query");
-    if (this.closed) return [];
+    const queryVector = await raceAbort(this.embedOne(query, "query"), signal);
+    if (queryVector === ABORTED || this.closed) return [];
 
-    const filter = input.access.memoryFilter(scope, input.type);
+    const candidates = this.candidates({ ...input, scope, limit, query }, queryVector);
+    const ranked = await raceAbort(this.rerank(query, candidates, limit), signal);
+    if (ranked === ABORTED || this.closed) return [];
+    // Re-ranking is asynchronous, so rows may have moved, changed or vanished since the candidates were read.
+    const hits = this.currentHits(ranked, { access: input.access, scope, type: input.type });
+    if (input.track) {
+      this.markShown(hits.slice(0, USED_TOP_N).flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
+    }
+    return hits;
+  }
+
+  private candidates(
+    input: SearchInput & { scope: SearchScope; limit: number },
+    queryVector: Float32Array | null,
+  ): Candidate[] {
+    const { query, access, scope } = input;
+    const filter = access.memoryFilter(scope, input.type);
     const ranks = new Map<number, number>();
     addRanks(ranks, this.keywordIds(query, filter));
     if (query.length < 3 || ranks.size === 0) addRanks(ranks, this.likeIds(query, filter));
-    const near = queryVector ? this.vectorNeighbors(queryVector, { ...input, scope }) : [];
+    const near = queryVector ? this.vectorNeighbors(queryVector, input) : [];
     addRanks(
       ranks,
       near.map((n) => n.id),
@@ -514,14 +566,42 @@ export class MemoryStore {
 
     const candidates = this.boostedHits(ranks, new Map(near.map((n) => [n.id, n.similarity])));
     if (input.includeSessions) {
-      const sessions = searchSessions(this.db, { query, access: input.access, scope, limit });
+      const sessions = searchSessions(this.db, { query, access, scope, limit: input.limit });
       candidates.push(...sessions.map((hit) => ({ hit, text: `${hit.title}\n${hit.preview}`, weight: 0.9 })));
     }
-    const hits = await this.rerank(query, candidates, limit);
-    if (input.track && !this.closed) {
-      this.markShown(hits.slice(0, USED_TOP_N).flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
-    }
-    return hits;
+    return candidates;
+  }
+
+  private currentHits(
+    hits: SearchHit[],
+    input: { access: Access; scope: SearchScope; type?: string },
+  ): SearchHit[] {
+    const filter = input.access.memoryFilter(input.scope, input.type);
+    const memoryIds = hits.flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : []));
+    const memories = new Map(
+      memoryIds.length === 0
+        ? []
+        : this.db
+            .prepare<MemoryWithProject, (string | number)[]>(
+              `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
+               WHERE ${filter.where} AND m.id IN (${memoryIds.map(() => "?").join(",")})`,
+            )
+            .all(...filter.params, ...memoryIds)
+            .map((row) => [row.id, row]),
+    );
+    const sessionIds = hits.flatMap((h) => (h.kind === "session" ? [h.id] : []));
+    const sessions = currentSessionHits(this.db, input.access.sessionFilter(input.scope), sessionIds);
+    return hits.flatMap((hit): SearchHit[] => {
+      if (hit.kind === "session") {
+        const fresh = sessions.get(hit.id);
+        return fresh ? [{ ...fresh, score: hit.score }] : [];
+      }
+      const row = memories.get(Number(hit.id));
+      if (!row) return [];
+      return [
+        { ...memoryHit(row, { score: hit.score, similarity: hit.similarity }), relevance: hit.relevance },
+      ];
+    });
   }
 
   recordTurn(input: TurnInput): boolean {
@@ -571,15 +651,25 @@ export class MemoryStore {
   }
 
   pendingEmbeddings(): number {
-    if (!this.embedder) return 0;
+    const vectors = this.vectors;
+    if (!vectors) return 0;
     const row = this.db
-      .query<{ n: number }, [string]>(
+      .query<{ n: number }, [string, string]>(
         `SELECT count(*) AS n FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-         WHERE m.deleted_at IS NULL AND (e.memory_id IS NULL OR e.content_hash != m.content_hash)`,
+         WHERE m.deleted_at IS NULL AND ${STALE_VECTOR_SQL}`,
       )
-      .get(this.embedder.spec.model);
+      .get(vectors.spec.model, vectors.fingerprint);
     return row?.n ?? 0;
+  }
+
+  /** Pending work plus whether embedding is failing; exposed in the service status so a stuck index is visible. */
+  indexHealth(): IndexHealth {
+    const generationOf = this.db.query<{ index_generation: number }, [number]>(
+      `SELECT index_generation FROM memories WHERE id = ? AND deleted_at IS NULL`,
+    );
+    const summary = this.retry.summary((id) => generationOf.get(id)?.index_generation ?? null);
+    return { pending: this.pendingEmbeddings(), ...summary, degraded: summary.retrying + summary.failed > 0 };
   }
 
   embeddingModels(): { model: string; dims: number; count: number }[] {
@@ -623,7 +713,8 @@ export class MemoryStore {
     this.db
       .query(
         `UPDATE memories SET title = ?, content = ?, type = ?, content_hash = ?, pinned = max(pinned, ?),
-         revision_count = revision_count + 1, updated_at = ?, agent_id = coalesce(?, agent_id),
+         revision_count = revision_count + 1, record_revision = record_revision + 1,
+         index_generation = index_generation + 1, updated_at = ?, agent_id = coalesce(?, agent_id),
          provider = coalesce(?, provider), workspace_dir = coalesce(?, workspace_dir) WHERE id = ?`,
       )
       .run(
@@ -638,7 +729,7 @@ export class MemoryStore {
         input.workspaceDir ?? null,
         existing.id,
       );
-    this.storeVector(this.target(existing.id, draft), draft.vector);
+    this.storeVector(this.target(existing.id, draft, existing.index_generation + 1), draft.vector);
     return { status: "updated", id: existing.id };
   }
 
@@ -691,7 +782,7 @@ export class MemoryStore {
 
   private similarTo(row: MemoryRow, access: Access): MemoryDetail["duplicates"] {
     const partition = scopeKey(row.scope, row.project_key);
-    const vector = this.vectors?.vector(row.id, row.content_hash);
+    const vector = this.vectors?.vector(row.id, row.content_hash, row.index_generation);
     if (!vector) return [];
     return this.closeMatches(vector, partition, { excludeId: row.id, access }).map(
       ({ id, title, similarity }) => ({ id, title, similarity }),
@@ -709,7 +800,7 @@ export class MemoryStore {
   }
 
   nearDuplicatesOf(row: MemoryRow): Neighbor[] {
-    const vector = this.vectors?.vector(row.id, row.content_hash);
+    const vector = this.vectors?.vector(row.id, row.content_hash, row.index_generation);
     if (!vector || !this.vectors) return [];
     const threshold = this.vectors.spec.duplicateThreshold;
     return this.vectors
@@ -763,12 +854,12 @@ export class MemoryStore {
         ts,
       );
     const id = Number(result.lastInsertRowid);
-    this.storeVector(this.target(id, draft), draft.vector);
+    this.storeVector(this.target(id, draft, 1), draft.vector);
     return { status: "created", id };
   }
 
-  private target(id: number, draft: SaveDraft): VectorTarget {
-    return { id, partition: scopeKey(draft.scope, draft.projectKey), hash: draft.hash };
+  private target(id: number, draft: SaveDraft, generation: number): VectorTarget {
+    return { id, partition: scopeKey(draft.scope, draft.projectKey), hash: draft.hash, generation };
   }
 
   private storeVector(target: VectorTarget, vector: Float32Array | null): void {
@@ -856,19 +947,24 @@ export class MemoryStore {
       .map((r) => r.project_key);
   }
 
-  // The vector table's partition is metadata that can lag behind the row, so every neighbor is re-checked here.
+  // The vector table's partition can lag behind the row, so a neighbor counts only when its stored vector was
+  // written for the row's current generation, text and model, and the row is still inside the caller's grant.
   private liveNeighbors(
     near: Neighbor[],
     input: { access: Access; scope: SearchScope; type?: string },
   ): Neighbor[] {
-    if (near.length === 0) return near;
+    const vectors = this.vectors;
+    if (near.length === 0 || !vectors) return near;
     const filter = input.access.memoryFilter(input.scope, input.type);
     const live = new Set(
       this.db
         .prepare<{ id: number }, (string | number)[]>(
-          `SELECT m.id FROM memories m WHERE ${filter.where} AND m.id IN (${near.map(() => "?").join(",")})`,
+          `SELECT m.id FROM memories m
+           JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ? AND e.model_fingerprint = ?
+             AND e.index_generation = m.index_generation AND e.content_hash = m.content_hash
+           WHERE ${filter.where} AND m.id IN (${near.map(() => "?").join(",")})`,
         )
-        .all(...filter.params, ...near.map((n) => n.id))
+        .all(vectors.spec.model, vectors.fingerprint, ...filter.params, ...near.map((n) => n.id))
         .map((r) => r.id),
     );
     return near.filter((n) => live.has(n.id)).sort((a, b) => b.similarity - a.similarity);
@@ -937,56 +1033,86 @@ export class MemoryStore {
 
   private async runIndex(): Promise<void> {
     const embedder = this.embedder;
-    if (!embedder) return;
-    const model = embedder.spec.model;
-    const active = () => !this.closed && this.embedder === embedder;
+    const vectors = this.vectors;
+    if (!embedder || !vectors) return;
     let done = 0;
-    let rows = this.pendingBatch(model, 0);
-    while (rows.length > 0 && active()) {
-      const vectors = await this.embedBatch(embedder, rows);
-      if (vectors && active()) done += this.writeBatch(rows, vectors);
-      rows = active() ? this.pendingBatch(model, rows.at(-1)?.id ?? Number.MAX_SAFE_INTEGER) : [];
+    let after = 0;
+    while (!this.closed && this.embedder === embedder) {
+      const rows = this.pendingBatch(vectors, after);
+      if (rows.length === 0) break;
+      after = rows.at(-1)?.id ?? Number.MAX_SAFE_INTEGER;
+      done += await this.indexRows(embedder, vectors, rows);
     }
-    if (done > 0) this.log.info(`embedded ${done} memories with ${model}`);
+    if (done > 0) this.log.info(`embedded ${done} memories with ${embedder.spec.model}`);
   }
 
-  private embedBatch(embedder: Embedder, rows: IndexRow[]): Promise<Float32Array[] | null> {
+  private async indexRows(embedder: Embedder, vectors: VectorIndex, rows: IndexRow[]): Promise<number> {
+    const runnable = rows.filter((row) => this.retry.canAttempt(row));
+    if (runnable.length === 0) return 0;
+    const outcome = await this.embedBatch(embedder, runnable);
+    // A model switch or close while embedding makes the result useless for the current index.
+    if (this.closed || this.embedder !== embedder) return 0;
+    if (outcome.ok) return this.writeBatch(vectors, runnable, outcome.vectors);
+    this.retry.failed(runnable, outcome.error, () => this.scheduleIndex());
+    return 0;
+  }
+
+  private async embedBatch(
+    embedder: Embedder,
+    rows: IndexRow[],
+  ): Promise<{ ok: true; vectors: Float32Array[] } | { ok: false; error: string }> {
     const texts = rows.map((r) => `${r.title}\n${r.content}`);
-    return embedder.embed(texts, "document").catch((error: unknown) => {
-      this.log.warn(`embedding batch ending at #${rows.at(-1)?.id} failed, skipped: ${errorText(error)}`);
-      return null;
-    });
+    try {
+      return { ok: true, vectors: await embedder.embed(texts, "document") };
+    } catch (error) {
+      const message = errorText(error);
+      this.log.warn(`embedding batch ending at #${rows.at(-1)?.id} failed, will retry: ${message}`);
+      return { ok: false, error: message };
+    }
   }
 
-  private pendingBatch(model: string, afterId: number): IndexRow[] {
+  private pendingBatch(vectors: VectorIndex, afterId: number): IndexRow[] {
     return this.db
-      .query<IndexRow, [string, number, number]>(
-        `SELECT m.id, m.title, m.content, m.scope, m.project_key, m.content_hash FROM memories m
+      .query<IndexRow, [string, number, string, number]>(
+        `SELECT m.id, m.title, m.content, m.scope, m.project_key, m.content_hash, m.index_generation FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-         WHERE m.deleted_at IS NULL AND m.id > ? AND (e.memory_id IS NULL OR e.content_hash != m.content_hash)
+         WHERE m.deleted_at IS NULL AND m.id > ? AND ${STALE_VECTOR_SQL}
          ORDER BY m.id LIMIT ?`,
       )
-      .all(model, afterId, INDEX_BATCH);
+      .all(vectors.spec.model, afterId, vectors.fingerprint, INDEX_BATCH);
   }
 
-  // Skips rows edited while the batch was embedding; the next pass picks them up.
-  private writeBatch(rows: IndexRow[], vectors: Float32Array[]): number {
-    const current = this.db.query<{ content_hash: string }, [number]>(
-      `SELECT content_hash FROM memories WHERE id = ? AND deleted_at IS NULL`,
+  // The vector commits only if the row still has the generation, namespace, text and lifecycle the batch started
+  // from; otherwise the row is still pending and the next pass embeds its current state.
+  private writeBatch(vectors: VectorIndex, rows: IndexRow[], results: Float32Array[]): number {
+    const current = this.db.query<IndexRow & { deleted_at: string | null }, [number]>(
+      `SELECT id, title, content, scope, project_key, content_hash, index_generation, deleted_at
+       FROM memories WHERE id = ?`,
     );
-    let written = 0;
-    this.db.transaction(() => {
-      rows.forEach((row, i) => {
-        const vector = vectors[i];
-        if (!vector || current.get(row.id)?.content_hash !== row.content_hash) return;
-        this.vectors?.write(
-          { id: row.id, partition: scopeKey(row.scope, row.project_key), hash: row.content_hash },
-          vector,
-        );
-        written++;
-      });
-    })();
-    return written;
+    const outcomes = this.db.transaction(() =>
+      rows.map((row, i) => this.commitVector(vectors, { row, now: current.get(row.id) ?? null }, results[i])),
+    )();
+    if (outcomes.includes("stale")) this.scheduleIndex();
+    return outcomes.filter((outcome) => outcome === "written").length;
+  }
+
+  private commitVector(
+    vectors: VectorIndex,
+    { row, now }: { row: IndexRow; now: (IndexRow & { deleted_at: string | null }) | null },
+    vector: Float32Array | undefined,
+  ): "written" | "stale" | "missing" {
+    if (!vector) {
+      this.retry.failed([row], "the embedder returned no vector", () => this.scheduleIndex());
+      return "missing";
+    }
+    if (!now || !sameIndexState(now, row)) return "stale";
+    const partition = scopeKey(now.scope, now.project_key);
+    vectors.write(
+      { id: row.id, partition, hash: now.content_hash, generation: now.index_generation },
+      vector,
+    );
+    this.retry.succeeded(row.id);
+    return "written";
   }
 
   private bump(ids: number[], set: string, params: string[]): void {
@@ -1018,6 +1144,39 @@ export class MemoryStore {
   private ts(): string {
     return this.now().toISOString();
   }
+}
+
+const ABORTED = Symbol("aborted");
+
+// Backends that cannot cancel keep running; the caller just stops waiting for them.
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+  const onAbort = () => resolve(ABORTED);
+  signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([work, promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
+function sameIndexState(now: IndexRow & { deleted_at: string | null }, batch: IndexRow): boolean {
+  return (
+    now.deleted_at === null &&
+    now.index_generation === batch.index_generation &&
+    now.content_hash === batch.content_hash &&
+    now.scope === batch.scope &&
+    now.project_key === batch.project_key
+  );
+}
+
+// The embedding depends on type, text and namespace; any of them changing invalidates in-flight index batches.
+function classifyChange(existing: MemoryRow, next: ReturnType<typeof patched>) {
+  const textChanged = next.title !== existing.title || next.content !== existing.content;
+  const reindex =
+    next.hash !== existing.content_hash ||
+    next.scope !== existing.scope ||
+    next.projectKey !== existing.project_key;
+  const changed = reindex || next.pinned !== existing.pinned || next.topicKey !== existing.topic_key;
+  return { textChanged, reindex, changed };
 }
 
 function namespaceOf(row: { scope: Scope; project_key: string | null }): Namespace {

@@ -138,9 +138,16 @@ function initialStates(options: ServiceOptions): ModelStates {
       state: "loading",
       error: null,
       pending: 0,
+      failed: 0,
+      indexError: null,
     },
     reranker: { mode, enabled, model: RERANK_MODEL, state: enabled ? "loading" : "off", error: null },
   };
+}
+
+function embedderIndexStatus(store: MemoryStore): Pick<EmbedderStatus, "pending" | "failed" | "indexError"> {
+  const health = store.indexHealth();
+  return { pending: health.pending, failed: health.retrying + health.failed, indexError: health.lastError };
 }
 
 function serviceStatus(store: MemoryStore, models: ModelStates, mcpUrl: string): ServiceStatus {
@@ -154,7 +161,7 @@ function serviceStatus(store: MemoryStore, models: ModelStates, mcpUrl: string):
     dbPath: store.path,
     mcpUrl,
     ...store.stats(),
-    embedder: { ...models.embedder, pending: store.pendingEmbeddings() },
+    embedder: { ...models.embedder, ...embedderIndexStatus(store) },
     reranker: { ...models.reranker },
   };
 }

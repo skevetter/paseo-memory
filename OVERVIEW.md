@@ -28,6 +28,9 @@ The settings screen controls how much memory each agent receives, the session re
 
 - The plugin starts a Bun child process that serves MCP and an internal API on `127.0.0.1:6797`.
 - Data is stored in `$PASEO_HOME/plugin-data/paseo-memory/memory.db`.
+- Each memory carries an index generation that changes with its text, type or scope. A vector is stored only if the memory still has the generation the embedder saw, so a memory that moves between projects while it is being indexed never becomes searchable in its old project. A search drops any hit whose scope, text or state changed while it ran.
+- A failed embedding batch retries with backoff, up to 5 attempts per memory. Keyword search keeps working, and Settings shows how many memories could not be indexed.
+- Upgrading to schema v6 first writes a consistent backup next to the database (`memory.db.pre-v6-from-v5.bak`) and marks existing vectors stale. They are rebuilt in the background; keyword search is available meanwhile. A database written by a newer schema is refused, not modified.
 - On first start the plugin runs `bun install` in its directory to fetch its runtime packages, about 480 MB.
 - Embedding and re-ranking models download from Hugging Face on first use, 30 MB to 337 MB per tier. Models run on the host. No memory content leaves the host.
 - Secrets in common formats are redacted before saving.

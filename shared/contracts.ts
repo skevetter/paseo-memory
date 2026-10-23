@@ -295,6 +295,8 @@ export const statusRpc = defineRpc({
           state: z.enum(["loading", "ready", "error"]),
           error: z.string().nullable(),
           pending: z.number(),
+          failed: z.number(),
+          indexError: z.string().nullable(),
         }),
         reranker: z.object({
           mode: z.enum(RERANK_MODES),

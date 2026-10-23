@@ -206,10 +206,10 @@ describe("vector search", () => {
     const global = scopeKey("global", null);
     const projectA = scopeKey("project", dataRepo.key);
     const projectB = scopeKey("project", otherRepo.key);
-    index.write({ id: 1, partition: global, hash: "h1" }, Float32Array.from([1, 0, 0, 0]));
-    index.write({ id: 2, partition: projectA, hash: "h2" }, Float32Array.from([1, 0, 0, 0]));
-    index.write({ id: 3, partition: projectB, hash: "h3" }, Float32Array.from([1, 0, 0, 0]));
-    index.write({ id: 4, partition: projectA, hash: "h4" }, Float32Array.from([0, 1, 0, 0]));
+    index.write({ id: 1, partition: global, hash: "h1", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
+    index.write({ id: 2, partition: projectA, hash: "h2", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
+    index.write({ id: 3, partition: projectB, hash: "h3", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
+    index.write({ id: 4, partition: projectA, hash: "h4", generation: 1 }, Float32Array.from([0, 1, 0, 0]));
     const query = Float32Array.from([1, 0, 0, 0]);
     expect(index.knn(query, projectA, 10).map((n) => n.id)).toEqual([2, 4]);
     expect(index.knn(query, projectB, 10)).toEqual([{ id: 3, similarity: 1 }]);

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { ProjectRef, SearchScope } from "../shared/service-api";
 import { isUsableReply } from "../shared/turns";
-import type { Access } from "./access";
+import type { Access, SqlFilter } from "./access";
 import { redact } from "./redact";
 import { clip, ftsQuery, RRF_K } from "./text";
 
@@ -142,7 +142,27 @@ export function searchSessions(
        WHERE sessions_fts MATCH ? AND ${filter.where} ORDER BY bm25(sessions_fts) LIMIT ?`,
     )
     .all(fts, ...filter.params, input.limit);
-  return rows.map((row, index) => ({
+  return rows.map((row, index) => toSessionHit(row, 0.5 / (RRF_K + index + 1)));
+}
+
+/** Current rows for session ids the caller may still see, used to recheck hits after async re-ranking. */
+export function currentSessionHits(
+  db: Database,
+  filter: SqlFilter | null,
+  ids: string[],
+): Map<string, SessionHit> {
+  if (!filter || ids.length === 0) return new Map();
+  const rows = db
+    .prepare<SessionRow & { project_name: string | null }, (string | number)[]>(
+      `SELECT s.*, p.name AS project_name FROM sessions s LEFT JOIN projects p ON p.key = s.project_key
+       WHERE ${filter.where} AND s.id IN (${ids.map(() => "?").join(",")})`,
+    )
+    .all(...filter.params, ...ids);
+  return new Map(rows.map((row) => [row.id, toSessionHit(row, 0)]));
+}
+
+function toSessionHit(row: SessionRow & { project_name: string | null }, score: number): SessionHit {
+  return {
     kind: "session",
     id: row.id,
     title: row.title ?? clip(row.first_prompt ?? "session", 80),
@@ -153,6 +173,6 @@ export function searchSessions(
     preview: clip(row.summary ?? row.last_reply ?? row.last_prompt ?? "", 240),
     pinned: false,
     updatedAt: row.updated_at,
-    score: 0.5 / (RRF_K + index + 1),
-  }));
+    score,
+  };
 }

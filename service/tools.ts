@@ -33,6 +33,7 @@ export interface ToolContext {
 
 const MAX_TITLE_CHARS = 200;
 const MAX_QUERY_CHARS = 1000;
+const SEARCH_DEADLINE_MS = 20_000;
 const MAX_TOPIC_CHARS = 200;
 // Bounds the request; the real content limit is enforced by the store with a message the model can act on.
 const MAX_CONTENT_INPUT_CHARS = MAX_CONTENT_CHARS * 25;
@@ -147,6 +148,7 @@ function searchTool(ctx: ToolContext): ToolDefinition {
     schema: searchInput,
     async run(args, caller, access) {
       const scope = args.scope ?? "all";
+      const signal = AbortSignal.timeout(SEARCH_DEADLINE_MS);
       const hits = await ctx.store.search({
         query: args.query,
         access,
@@ -155,7 +157,10 @@ function searchTool(ctx: ToolContext): ToolDefinition {
         limit: args.limit ?? 8,
         includeSessions: args.include_sessions === true,
         track: true,
+        signal,
       });
+      if (signal.aborted)
+        throw new ToolError("search_timeout", "The search took too long. Try a narrower query.");
       ctx.store.audit.record(caller.nonce, {
         kind: "search",
         query: args.query,

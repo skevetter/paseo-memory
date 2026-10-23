@@ -359,6 +359,9 @@ export interface EmbedderStatus {
   state: "loading" | "ready" | "error";
   error: string | null;
   pending: number;
+  /** Memories whose embedding keeps failing: still retrying, or out of attempts. */
+  failed: number;
+  indexError: string | null;
 }
 
 export interface RerankerStatus {
