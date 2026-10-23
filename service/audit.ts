@@ -36,7 +36,9 @@ export type AuditDetail =
   | { kind: "save"; id: number | null; status: string; candidates: number[] }
   | { kind: "update" | "delete"; id: number; ok: boolean }
   | ({ kind: "review" } & ReviewAudit)
-  | { kind: "merge"; source: number; target: number; similarity: number | null; sameTopic: boolean };
+  | { kind: "merge"; source: number; target: number; similarity: number | null; sameTopic: boolean }
+  | { kind: "denied"; tool: string; operation: string; ids: number[] }
+  | { kind: "invalid"; tool: string; fields: string[] };
 
 interface LinkRow {
   nonce: string;
@@ -295,6 +297,10 @@ class AuditViews {
           summary: `merged #${d.source} into #${d.target}${d.sameTopic ? " (same topic)" : ""}`,
           memories: [this.memory(d.target, d.similarity, "kept")],
         };
+      case "denied":
+        return { summary: `${d.tool} refused outside this agent's scope (${d.operation})` };
+      case "invalid":
+        return { summary: `${d.tool} rejected malformed input: ${d.fields.join(", ") || "arguments"}` };
       default:
         return {
           summary: `${d.ok ? `${d.kind}d` : "not found"} #${d.id}`,
@@ -397,6 +403,9 @@ function memoryIds(d: AuditDetail): number[] {
       return [...d.saved, ...d.updated];
     case "merge":
       return [d.source, d.target];
+    case "denied":
+    case "invalid":
+      return [];
     default:
       return [d.id];
   }

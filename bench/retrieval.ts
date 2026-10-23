@@ -1,6 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { Access } from "../service/access";
 import { type Embedder, loadEmbedder } from "../service/embedder";
 import { loadReranker, type Reranker } from "../service/reranker";
 import { MemoryStore } from "../service/store";
@@ -52,7 +53,7 @@ async function measure(store: MemoryStore, keyOf: Map<string, string>): Promise<
   const byKind = { paraphrase: 0, "no-overlap": 0, "near-miss": 0 };
   for (const q of BENCHMARK.queries) {
     const started = performance.now();
-    const hits = await store.search({ query: q.query, project: dataRepo, limit: 10 });
+    const hits = await store.search({ query: q.query, access: Access.agent(dataRepo.key), limit: 10 });
     elapsed += performance.now() - started;
     const rank = hits.findIndex((h) => keyOf.get(h.id) === q.relevant) + 1;
     if (rank === 1) {
@@ -77,7 +78,7 @@ async function benchTier(tier: EmbeddingTier, reranker: Reranker): Promise<strin
   await measure(store, keyOf);
   const fused = await measure(store, keyOf);
   store.setReranker(reranker);
-  await store.search({ query: "warm up", project: dataRepo });
+  await store.search({ query: "warm up", access: Access.agent(dataRepo.key) });
   const reranked = await measure(store, keyOf);
   store.close();
   const added = (reranked.msPerSearch - fused.msPerSearch).toFixed(1);

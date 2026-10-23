@@ -36,7 +36,12 @@ import { digestLatestTurn, type TurnDigest } from "./capture";
 import { FirstPrompts } from "./first-prompts";
 import type { PaseoAgent, PaseoApi } from "./host-types";
 import { AgentLinks } from "./links";
-import { createProjectResolver, type ProjectResolver, projectFromDescriptor } from "./projects";
+import {
+  createProjectResolver,
+  type ProjectResolution,
+  type ProjectResolver,
+  projectFromDescriptor,
+} from "./projects";
 import { ReviewScheduler, type ReviewTrigger, type TurnResult } from "./review";
 import { type ServiceConfig, ServiceSupervisor } from "./supervisor";
 import { readBranch, type TaskQuery, taskQuery } from "./task-query";
@@ -347,7 +352,7 @@ async function captureTurn(
 ): Promise<void> {
   if (!isUsableReply(digest.assistantText)) return;
   const { agent } = event;
-  const project = await ctx.state.projects.resolve(ctx.paseo, {
+  const { project } = await ctx.state.projects.resolve(ctx.paseo, {
     cwd: agent.cwd,
     workspaceId: agent.workspaceId,
   });
@@ -370,10 +375,10 @@ async function injectMemory(
   const { settings } = state;
   const config = request.config;
   if (config.internal || (!settings.injectContext && !settings.injectMcp)) return request;
-  const project = await withDeadline(
+  const { project, unresolved } = await withDeadline(
     state.projects.resolve(paseo, { cwd: config.cwd }),
     PROJECT_LOOKUP_MS,
-    () => null,
+    (): ProjectResolution => ({ project: null, unresolved: "deadline" }),
   );
   const provider = String(config.provider).split("/")[0] ?? "";
   const includeTools =
@@ -385,6 +390,7 @@ async function injectMemory(
     "agent-context",
     {
       project,
+      projectUnresolved: unresolved,
       provider,
       includeContext: settings.injectContext,
       includeTools,

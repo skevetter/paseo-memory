@@ -5,7 +5,7 @@ import { type MemoryHit, MemoryStore, type SaveInput } from "../service/store";
 import { findTaskMatches, isTaskMatch } from "../service/task";
 import { candidatePairs, runUpkeep, UPKEEP_NONCE, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME, type RuntimeConfig } from "../shared/service-api";
-import { dataRepo, hashEmbedder, hashSpec } from "./helpers";
+import { dataRepo, hashEmbedder, hashSpec, owner } from "./helpers";
 
 let store: MemoryStore;
 beforeEach(() => {
@@ -154,7 +154,7 @@ describe("usage feedback", () => {
     for (let i = 0; i < 10; i++) store.markShown([a, b]);
     store.markOpened([b]);
     const order = async () =>
-      (await store.search({ query: "grafana dashboards", project: null })).map((h) => h.id);
+      (await store.search({ query: "grafana dashboards", access: owner })).map((h) => h.id);
     expect(await order()).toEqual([String(b), String(a)]);
     for (let i = 0; i < 3; i++) store.markOpened([a]);
     expect(await order()).toEqual([String(a), String(b)]);
@@ -163,7 +163,7 @@ describe("usage feedback", () => {
   it("applies to the starting list and turns off with the setting", async () => {
     await twoEqual();
     const order = async () =>
-      (await store.search({ query: "grafana dashboards", project: null })).map((h) => h.id);
+      (await store.search({ query: "grafana dashboards", access: owner })).map((h) => h.id);
     const [first, second] = (await order()).map(Number) as [number, number];
     for (let i = 0; i < 10; i++) store.markShown([first, second]);
     store.markOpened([second]);
@@ -186,11 +186,11 @@ describe("upkeep", () => {
     expect(duplicates).toHaveLength(1);
     expect(duplicates[0]).toMatchObject({ targetId: used, similarity: 1, sameTopic: false });
     expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ duplicates: 1, merged: 0 });
-    expect(store.get([older])).toHaveLength(1);
+    expect(store.getVisible(owner, [older])).toHaveLength(1);
 
     configure({ duplicateMerge: "auto" });
     expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ duplicates: 1, merged: 1 });
-    expect(store.detail(older)).toMatchObject({ memory: null, mergedInto: used });
+    expect(store.detailAuthorized(owner, older)).toMatchObject({ memory: null, mergedInto: used });
     expect(store.audit.eventsSince(UPKEEP_NONCE, "2026-01-01")).toEqual([
       { kind: "merge", source: older, target: used, similarity: 1, sameTopic: false },
     ]);
@@ -218,7 +218,7 @@ describe("upkeep", () => {
       expect.objectContaining({ values: { a: ["6797"], b: ["6798"] }, similarity: 1 }),
     ]);
     expect(runUpkeep(store, "2026-10-07T00:00:00Z")).toMatchObject({ contradictions: 1, merged: 0 });
-    expect(store.get([a, b])).toHaveLength(2);
+    expect(store.getVisible(owner, [a, b])).toHaveLength(2);
     store.dismissPair(b, a);
     expect(upkeepPairs(store, dataRepo).contradictions).toEqual([]);
   });
@@ -242,13 +242,17 @@ describe("upkeep", () => {
       const kept = (await timed.save({ ...global, title: "Kept", content: "k" })).id as number;
       await timed.save({ ...global, title: "Pinned", content: "p", pinned: true });
       now = new Date("2026-02-15T00:00:00Z");
-      const stale = () => timed.list({ project: null, stale: true }).map((h) => Number(h.id));
+      const stale = () => timed.list({ access: owner, stale: true }).map((h) => Number(h.id));
       expect(stale()).toEqual([old, kept]);
-      expect(timed.keep(kept)).toBe(true);
+      expect(timed.keep(owner, kept)).toBe("ok");
       expect(stale()).toEqual([old]);
-      expect(timed.archive(old)).toBe(true);
+      expect(timed.archive(owner, old)).toBe("ok");
       expect(stale()).toEqual([]);
-      expect(timed.detail(old)).toMatchObject({ memory: null, archived: true, mergedInto: null });
+      expect(timed.detailAuthorized(owner, old)).toMatchObject({
+        memory: null,
+        archived: true,
+        mergedInto: null,
+      });
     } finally {
       timed.close();
     }

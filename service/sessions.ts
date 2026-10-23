@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { ProjectRef, SearchScope } from "../shared/service-api";
 import { isUsableReply } from "../shared/turns";
+import type { Access } from "./access";
 import { redact } from "./redact";
 import { clip, ftsQuery, RRF_K } from "./text";
 
@@ -129,23 +130,18 @@ export function listSessions(
 
 export function searchSessions(
   db: Database,
-  input: { query: string; project: ProjectRef | null; scope: SearchScope; limit: number },
+  input: { query: string; access: Access; scope: SearchScope; limit: number },
 ): SessionHit[] {
   const fts = ftsQuery(input.query);
-  if (input.scope === "global" || !fts) return [];
-  const params: (string | number)[] = [fts];
-  let where = "";
-  if (input.scope === "project" || input.project) {
-    where = "AND ifnull(s.project_key, '') = ?";
-    params.push(input.project?.key ?? "");
-  }
+  const filter = input.access.sessionFilter(input.scope);
+  if (!fts || !filter) return [];
   const rows = db
     .query<SessionRow & { project_name: string | null }, (string | number)[]>(
       `SELECT s.*, p.name AS project_name FROM sessions_fts f JOIN sessions s ON s.rowid = f.rowid
        LEFT JOIN projects p ON p.key = s.project_key
-       WHERE sessions_fts MATCH ? ${where} ORDER BY bm25(sessions_fts) LIMIT ?`,
+       WHERE sessions_fts MATCH ? AND ${filter.where} ORDER BY bm25(sessions_fts) LIMIT ?`,
     )
-    .all(...params, input.limit);
+    .all(fts, ...filter.params, input.limit);
   return rows.map((row, index) => ({
     kind: "session",
     id: row.id,

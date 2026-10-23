@@ -70,6 +70,10 @@ export const MEMORY_TYPES = [
   "note",
 ] as const;
 
+// Why a workspace has no project: nothing is attached, or the lookup itself failed and access stays global-only.
+export const PROJECT_UNRESOLVED_REASONS = ["no_project", "lookup_failed", "deadline", "page_limit"] as const;
+export type ProjectUnresolved = (typeof PROJECT_UNRESOLVED_REASONS)[number];
+
 export const ProjectRefSchema = z.object({
   key: z.string().min(1),
   name: z.string(),
@@ -88,6 +92,7 @@ export const serviceInputs = {
   configure: RuntimeConfigSchema,
   "agent-context": z.object({
     project: ProjectRefSchema.nullable(),
+    projectUnresolved: z.enum(PROJECT_UNRESOLVED_REASONS).nullable().default(null),
     provider: z.string(),
     includeContext: z.boolean(),
     includeTools: z.boolean(),
@@ -248,6 +253,8 @@ export const AUDIT_KINDS = [
   "delete",
   "review",
   "merge",
+  "denied",
+  "invalid",
 ] as const;
 export type AuditKind = (typeof AUDIT_KINDS)[number];
 

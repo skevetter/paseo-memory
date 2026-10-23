@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Access } from "../service/access";
 import { type Embedder, loadEmbedder, TIERS, WordPieceTokenizer } from "../service/embedder";
 import { loadReranker, RERANK_MODEL, RERANK_TASK_FLOOR } from "../service/reranker";
 import { MemoryStore } from "../service/store";
@@ -125,7 +126,10 @@ for (const tier of EMBEDDING_TIERS) {
           content: "Why: joins and JSONB",
         });
         await store.save({ ...base, title: "Frontend uses React Native", content: "Why: mobile" });
-        const hits = await store.search({ query: "which database engine was selected", project: dataRepo });
+        const hits = await store.search({
+          query: "which database engine was selected",
+          access: Access.agent(dataRepo.key),
+        });
         expect(hits[0]?.title).toBe("Picked Postgres for the warehouse");
         const restated = {
           ...base,

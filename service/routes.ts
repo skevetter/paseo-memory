@@ -8,6 +8,7 @@ import type {
   ServiceStatus,
   SessionItem,
 } from "../shared/service-api";
+import { Access } from "./access";
 import { buildContext, buildSystemPrompt } from "./context";
 import { signCaller } from "./mcp";
 import { redact } from "./redact";
@@ -17,6 +18,9 @@ import type { MemoryStore, SearchHit, SessionRow } from "./store";
 import { findTaskMatches, type TaskMatches } from "./task";
 import { clip } from "./text";
 import { lastUpkeepRun, runUpkeep, upkeepPairs } from "./upkeep";
+
+// The settings and memory panels belong to the machine owner; MCP callers never reach this principal.
+const OWNER = Access.owner();
 
 export interface RouteContext {
   store: MemoryStore;
@@ -59,7 +63,7 @@ export function createRoutes(ctx: RouteContext): Routes {
       const project = projectOf(input.paseoProjectId);
       const hits = await store.search({
         query: input.query,
-        project,
+        access: Access.owner(project?.key),
         scope: input.scope,
         limit: input.limit,
       });
@@ -69,10 +73,10 @@ export function createRoutes(ctx: RouteContext): Routes {
     ...upkeepRoutes(store, projectOf),
     save: (input) => saveFromUi(store, input),
     update: (input) => updateFromUi(store, input),
-    delete: (input) => ({ ok: store.delete(input.id) }),
-    detail: (input) => store.detail(input.id),
-    restore: (input) => ({ ok: store.restore(input.id, input.version) }),
-    merge: (input) => store.merge(input.sourceId, input.targetId),
+    delete: (input) => ({ ok: store.deleteAuthorized(OWNER, input.id) === "ok" }),
+    detail: (input) => store.detailAuthorized(OWNER, input.id),
+    restore: (input) => ({ ok: store.restoreAuthorized(OWNER, input.id, input.version) === "ok" }),
+    merge: (input) => store.mergeAuthorized(OWNER, input.sourceId, input.targetId),
     sessions: (input) => {
       const projectKey = projectOf(input.paseoProjectId)?.key ?? null;
       return { items: store.sessions({ projectKey, query: input.query, limit: input.limit }).map(toSession) };
@@ -119,7 +123,7 @@ function upkeepRoutes(
   return {
     "upkeep-list": (input) => {
       const project = projectOf(input.paseoProjectId);
-      const stale = store.list({ project, scope: "all", stale: true, limit: 50 });
+      const stale = store.list({ access: Access.owner(project?.key), scope: "all", stale: true, limit: 50 });
       return {
         mode: store.config.duplicateMerge,
         staleDays: store.config.staleDays,
@@ -129,8 +133,8 @@ function upkeepRoutes(
       };
     },
     "upkeep-run": () => runUpkeep(store, new Date().toISOString()),
-    keep: (input) => ({ ok: store.keep(input.id) }),
-    archive: (input) => ({ ok: store.archive(input.id) }),
+    keep: (input) => ({ ok: store.keep(OWNER, input.id) === "ok" }),
+    archive: (input) => ({ ok: store.archive(OWNER, input.id) === "ok" }),
     "dismiss-pair": (input) => {
       store.dismissPair(input.a, input.b);
       return { ok: true };
@@ -156,6 +160,7 @@ async function agentContext(
     systemPrompt = buildSystemPrompt({
       context: context.text,
       project,
+      projectUnresolved: input.projectUnresolved,
       hasTools: input.includeTools,
       extraInstructions: store.config.extraInstructions,
     });
@@ -200,7 +205,7 @@ async function saveFromUi(
 function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): ServiceOutputs["update"] {
   const known = input.paseoProjectId ? store.projectByPaseoId(input.paseoProjectId) : null;
   try {
-    const ok = store.update(input.id, {
+    const outcome = store.updateAuthorized(OWNER, input.id, {
       title: input.title,
       content: input.content,
       type: input.type,
@@ -208,6 +213,7 @@ function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): 
       scope: input.scope,
       project: known ?? input.project ?? null,
     });
+    const ok = outcome === "ok";
     return { ok, message: ok ? "Saved." : "This memory no longer exists." };
   } catch (error) {
     return { ok: false, message: errorText(error) };
@@ -215,12 +221,12 @@ function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): 
 }
 
 async function attachments(store: MemoryStore, query: string): Promise<ServiceOutputs["attachments"]> {
-  const hits = await store.search({ query, project: null, scope: "all", limit: 15 });
+  const hits = await store.search({ query, access: OWNER, scope: "all", limit: 15 });
   const items = hits
     .filter((h) => h.kind === "memory")
     .map((h) => {
       const where = h.projectName ?? "global";
-      const content = store.get([Number(h.id)])[0]?.content ?? h.preview;
+      const content = store.getVisible(OWNER, [Number(h.id)])[0]?.content ?? h.preview;
       return {
         id: h.id,
         identifier: `#${h.id}`,
