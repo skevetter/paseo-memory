@@ -1,17 +1,12 @@
 import { z } from "zod";
+import { type LifecycleDetail, type MutationRequest, MutationRequestSchema } from "../shared/lifecycle";
 import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
 import { Access } from "./access";
 import { buildContext } from "./context";
 import { type Caller, type ToolDefinition, ToolError, type ToolRequest } from "./mcp";
+import { canonicalBody, MutationError, type MutationPrincipal } from "./mutations";
 import { type Reservation, ReviewLimitError, type ReviewOpKind } from "./review-ledger";
-import { formatSave } from "./save-receipt";
-import {
-  ContentTooLongError,
-  type MemoryStore,
-  type ProjectRef,
-  type SaveInput,
-  type SearchHit,
-} from "./store";
+import { ContentTooLongError, type MemoryStore, type ProjectRef, type SearchHit } from "./store";
 import { age, sha256 } from "./text";
 
 export const MCP_INSTRUCTIONS = [
@@ -61,29 +56,58 @@ const saveInput = z.strictObject({
   topic_key: topicKey.optional().describe("Stable key, e.g. 'auth/token-refresh'."),
   pinned: z.boolean().optional().describe("Pinned memories are injected into every new agent."),
   force: z.boolean().optional().describe("Save even when a similar memory exists."),
+  expected_revision: memoryId.optional().describe("Expected current revision for a topic-key update."),
+  request_id: z.string().min(1).max(200).optional().describe("Stable retry identity for this mutation."),
 });
 
 const updateInput = z
   .strictObject({
     id: memoryId,
+    expected_revision: memoryId.optional(),
+    request_id: z.string().min(1).max(200).optional(),
     title: title.optional(),
     content: content.optional(),
     type: memoryType.optional(),
     pinned: z.boolean().optional(),
     topic_key: topicKey.optional(),
   })
-  .refine((input) => Object.keys(input).some((key) => key !== "id"), {
-    message: "provide at least one field to change besides id",
-  });
+  .refine(
+    (input) => Object.keys(input).some((key) => !["id", "expected_revision", "request_id"].includes(key)),
+    {
+      message: "provide at least one field to change besides id",
+    },
+  );
 
-const deleteInput = z.strictObject({ id: memoryId });
+const deleteInput = z.strictObject({
+  id: memoryId,
+  expected_revision: memoryId.optional(),
+  request_id: z.string().min(1).max(200).optional(),
+});
 const contextInput = z.strictObject({});
+
+const MUTATION_TOOLS: Partial<Record<string, true>> = {
+  memory_save: true,
+  memory_update: true,
+  memory_delete: true,
+  memory_mutate: true,
+};
+
+interface InvocationRequest extends ToolRequest {
+  admissionAttempted: boolean;
+  principalId: string;
+  auditNonce: string;
+}
 
 interface ToolSpec<S extends z.ZodType> {
   name: string;
   description: string;
   schema: S;
-  run(args: z.output<S>, caller: Caller, access: Access, request: ToolRequest): Promise<string> | string;
+  run(
+    args: z.output<S>,
+    caller: Caller,
+    access: Access,
+    request: InvocationRequest,
+  ): Promise<string> | string;
 }
 
 // Arguments are parsed before any handler logic runs, so a malformed call can never reach the store.
@@ -94,34 +118,104 @@ function defineTool<S extends z.ZodType>(ctx: ToolContext, spec: ToolSpec<S>): T
     description: spec.description,
     inputSchema,
     async handler(raw, caller, request) {
+      const principalId = callerPrincipalId(caller);
+      const invocation = {
+        ...request,
+        admissionAttempted: false,
+        principalId,
+        auditNonce: caller.nonce ?? principalId,
+      };
       try {
-        const args = parseArguments(ctx, spec, raw, caller);
-        return await spec.run(args, caller, Access.agent(caller.projectKey), request);
+        authorizeInvocation(ctx, caller, invocation);
+        const args = parseArguments(ctx, spec, raw, invocation.auditNonce);
+        return await spec.run(args, caller, Access.agent(caller.projectKey), invocation);
       } catch (error) {
-        if (error instanceof ContentTooLongError) throw new ToolError("content_too_long", error.message);
-        if (error instanceof ReviewLimitError) throw new ToolError(error.code, error.message);
-        throw error;
+        const failure = MUTATION_TOOLS[spec.name]
+          ? mutationFailure(ctx, caller, { tool: spec.name, raw, request: invocation, error })
+          : error;
+        throw toolError(failure);
       }
     },
   };
+}
+
+function authorizeInvocation(ctx: ToolContext, caller: Caller, invocation: InvocationRequest): void {
+  if (
+    ctx.store.lifecycle.contextInvalidated({
+      nonce: invocation.auditNonce,
+      agentId: caller.agentId,
+      principalId: invocation.principalId,
+    })
+  )
+    throw new MutationError(
+      "context_invalidated",
+      "A source in this context was forgotten. Start a fresh authorized context.",
+    );
+  if (caller.agentId && !ctx.store.audit.agentFor(invocation.auditNonce))
+    ctx.store.audit.link({
+      nonce: invocation.auditNonce,
+      agentId: caller.agentId,
+      workspaceId: null,
+      title: null,
+    });
+}
+
+function toolError(error: unknown): unknown {
+  if (error instanceof ContentTooLongError) return new ToolError("content_too_long", error.message);
+  if (error instanceof ReviewLimitError) return new ToolError(error.code, error.message);
+  if (error instanceof MutationError) {
+    return new ToolError(
+      error.code,
+      error.details === null ? error.message : `${error.message} ${JSON.stringify(error.details)}`,
+    );
+  }
+  return error;
+}
+
+function mutationFailure(
+  ctx: ToolContext,
+  caller: Caller,
+  input: { tool: string; raw: unknown; request: InvocationRequest; error: unknown },
+): unknown {
+  const { tool, raw, request, error } = input;
+  if (error instanceof MutationError && error.code === "context_invalidated") return error;
+  if (error instanceof MutationError && error.code === "scope_denied") {
+    auditDeniedMutation(ctx, request.auditNonce, tool, raw);
+  }
+  if (request.admissionAttempted) return error;
+  try {
+    ctx.store.reviews.rejectAttempt(caller.nonce);
+  } catch (limit) {
+    return limit;
+  }
+  return error;
+}
+
+function auditDeniedMutation(ctx: ToolContext, auditNonce: string, tool: string, raw: unknown): void {
+  const parsed = z
+    .object({
+      id: memoryId.optional(),
+      operation: MutationRequestSchema.shape.operation.optional(),
+    })
+    .safeParse(raw);
+  const operation = parsed.success ? parsed.data.operation : undefined;
+  const ids = parsed.success && parsed.data.id ? [parsed.data.id] : [];
+  ctx.store.audit.record(auditNonce, { kind: "denied", tool, operation: operation ?? tool, ids });
 }
 
 function parseArguments<S extends z.ZodType>(
   ctx: ToolContext,
   spec: ToolSpec<S>,
   raw: unknown,
-  caller: Caller,
+  auditNonce: string,
 ): z.output<S> {
   const parsed = spec.schema.safeParse(raw);
   if (parsed.success) return parsed.data;
-  ctx.store.audit.record(caller.nonce, {
+  ctx.store.audit.record(auditNonce, {
     kind: "invalid",
     tool: spec.name,
     fields: parsed.error.issues.flatMap(issueFields),
   });
-  if (spec.name === "memory_save" || spec.name === "memory_update" || spec.name === "memory_delete") {
-    ctx.store.reviews.rejectAttempt(caller.nonce);
-  }
   throw new ToolError("invalid_input", describeIssues(parsed.error));
 }
 
@@ -139,11 +233,11 @@ function describeIssues(error: z.ZodError): string {
 
 function recordDenied(
   ctx: ToolContext,
-  caller: Caller,
+  auditNonce: string,
   denial: { tool: string; operation: string; ids: number[] },
 ): void {
   if (denial.ids.length === 0) return;
-  ctx.store.audit.record(caller.nonce, { kind: "denied", ...denial });
+  ctx.store.audit.record(auditNonce, { kind: "denied", ...denial });
 }
 
 class MutationGate {
@@ -160,13 +254,12 @@ class MutationGate {
    */
   async run(
     caller: Caller,
-    request: ToolRequest,
+    request: InvocationRequest,
     change: { kind: ReviewOpKind; tool: string; args: unknown },
     work: (reservation: Reservation | undefined) => Promise<string> | string,
   ): Promise<string> {
-    const key = sha256(
-      JSON.stringify(request.id === null ? [change.tool, change.args] : ["request", request.id]),
-    );
+    const key = sha256(canonicalBody([change.tool, request.id, change.args]));
+    request.admissionAttempted = true;
     const admission = this.store.reviews.admit(caller.nonce, key, change.kind);
     if (admission.kind === "unrestricted") return work(undefined);
     if (admission.kind === "replay") {
@@ -217,7 +310,15 @@ function gateFor(store: MemoryStore): MutationGate {
 }
 
 export function createTools(ctx: ToolContext): ToolDefinition[] {
-  return [searchTool(ctx), getTool(ctx), saveTool(ctx), updateTool(ctx), deleteTool(ctx), contextTool(ctx)];
+  return [
+    searchTool(ctx),
+    getTool(ctx),
+    saveTool(ctx),
+    updateTool(ctx),
+    deleteTool(ctx),
+    mutateTool(ctx),
+    contextTool(ctx),
+  ];
 }
 
 function searchTool(ctx: ToolContext): ToolDefinition {
@@ -227,7 +328,7 @@ function searchTool(ctx: ToolContext): ToolDefinition {
       "Search durable memory by meaning and keywords. Returns compact hits; call memory_get for full content. " +
       "scope: all (project + global, default), project, or global. Search before saving to avoid duplicates.",
     schema: searchInput,
-    async run(args, caller, access) {
+    async run(args, _caller, access, request) {
       const scope = args.scope ?? "all";
       const signal = AbortSignal.timeout(SEARCH_DEADLINE_MS);
       const hits = await ctx.store.search({
@@ -242,7 +343,7 @@ function searchTool(ctx: ToolContext): ToolDefinition {
       });
       if (signal.aborted)
         throw new ToolError("search_timeout", "The search took too long. Try a narrower query.");
-      ctx.store.audit.record(caller.nonce, {
+      ctx.store.audit.record(request.auditNonce, {
         kind: "search",
         query: args.query,
         scope,
@@ -267,126 +368,242 @@ function getTool(ctx: ToolContext): ToolDefinition {
     name: "memory_get",
     description: "Get full content for memory ids returned by memory_search.",
     schema: getInput,
-    run({ ids }, caller, access) {
+    run({ ids }, caller, access, request) {
       const rows = ctx.store.getVisible(access, ids);
-      recordDenied(ctx, caller, {
+      recordDenied(ctx, request.auditNonce, {
         tool: "memory_get",
         operation: "read",
         ids: ctx.store.deniedIds(access, ids),
       });
-      ctx.store.markUsed(rows.map((r) => r.id));
-      const shown = caller.nonce ? ctx.store.audit.shownTo(caller.nonce) : new Set<number>();
-      ctx.store.markOpened(rows.map((r) => r.id).filter((id) => shown.has(id)));
-      ctx.store.audit.record(caller.nonce, { kind: "get", ids, found: rows.map((r) => r.id) });
       const found = new Set(rows.map((r) => r.id));
+      const principal = agentPrincipal(caller, access, request.principalId);
+      const candidates = ids.flatMap((id) => {
+        if (found.has(id)) return [];
+        const receipt = ownCandidateReceipt(ctx.store.lifecycleDetail(access, id), principal);
+        if (!receipt) return [];
+        found.add(id);
+        return [receipt];
+      });
+      ctx.store.markUsed([...found]);
+      const shown = ctx.store.audit.shownTo(request.auditNonce);
+      ctx.store.markOpened([...found].filter((id) => shown.has(id)));
+      ctx.store.audit.record(request.auditNonce, { kind: "get", ids, found: [...found] });
       const merged = ids.flatMap((id) => {
         const target = found.has(id) ? null : ctx.store.mergedIntoVisible(access, id);
         return target === null ? [] : [`#${id} was merged into #${target}; fetch #${target} instead.`];
       });
-      if (rows.length === 0 && merged.length === 0) return "No memories found for those ids.";
-      const bodies = rows.map(
-        (r) =>
+      if (rows.length === 0 && merged.length === 0 && candidates.length === 0)
+        return "No memories found for those ids.";
+      const bodies = rows.map((r) => {
+        const lifecycle = ctx.store.lifecycleDetail(access, r.id);
+        return (
           `#${r.id} [${r.type}/${r.scope}${r.pinned ? "/pinned" : ""}] ${r.title}\n` +
-          `project: ${r.project_name ?? "(global)"}  topic_key: ${r.topic_key ?? "-"}  updated: ${r.updated_at}  revisions: ${r.revision_count}\n\n${r.content}`,
-      );
-      return [...merged, ...bodies].join("\n\n---\n\n");
+          `project: ${r.project_name ?? "(global)"}  topic_key: ${r.topic_key ?? "-"}  updated: ${r.updated_at}\n` +
+          `memoryRef: ${JSON.stringify(lifecycle?.memoryRef)}  state: ${lifecycle?.state}  verification: ${lifecycle?.verificationStatus}\n` +
+          `validFrom: ${lifecycle?.validFrom ?? "-"}  validUntil: ${lifecycle?.validUntil ?? "-"}\n` +
+          `evidence: ${JSON.stringify(lifecycle?.evidence ?? [])}\n\n${r.content}`
+        );
+      });
+      return [...merged, ...bodies, ...candidates].join("\n\n---\n\n");
     },
   });
+}
+
+function ownCandidateReceipt(detail: LifecycleDetail | null, principal: MutationPrincipal): string | null {
+  if (detail?.state !== "candidate") return null;
+  const origin = detail.revisions.find((revision) => revision.revision === 1);
+  if (origin?.actorId !== principal.actorId) return null;
+  const snapshot = detail.revisions.find(
+    (revision) => revision.revision === detail.memoryRef.revision,
+  )?.snapshot;
+  if (!snapshot || typeof snapshot.title !== "string" || typeof snapshot.content !== "string") return null;
+  return JSON.stringify({
+    memoryRef: detail.memoryRef,
+    state: detail.state,
+    recordKind: detail.recordKind,
+    verificationStatus: detail.verificationStatus,
+    validFrom: detail.validFrom,
+    validUntil: detail.validUntil,
+    title: snapshot.title,
+    content: snapshot.content,
+    evidence: detail.evidence,
+  });
+}
+
+function callerPrincipalId(caller: Caller): string {
+  if (caller.nonce) return `nonce:${caller.nonce}`;
+  if (caller.agentId) return `agent:${caller.agentId}`;
+  return `credential:${sha256(canonicalBody(caller))}`;
+}
+
+function agentPrincipal(caller: Caller, access: Access, id: string): MutationPrincipal {
+  return { id, actorId: id, access, agentId: caller.agentId, provider: caller.provider };
+}
+
+function legacyRequestId(tool: string, args: unknown, request: ToolRequest, explicit?: string): string {
+  return explicit ?? `legacy:${tool}:${sha256(canonicalBody(request.id ?? args))}`;
+}
+
+interface MutationCall {
+  caller: Caller;
+  access: Access;
+  request: InvocationRequest;
+  tool: string;
+  kind: ReviewOpKind;
+  mutation: MutationRequest;
+}
+
+function runMutation(ctx: ToolContext, call: MutationCall): Promise<string> | string {
+  const { caller, access, request, tool, kind, mutation } = call;
+  const principal = agentPrincipal(caller, access, request.principalId);
+  const parsed = MutationRequestSchema.parse(mutation);
+  // Replays remain readable even when a new review has no capacity.
+  const prior = ctx.store.mutations.replay(principal, parsed);
+  if (prior) return JSON.stringify(prior);
+  return gateFor(ctx.store).run(caller, request, { kind, tool, args: parsed }, (reservation) => {
+    const result = ctx.store.mutations.mutate(principal, parsed, reservation);
+    if (kind === "save")
+      ctx.store.audit.record(request.auditNonce, {
+        kind: "save",
+        id: result.memoryRef.id,
+        status: result.status,
+        candidates: [],
+      });
+    else if (kind === "delete")
+      ctx.store.audit.record(request.auditNonce, {
+        kind: "delete",
+        id: result.memoryRef.id,
+        ok: result.status === "updated" || result.status === "forgotten",
+      });
+    else
+      ctx.store.audit.record(request.auditNonce, {
+        kind: "update",
+        id: result.memoryRef.id,
+        ok: true,
+        unchanged: result.status === "unchanged",
+      });
+    return JSON.stringify(result);
+  });
+}
+
+function currentRevision(ctx: ToolContext, access: Access, id: number): number {
+  const detail = ctx.store.lifecycleDetail(access, id);
+  if (!detail) throw new MutationError("scope_denied", "Memory is unavailable.");
+  return detail.memoryRef.revision;
+}
+
+function assertContentLimit(value: string | undefined): void {
+  if (value && value.length > MAX_CONTENT_CHARS) {
+    throw new ToolError("content_too_long", `Content over ${MAX_CONTENT_CHARS} characters is rejected.`);
+  }
+}
+
+function legacySaveTarget(
+  ctx: ToolContext,
+  args: z.output<typeof saveInput>,
+  principal: MutationPrincipal,
+  input: { requestId: string; scope: "global" | "project"; project: ProjectRef | null },
+): Pick<MutationRequest, "operation" | "id" | "expectedRevision"> {
+  const previous = ctx.store.mutations.compatibilityRequest(principal, input.requestId);
+  if (previous)
+    return previous.operation === "update"
+      ? {
+          operation: "update",
+          id: previous.id,
+          expectedRevision: args.expected_revision ?? previous.expectedRevision ?? undefined,
+        }
+      : { operation: "create" };
+  if (!args.topic_key) return { operation: "create" };
+  const holder = ctx.store.authorizedTopic(
+    principal.access,
+    input.scope,
+    input.scope === "project" ? (input.project?.key ?? null) : null,
+    args.topic_key,
+  );
+  if (!holder) return { operation: "create" };
+  return {
+    operation: "update",
+    id: holder.id,
+    expectedRevision: args.expected_revision ?? holder.record_revision,
+  };
 }
 
 function saveTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_save",
     description:
-      "Save one durable fact: a decision, root cause, convention, config detail, or user correction. Search " +
-      "first. Keep content under 800 characters; content over " +
-      `${MAX_CONTENT_CHARS} characters is rejected. Default scope is project (shared across this project's ` +
-      "worktrees); use global for user preferences that apply to every project. Provide topic_key to update an " +
-      "existing entry for the same topic. A near-identical memory of the same type is not saved again: the " +
-      "result names it so you can call memory_update instead.",
+      "Save a durable assertion as a candidate, not a verified fact. Search first. " +
+      "Use topic_key to correct an existing topic with expected_revision; request_id makes retries idempotent. " +
+      "User preferences require owner approval.",
     schema: saveInput,
-    run(args, caller, _access, request) {
-      const change = { kind: "save", tool: "memory_save", args } as const;
-      return gateFor(ctx.store).run(caller, request, change, (reservation) =>
-        performSave(ctx, args, caller, reservation),
-      );
+    run(args, caller, access, request) {
+      assertContentLimit(args.content);
+      const project = ctx.resolveProject(caller);
+      const scope = args.scope === "global" ? "global" : "project";
+      if (scope === "project" && !project)
+        throw new MutationError(
+          "scope_denied",
+          "This agent has no resolved project. Use scope=global or skip.",
+        );
+      const requestId = legacyRequestId("memory_save", args, request, args.request_id);
+      const target = legacySaveTarget(ctx, args, agentPrincipal(caller, access, request.principalId), {
+        requestId,
+        scope,
+        project,
+      });
+      const mutation: MutationRequest = {
+        requestId,
+        ...target,
+        change: {
+          title: args.title,
+          content: args.content,
+          type: args.type ?? "note",
+          scope,
+          project,
+          topicKey: args.topic_key,
+          pinned: args.pinned ?? false,
+        },
+      };
+      return runMutation(ctx, { caller, access, request, tool: "memory_save", kind: "save", mutation });
     },
   });
-}
-
-async function performSave(
-  ctx: ToolContext,
-  args: z.output<typeof saveInput>,
-  caller: Caller,
-  reservation: Reservation | undefined,
-): Promise<string> {
-  const project = ctx.resolveProject(caller);
-  const scope = args.scope === "global" ? "global" : "project";
-  if (scope === "project" && !project) {
-    return "This agent is not attached to a Paseo project, so project memory is unavailable. Use scope=global or skip.";
-  }
-  const result = await ctx.store.save(toSaveInput(args, { scope, project, caller }), reservation);
-  const candidates = result.status === "possible_duplicate" ? result.candidates.map((c) => c.id) : [];
-  ctx.store.audit.record(caller.nonce, { kind: "save", id: result.id, status: result.status, candidates });
-  return formatSave(result, scope === "project" ? project : null);
-}
-
-function toSaveInput(
-  args: z.output<typeof saveInput>,
-  input: { scope: "global" | "project"; project: ProjectRef | null; caller: Caller },
-): SaveInput {
-  return {
-    title: args.title,
-    content: args.content,
-    type: args.type ?? "note",
-    scope: input.scope,
-    project: input.project,
-    topicKey: args.topic_key ?? null,
-    pinned: args.pinned === true,
-    force: args.force === true,
-    source: "agent",
-    agentId: input.caller.agentId,
-    provider: input.caller.provider,
-  };
 }
 
 function updateTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_update",
     description:
-      "Update a memory by id (title, content, type, pinned, topic_key). Prior text is kept as a version. " +
-      `Content over ${MAX_CONTENT_CHARS} characters is rejected.`,
+      "Correct a memory with expected_revision and stable request_id. Corrections are candidates; " +
+      "prior revisions are retained. Preferences require owner authority.",
     schema: updateInput,
     run(args, caller, access, request) {
-      const { id } = args;
-      const patch = {
-        title: args.title,
-        content: args.content,
-        type: args.type,
-        pinned: args.pinned,
-        topicKey: args.topic_key,
-      };
-      return gateFor(ctx.store).run(
-        caller,
-        request,
-        { kind: "update", tool: "memory_update", args },
-        (reservation) => {
-          const outcome = ctx.store.updateAuthorized(access, id, patch, reservation);
-          if (outcome === "denied") {
-            recordDenied(ctx, caller, { tool: "memory_update", operation: "write", ids: [id] });
-          } else {
-            const ok = outcome === "ok" || outcome === "unchanged";
-            ctx.store.audit.record(caller.nonce, {
-              kind: "update",
-              id,
-              ok,
-              unchanged: outcome === "unchanged",
-            });
-          }
-          if (outcome === "unchanged") return `unchanged: #${id} already says this`;
-          return outcome === "ok" ? `updated: #${id}` : `not found: #${id}`;
-        },
+      assertContentLimit(args.content);
+      const requestId = legacyRequestId("memory_update", args, request, args.request_id);
+      const previous = ctx.store.mutations.compatibilityRequest(
+        agentPrincipal(caller, access, request.principalId),
+        requestId,
       );
+      return runMutation(ctx, {
+        caller,
+        access,
+        request,
+        tool: "memory_update",
+        kind: "update",
+        mutation: {
+          requestId,
+          operation: "update",
+          id: args.id,
+          expectedRevision:
+            args.expected_revision ?? previous?.expectedRevision ?? currentRevision(ctx, access, args.id),
+          change: {
+            title: args.title,
+            content: args.content,
+            type: args.type,
+            pinned: args.pinned,
+            topicKey: args.topic_key,
+          },
+        },
+      });
     },
   });
 }
@@ -394,21 +611,47 @@ function updateTool(ctx: ToolContext): ToolDefinition {
 function deleteTool(ctx: ToolContext): ToolDefinition {
   return defineTool(ctx, {
     name: "memory_delete",
-    description: "Delete a memory that is wrong or obsolete (soft delete).",
+    description: "Archive an obsolete memory with expected_revision. Retains history; this is not erasure.",
     schema: deleteInput,
-    run({ id }, caller, access, request) {
-      return gateFor(ctx.store).run(
-        caller,
-        request,
-        { kind: "delete", tool: "memory_delete", args: { id } },
-        (reservation) => {
-          const outcome = ctx.store.deleteAuthorized(access, id, false, reservation);
-          if (outcome === "denied")
-            recordDenied(ctx, caller, { tool: "memory_delete", operation: "delete", ids: [id] });
-          else ctx.store.audit.record(caller.nonce, { kind: "delete", id, ok: outcome === "ok" });
-          return outcome === "ok" ? `deleted: #${id}` : `not found: #${id}`;
-        },
+    run(args, caller, access, request) {
+      const requestId = legacyRequestId("memory_delete", args, request, args.request_id);
+      const previous = ctx.store.mutations.compatibilityRequest(
+        agentPrincipal(caller, access, request.principalId),
+        requestId,
       );
+      return runMutation(ctx, {
+        caller,
+        access,
+        request,
+        tool: "memory_delete",
+        kind: "delete",
+        mutation: {
+          requestId,
+          operation: "archive",
+          id: args.id,
+          expectedRevision:
+            args.expected_revision ?? previous?.expectedRevision ?? currentRevision(ctx, access, args.id),
+        },
+      });
+    },
+  });
+}
+
+function mutateTool(ctx: ToolContext): ToolDefinition {
+  return defineTool(ctx, {
+    name: "memory_mutate",
+    description:
+      "Apply an evidence-backed lifecycle mutation. Supply a stable requestId and expectedRevision " +
+      "for an existing record. Unsupported assertions remain candidates; promotion and preferences require owner authority.",
+    schema: MutationRequestSchema,
+    run(args, caller, access, request) {
+      const kind =
+        args.operation === "create" || args.operation === "propose"
+          ? "save"
+          : args.operation === "archive" || args.operation === "forget"
+            ? "delete"
+            : "update";
+      return runMutation(ctx, { caller, access, request, tool: "memory_mutate", kind, mutation: args });
     },
   });
 }
@@ -421,14 +664,14 @@ function contextTool(ctx: ToolContext): ToolDefinition {
       "used and recent memories, and recent agent sessions. Use after context compaction or when starting " +
       "unfamiliar work.",
     schema: contextInput,
-    run(_args, caller) {
+    run(_args, caller, _access, request) {
       const context = buildContext({
         store: ctx.store,
         project: ctx.resolveProject(caller),
         excludeAgentId: caller.agentId,
       });
       ctx.store.markShown(context.memoryIds);
-      ctx.store.audit.record(caller.nonce, {
+      ctx.store.audit.record(request.auditNonce, {
         kind: "context",
         memories: context.memoryIds,
         sessions: context.sessionIds,

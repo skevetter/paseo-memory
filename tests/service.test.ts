@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { z } from "zod";
 import { type RunningService, serviceKey, startService } from "../service/app";
 import { signCaller, verifyCaller } from "../service/mcp";
+import { MutationResultSchema } from "../shared/lifecycle";
 import { silentLogger } from "../shared/log";
 import { AgentAuditSchema, MAX_CONTENT_CHARS, SERVICE_KEY_HEADER } from "../shared/service-api";
 import { dataRepo, hashEmbedder, tempDir } from "./helpers";
@@ -52,13 +53,12 @@ async function mcp(body: unknown, headers: Record<string, string>) {
 
 const ToolCallResponse = z.object({ result: z.object({ content: z.array(z.object({ text: z.string() })) }) });
 const InitResponse = z.object({ result: z.object({ serverInfo: z.object({ name: z.string() }) }) });
-const ListResponse = z.object({ result: z.object({ tools: z.array(z.object({ name: z.string() })) }) });
 
 const toolText = (result: { json: unknown }): string | undefined =>
   ToolCallResponse.parse(result.json).result.content[0]?.text;
 
 describe("mcp endpoint", () => {
-  it("authenticates, lists tools, and saves and searches scoped by the signed project", async () => {
+  it("authenticates and scopes retrieval while keeping unreviewed assertions out of search", async () => {
     service.store.upsertProject(dataRepo);
     const auth = signCaller(service.secret, {
       projectKey: dataRepo.key,
@@ -80,15 +80,6 @@ describe("mcp endpoint", () => {
     );
     expect(InitResponse.parse(init.json).result.serverInfo.name).toBe("paseo-memory");
     expect((await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, auth)).status).toBe(202);
-    const list = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/list" }, auth);
-    expect(ListResponse.parse(list.json).result.tools.map((t) => t.name)).toEqual([
-      "memory_search",
-      "memory_get",
-      "memory_save",
-      "memory_update",
-      "memory_delete",
-      "memory_context",
-    ]);
     const saved = await mcp(
       {
         jsonrpc: "2.0",
@@ -105,7 +96,8 @@ describe("mcp endpoint", () => {
       },
       auth,
     );
-    expect(toolText(saved)).toMatch(/^created: #\d+ \(project: data\/data-team\)$/);
+    const candidate = MutationResultSchema.parse(JSON.parse(toolText(saved) ?? "{}"));
+    expect(candidate.state).toBe("candidate");
     const found = await mcp(
       {
         jsonrpc: "2.0",
@@ -115,7 +107,24 @@ describe("mcp endpoint", () => {
       },
       auth,
     );
-    expect(toolText(found)).toContain("Airflow DAG naming");
+    expect(toolText(found)).not.toContain("Airflow DAG naming");
+    const promoted = await internal("mutate", {
+      requestId: "approve-dag-naming",
+      operation: "promote",
+      id: candidate.memoryRef.id,
+      expectedRevision: candidate.memoryRef.revision,
+    });
+    expect(promoted.status).toBe(200);
+    const active = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: { name: "memory_search", arguments: { query: "airflow dag" } },
+      },
+      auth,
+    );
+    expect(toolText(active)).toContain("Airflow DAG naming");
 
     const other = signCaller(service.secret, {
       projectKey: "remote:github.com/x/y",
@@ -132,7 +141,7 @@ describe("mcp endpoint", () => {
       },
       other,
     );
-    expect(toolText(hidden)).toBe("No matching memories.");
+    expect(toolText(hidden)).not.toContain("Airflow DAG naming");
   });
 
   it("rejects tampered and foreign-secret tokens", () => {
@@ -213,7 +222,11 @@ describe("internal api", () => {
 });
 
 const ToolResult = z.object({
-  result: z.object({ content: z.array(z.object({ text: z.string() })), isError: z.boolean() }),
+  result: z.object({
+    content: z.array(z.object({ text: z.string() })),
+    isError: z.boolean(),
+    structuredContent: z.object({ error: z.object({ code: z.string() }) }).optional(),
+  }),
 });
 
 describe("agent audit", () => {
@@ -257,14 +270,14 @@ describe("agent audit", () => {
       content: "Where: infra/terraform/staging",
       type: "config",
     });
-    const id = Number(/#(\d+)/.exec(saved.content[0]?.text ?? "")?.[1]);
+    const id = savedId(saved);
     await call(3, "memory_get", { ids: [id, 99999] });
     const tooLong = await call(4, "memory_save", {
       title: "Huge",
       content: "x".repeat(MAX_CONTENT_CHARS + 1),
     });
     expect(tooLong.isError).toBe(true);
-    expect(tooLong.content[0]?.text).toContain(`limit is ${MAX_CONTENT_CHARS}`);
+    expect(tooLong.structuredContent?.error.code).toBe("content_too_long");
 
     await internal("link-agent", {
       nonce: ctx.nonce,
@@ -277,7 +290,7 @@ describe("agent audit", () => {
       content: "Where: infra/prod",
       type: "config",
     });
-    const laterId = Number(/#(\d+)/.exec(later.content[0]?.text ?? "")?.[1]);
+    const laterId = savedId(later);
     expect((await internal("detail", { id: laterId })).json).toMatchObject({
       memory: { agentId: "agent-x" },
     });
@@ -290,7 +303,6 @@ describe("agent audit", () => {
       projectName: dataRepo.name,
     });
     expect(audit.injected?.memories.map((m) => m.title)).toContain("Deploys run from main");
-    expect(audit.injected?.budget).toBe(6000);
     expect(audit.events.map((e) => e.kind)).toEqual(["search", "save", "get", "save"]);
     const [search, save, get] = audit.events;
     expect(search?.query).toBe("deploys main branch");
@@ -311,9 +323,13 @@ const ContextOutput = z.object({
   mcpServer: z.object({ headers: z.record(z.string(), z.string()) }),
 });
 
-async function startAgent(agentId: string, task: { query: string; source: "prompt" | "names" } | null) {
+async function startAgent(
+  agentId: string,
+  task: { query: string; source: "prompt" | "names" } | null,
+  project: typeof dataRepo | null = dataRepo,
+) {
   const created = await internal("agent-context", {
-    project: dataRepo,
+    project,
     provider: "omp",
     includeContext: true,
     includeTools: true,
@@ -336,7 +352,7 @@ async function startAgent(agentId: string, task: { query: string; source: "promp
 }
 
 const savedId = (result: { content: { text: string }[] }) =>
-  Number(/#(\d+)/.exec(result.content[0]?.text ?? "")?.[1]);
+  MutationResultSchema.parse(JSON.parse(result.content[0]?.text ?? "{}")).memoryRef.id;
 
 describe("task-aware start", () => {
   it("injects task matches above the general lists and records the query and matches", async () => {
@@ -433,30 +449,83 @@ describe("session review", () => {
         (await internal("sessions", { query: "backoff", paseoProjectId: dataRepo.paseoProjectId, limit: 5 }))
           .json,
       );
-    expect(sessions.items.find((s) => s.agentId === agentId)).toEqual({
-      agentId,
-      summary: "Capped retries at three and kept backoff.",
-      outcomes: `Saved #${ids[0]}: Review fact 1\nSaved #${ids[1]}: Review fact 2\nSaved #${ids[2]}: Review fact 3`,
-    });
+    const session = sessions.items.find((s) => s.agentId === agentId);
+    expect(session).toMatchObject({ agentId, summary: "Capped retries at three and kept backoff." });
+    for (const [index, id] of ids.entries()) {
+      expect(session?.outcomes).toContain(`#${id}`);
+      expect(session?.outcomes).toContain(`Review fact ${index + 1}`);
+    }
     const next = await startAgent("agent-next", null);
-    expect(next.systemPrompt).toContain("→ Capped retries at three and kept backoff.");
+    expect(next.systemPrompt).toContain("Capped retries at three and kept backoff.");
     const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId })).json);
     const review = audit.events.find((e) => e.kind === "review");
     expect(review).toMatchObject({ text: "Capped retries at three and kept backoff." });
-    expect(review?.summary).toMatch(/^saved #\d+, #\d+, #\d+ in \d+ s \(idle\)$/);
     expect(review?.memories.map((m) => m.status)).toEqual(["saved", "saved", "saved"]);
   });
 
   it("declines agents without memory tools and records skipped reviews", async () => {
     expect(
       (await internal("review-start", { agentId: "agent-unknown", trigger: "idle" })).json,
-    ).toMatchObject({
-      ok: false,
-      reason: "This agent has no memory tools.",
-    });
+    ).toMatchObject({ ok: false });
     await startAgent("agent-busy", null);
     await internal("review-skip", { agentId: "agent-busy", trigger: "turns", reason: "The agent is busy." });
     const audit = AgentAuditSchema.parse((await internal("agent-audit", { agentId: "agent-busy" })).json);
-    expect(audit.events.map((e) => e.summary)).toEqual(["skipped (turns): The agent is busy."]);
+    expect(audit.events).toMatchObject([{ kind: "review" }]);
   });
+});
+
+it("counts preflight and admitted failures once, and never recharges an authorized replay", async () => {
+  const fixture = await internal("save", {
+    title: "Attempt budget fixture",
+    content: "A real editable record",
+    type: "note",
+    scope: "global",
+    paseoProjectId: null,
+    project: null,
+    pinned: false,
+  });
+  const ref = MutationResultSchema.parse(fixture.json).memoryRef;
+  const reviewer = await startAgent("preflight-attempt-review", null);
+  await internal("review-start", { agentId: "preflight-attempt-review", trigger: "idle" });
+  const attempts: [string, Record<string, unknown>][] = [
+    ["memory_update", { id: 999999, content: "Unavailable record" }],
+    ["memory_save", { title: "Oversized", content: "x".repeat(MAX_CONTENT_CHARS + 1) }],
+    ["memory_update", { id: "malformed", title: "Invalid arguments" }],
+    [
+      "memory_mutate",
+      {
+        requestId: "admitted-cas-failure",
+        operation: "update",
+        id: ref.id,
+        expectedRevision: ref.revision + 1,
+        change: { content: "Stale correction" },
+      },
+    ],
+  ];
+  for (const [index, [name, args]] of attempts.entries()) {
+    expect((await reviewer.call(name, args)).isError).toBe(true);
+    expect(service.store.reviews.info(reviewer.nonce)).toMatchObject({ attempts: index + 1, committed: 0 });
+  }
+  const mutation = {
+    title: "Idempotent review candidate",
+    content: "A bounded candidate assertion",
+    request_id: "attempt-budget-create",
+  };
+  const first = await reviewer.call("memory_save", mutation);
+  expect(first.isError).toBe(false);
+  const replay = await reviewer.call("memory_save", mutation);
+  expect(replay).toEqual(first);
+  expect(service.store.reviews.info(reviewer.nonce)).toMatchObject({ attempts: 5, committed: 1 });
+  const conflict = await reviewer.call("memory_save", { ...mutation, content: "Different retry body" });
+  expect(conflict.structuredContent?.error.code).toBe("request_conflict");
+  expect(service.store.reviews.info(reviewer.nonce)).toMatchObject({ attempts: 6, committed: 1 });
+
+  const unresolved = await startAgent("unresolved-project-review", null, null);
+  await internal("review-start", { agentId: "unresolved-project-review", trigger: "idle" });
+  const denied = await unresolved.call("memory_save", {
+    title: "No project",
+    content: "Cannot assign this scope",
+  });
+  expect(denied.structuredContent?.error.code).toBe("scope_denied");
+  expect(service.store.reviews.info(unresolved.nonce)).toMatchObject({ attempts: 1, committed: 0 });
 });

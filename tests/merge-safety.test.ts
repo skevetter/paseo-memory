@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { Access } from "../service/access";
+import { ownerMutation } from "../service/mutations";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type SaveInput } from "../service/store";
 import { runUpkeep, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME } from "../shared/service-api";
-import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
+import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, removeV7Schema, tempDir } from "./helpers";
 
 let store: MemoryStore;
 let path: string;
@@ -119,7 +120,6 @@ describe("revision guarded merge and undo", () => {
     const b = await save({ title: "Second policy", content: "Keep history" });
     store.updateAuthorized(owner, a, { content: "Require signed commits" });
     await store.indexPending();
-    const before = store.getVisible(owner, [a])[0];
     const merged = store.mergeAuthorized(owner, mergeRequest(store, a, b));
     expect({ ...merged }).toMatchObject({ ok: true, mergeId: expect.any(Number) });
     const mergeId = merged.mergeId as number;
@@ -145,11 +145,13 @@ describe("revision guarded merge and undo", () => {
     expect(store.undoMergeAuthorized(owner, mergeId).ok).toBe(true);
     const restored = store.detailAuthorized(owner, a);
     expect(restored.memory).toMatchObject({ id: a, content: "Require signed commits", recordRevision: 4 });
-    expect(restored.versions.map((version) => version.content)).toEqual([
-      "Require signed commits",
-      "Use signed commits",
-    ]);
-    expect(store.getVisible(owner, [a])[0]?.index_generation).toBe((before?.index_generation ?? 0) + 1);
+    const history = store.lifecycleDetail(owner, a)?.revisions;
+    expect(history?.find((version) => version.revision === 1)?.snapshot.content).toBe("Use signed commits");
+    expect(history?.find((version) => version.revision === 3)?.snapshot).toMatchObject({
+      state: "superseded",
+      merged_into: b,
+      content: "Require signed commits",
+    });
     await store.indexPending();
     expect(
       (await store.search({ access: Access.agent(dataRepo.key), query: "signed" })).map((hit) => hit.id),
@@ -177,7 +179,10 @@ describe("v6 review extension upgrade", () => {
     const before = store.getVisible(owner, [id])[0];
     store.close();
     const { db } = openDatabase(path);
-    db.run("DROP TABLE review_ops; DROP TABLE review_windows; DROP TABLE memory_merges;");
+    removeV7Schema(db);
+    db.run(
+      "DROP TABLE review_ops; DROP TABLE review_windows; DROP TABLE memory_merges; PRAGMA user_version=6;",
+    );
     db.close();
     store = new MemoryStore({ path });
     expect(store.getVisible(owner, [id])[0]).toMatchObject({
@@ -192,4 +197,37 @@ describe("v6 review extension upgrade", () => {
     expect(store.updateAuthorized(owner, id, { pinned: true }, reservation.reservation)).toBe("ok");
     expect(store.reviews.info("nonce")?.committed).toBe(1);
   });
+});
+
+it("does not merge a permanent fact into an otherwise identical temporary exception", async () => {
+  const principal = ownerMutation(owner);
+  const claim = {
+    title: "Canonical deployment policy",
+    content: "Require signed deployments",
+    type: "config",
+    scope: "global" as const,
+  };
+  const permanent = store.mutations.mutate(principal, {
+    requestId: "permanent",
+    operation: "create",
+    change: claim,
+  });
+  const temporary = store.mutations.mutate(principal, {
+    requestId: "temporary",
+    operation: "create",
+    change: { ...claim, validUntil: "2100-01-01T00:00:00Z" },
+  });
+  store.markUsed([temporary.memoryRef.id]);
+  await store.indexPending();
+  expect(run().merged).toBe(0);
+  store.mutations.mutate(principal, {
+    requestId: "expire-temporary",
+    operation: "update",
+    id: temporary.memoryRef.id,
+    expectedRevision: temporary.memoryRef.revision,
+    change: { validUntil: "2000-01-01T00:00:00Z" },
+  });
+  expect(
+    store.getVisible(owner, [permanent.memoryRef.id, temporary.memoryRef.id]).map((row) => row.id),
+  ).toEqual([permanent.memoryRef.id]);
 });

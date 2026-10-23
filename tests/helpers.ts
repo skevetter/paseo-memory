@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,4 +74,23 @@ export function hashEmbedder(model = "test/hash", dims = 64): Embedder & { calls
 export function mergeRequest(store: MemoryStore, sourceId: number, targetId: number) {
   const revision = (id: number) => store.getVisible(owner, [id])[0]?.record_revision ?? -1;
   return { sourceId, targetId, sourceRevision: revision(sourceId), targetRevision: revision(targetId) };
+}
+
+export function removeV7Schema(db: Database): void {
+  db.run("DROP TRIGGER memory_revision_ai; DROP TRIGGER memory_revision_au;");
+  for (const table of [
+    "memory_revisions",
+    "memory_evidence",
+    "memory_evidence_links",
+    "memory_relations",
+    "memory_mutations",
+    "memory_feedback",
+    "review_jobs",
+    "review_job_sources",
+    "lifecycle_invalidations",
+    "memory_tombstones",
+    "source_artifacts",
+  ]) {
+    db.run(`DROP TABLE ${table}`);
+  }
 }

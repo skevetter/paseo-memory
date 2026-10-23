@@ -1,8 +1,11 @@
-import type { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
+import { existsSync, statfsSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { getLoadablePath } from "sqlite-vec";
 import { FatalError } from "./sqlite";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export class SchemaTooNewError extends FatalError {
   constructor(found: number, supported: number) {
@@ -16,29 +19,35 @@ export class SchemaTooNewError extends FatalError {
 export function migrate(db: Database): void {
   const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version ?? 0;
   if (current > SCHEMA_VERSION) throw new SchemaTooNewError(current, SCHEMA_VERSION);
-  if (current === SCHEMA_VERSION) {
-    const reviews = db.query(`SELECT name FROM sqlite_master WHERE name = 'review_windows'`).get();
-    if (!reviews) {
-      backupBeforeMigration(db, current);
-      db.transaction(() => db.run(REVIEW_SQL))();
-    }
-    return;
-  }
-  if (current > 0) backupBeforeMigration(db, current);
+  if (current === SCHEMA_VERSION) return;
+  backupBeforeMigration(db, current);
   db.transaction(() => {
-    if (current === 1) dropV1Vectors(db);
-    db.run(SCHEMA_SQL);
-    addColumns(db, "memories", V3_MEMORY_COLUMNS);
-    db.run(V3_SQL);
-    addColumns(db, "memories", V4_MEMORY_COLUMNS);
-    addColumns(db, "sessions", V4_SESSION_COLUMNS);
-    addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
-    db.run(V4_SQL);
-    db.run(V5_SQL);
-    addColumns(db, "memories", V6_MEMORY_COLUMNS);
-    addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
-    db.run(V6_SQL);
+    if (current < 6) {
+      if (current === 1) dropV1Vectors(db);
+      db.run(SCHEMA_SQL);
+      addColumns(db, "memories", V3_MEMORY_COLUMNS);
+      db.run(V3_SQL);
+      addColumns(db, "memories", V4_MEMORY_COLUMNS);
+      addColumns(db, "sessions", V4_SESSION_COLUMNS);
+      addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
+      db.run(V4_SQL);
+      db.run(V5_SQL);
+      addColumns(db, "memories", V6_MEMORY_COLUMNS);
+      addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
+      db.run(V6_SQL);
+    }
     db.run(REVIEW_SQL);
+    addColumns(db, "memories", V7_MEMORY_COLUMNS);
+    db.run(`UPDATE memories SET state=CASE WHEN merged_into IS NOT NULL THEN 'superseded'
+      WHEN deleted_at IS NOT NULL OR archived_at IS NOT NULL THEN 'archived' ELSE 'active' END,
+      record_kind=CASE WHEN type='preference' THEN 'preference' ELSE 'fact' END`);
+    db.run(V7_SQL);
+    initializeRevisions(db);
+    if (db.query(`PRAGMA foreign_key_check`).all().length !== 0) {
+      throw new FatalError(
+        "Memory migration failed foreign-key verification; the migration was rolled back.",
+      );
+    }
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
 }
@@ -49,10 +58,131 @@ function backupBeforeMigration(db: Database, from: number): void {
     .query<{ file: string }, []>(`SELECT file FROM pragma_database_list WHERE name = 'main'`)
     .get()?.file;
   if (!file) return;
+  const pages = db.query<{ page_count: number }, []>(`PRAGMA page_count`).get()?.page_count ?? 0;
+  if (pages === 0) return;
+  const pageSize = db.query<{ page_size: number }, []>(`PRAGMA page_size`).get()?.page_size ?? 4096;
+  const space = statfsSync(dirname(file), { bigint: true });
+  const required = BigInt(pages) * BigInt(pageSize) * 2n + 1048576n;
+  if (space.bavail * space.bsize < required) {
+    throw new FatalError(
+      "Insufficient disk space for a verified memory backup and migration; the database was not modified.",
+    );
+  }
   const base = `${file}.pre-v${SCHEMA_VERSION}-from-v${from}.bak`;
-  const target = existsSync(base) ? `${base}.${Date.now()}` : base;
+  const target = existsSync(base) ? `${base}.${randomUUID()}` : base;
+  writeFileSync(target, "", { flag: "wx", mode: 0o600 });
   db.query(`VACUUM INTO ?`).run(target);
+  const backup = new Database(target, { readonly: true });
+  try {
+    verifyBackup(backup, from, target);
+  } finally {
+    backup.close();
+  }
 }
+
+function verifyBackup(backup: Database, from: number, target: string): void {
+  backup.loadExtension(getLoadablePath());
+  const integrity = backup.query<{ integrity_check: string }, []>(`PRAGMA integrity_check`).all();
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+    throw new FatalError(`Memory backup failed integrity verification: ${target}; migration refused.`);
+  }
+  const version = backup.query<{ user_version: number }, []>(`PRAGMA user_version`).get()?.user_version;
+  if (version !== from || backup.query(`PRAGMA foreign_key_check`).all().length !== 0) {
+    throw new FatalError(
+      `Memory backup failed schema or foreign-key verification: ${target}; migration refused.`,
+    );
+  }
+  writeFileSync(
+    `${target}.json`,
+    JSON.stringify({
+      backupPath: target,
+      fromSchema: from,
+      toSchema: SCHEMA_VERSION,
+      integrity: "ok",
+      foreignKeys: "ok",
+      createdAt: new Date().toISOString(),
+    }),
+    { flag: "wx", mode: 0o600 },
+  );
+}
+
+const V7_MEMORY_COLUMNS: [string, string][] = [
+  ["record_kind", "TEXT NOT NULL DEFAULT 'fact'"],
+  ["state", "TEXT NOT NULL DEFAULT 'active'"],
+  ["verification_status", "TEXT NOT NULL DEFAULT 'unverified'"],
+  ["valid_from", "TEXT"],
+  ["valid_until", "TEXT"],
+  ["verified_at", "TEXT"],
+];
+
+function initializeRevisions(db: Database): void {
+  const columns = db.query<{ name: string }, []>(`PRAGMA table_info(memories)`).all();
+  const snapshot = (prefix: string) =>
+    `json_object(${columns.map(({ name }) => `'${name.replaceAll("'", "''")}', ${prefix}."${name.replaceAll('"', '""')}"`).join(", ")})`;
+  db.run(`
+    INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, legacy_metadata_unknown)
+      SELECT id, record_revision, ${snapshot("memories")}, updated_at, 1 FROM memories;
+    INSERT OR IGNORE INTO memory_revisions (memory_id, revision, snapshot, changed_at, legacy_metadata_unknown)
+      SELECT memory_id, version, json_object('title', title, 'content', content), created_at, 1 FROM memory_versions;
+    CREATE TRIGGER memory_revision_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, actor_id, reason, legacy_metadata_unknown)
+        VALUES (new.id, new.record_revision, ${snapshot("new")}, new.updated_at,
+          (SELECT value FROM meta WHERE key = 'mutation_actor'), (SELECT value FROM meta WHERE key = 'mutation_reason'), 0);
+    END;
+    CREATE TRIGGER memory_revision_au AFTER UPDATE ON memories WHEN new.record_revision != old.record_revision BEGIN
+      INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, actor_id, reason, legacy_metadata_unknown)
+        VALUES (new.id, new.record_revision, ${snapshot("new")}, new.updated_at,
+          (SELECT value FROM meta WHERE key = 'mutation_actor'), (SELECT value FROM meta WHERE key = 'mutation_reason'), 0);
+    END;
+  `);
+}
+
+const V7_SQL = `
+  CREATE TABLE memory_revisions (
+    memory_id INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot TEXT NOT NULL, changed_at TEXT NOT NULL,
+    actor_id TEXT, reason TEXT, legacy_metadata_unknown INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, revision));
+  CREATE TABLE memory_evidence (
+    evidence_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, source_ref TEXT NOT NULL, source_hash TEXT,
+    observed_at TEXT, source_event_at TEXT, stored_at TEXT NOT NULL, actor_id TEXT, agent_id TEXT, bot_id TEXT,
+    run_id TEXT, cycle_id TEXT, excerpt TEXT, sensitivity TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+    scope TEXT NOT NULL, project_key TEXT);
+  CREATE INDEX ix_memory_evidence_source ON memory_evidence(source_ref);
+  CREATE TABLE memory_evidence_links (
+    memory_id INTEGER NOT NULL, revision INTEGER NOT NULL, evidence_id TEXT NOT NULL, relationship TEXT NOT NULL,
+    PRIMARY KEY (memory_id, revision, evidence_id, relationship));
+  CREATE INDEX ix_memory_evidence_links_evidence ON memory_evidence_links(evidence_id);
+  CREATE TABLE memory_relations (
+    from_id INTEGER NOT NULL, from_revision INTEGER NOT NULL, to_id INTEGER NOT NULL, to_revision INTEGER NOT NULL,
+    kind TEXT NOT NULL, actor_id TEXT NOT NULL, created_at TEXT NOT NULL, verification_status TEXT NOT NULL,
+    PRIMARY KEY (from_id, from_revision, to_id, to_revision, kind));
+  CREATE INDEX ix_memory_relations_to ON memory_relations(to_id, to_revision);
+  CREATE TABLE memory_mutations (
+    principal_id TEXT NOT NULL, request_id TEXT NOT NULL, request_body_hash TEXT NOT NULL, operation TEXT NOT NULL,
+    memory_id INTEGER NOT NULL, expected_revision INTEGER, resulting_revision INTEGER NOT NULL,
+    result TEXT NOT NULL, created_at TEXT NOT NULL, actor_id TEXT, reason TEXT, PRIMARY KEY (principal_id, request_id));
+  CREATE TABLE memory_feedback (
+    producer_id TEXT NOT NULL, event_id TEXT NOT NULL, retrieval_id TEXT NOT NULL, memory_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL, run_id TEXT, cycle_id TEXT, signal TEXT NOT NULL, basis TEXT NOT NULL,
+    evidence_refs TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (producer_id, event_id));
+  CREATE TABLE review_jobs (
+    id TEXT PRIMARY KEY, source_watermark TEXT NOT NULL, purpose TEXT NOT NULL, policy_revision INTEGER NOT NULL,
+    state TEXT NOT NULL, lease_version INTEGER NOT NULL DEFAULT 0, input_fingerprint TEXT,
+    reservations TEXT NOT NULL DEFAULT '{}', usage TEXT NOT NULL DEFAULT '{}', retry_deadline TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  CREATE TABLE review_job_sources (
+    job_id TEXT NOT NULL, memory_id INTEGER NOT NULL, revision INTEGER NOT NULL, evidence_id TEXT,
+    PRIMARY KEY (job_id, memory_id, revision));
+  CREATE INDEX ix_review_job_sources_memory ON review_job_sources(memory_id, revision);
+  CREATE TABLE lifecycle_invalidations (
+    memory_id INTEGER NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (memory_id, revision));
+  CREATE TABLE memory_tombstones (
+    kind TEXT NOT NULL, identifier TEXT NOT NULL, forgotten_at TEXT NOT NULL, principal_id TEXT NOT NULL,
+    PRIMARY KEY (kind, identifier));
+  CREATE TABLE source_artifacts (
+    source_ref TEXT PRIMARY KEY, content TEXT NOT NULL, source_hash TEXT NOT NULL, scope TEXT NOT NULL,
+    project_key TEXT, allow_excerpt INTEGER NOT NULL, source_event_at TEXT, created_at TEXT NOT NULL);
+`;
 
 const V6_MEMORY_COLUMNS: [string, string][] = [
   ["index_generation", "INTEGER NOT NULL DEFAULT 1"],

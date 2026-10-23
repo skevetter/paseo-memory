@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { LifecycleDetail } from "../shared/lifecycle";
 import { type Logger, silentLogger } from "../shared/log";
 import {
   DEFAULT_RUNTIME,
@@ -20,6 +21,9 @@ import type {
 import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { type IndexHealth, IndexRetry, type IndexRetryOptions } from "./index-retry";
+import { currentLifecycleSql, Lifecycle } from "./lifecycle";
+import { canonicalBody, MemoryMutations, MutationError, ownerMutation } from "./mutations";
+import { Provenance } from "./provenance";
 import { redact } from "./redact";
 import { RERANK_CANDIDATES, type Reranker } from "./reranker";
 import { type Reservation, ReviewLedger } from "./review-ledger";
@@ -107,6 +111,12 @@ export interface MemoryRow {
   deleted_at: string | null;
   index_generation: number;
   record_revision: number;
+  record_kind: "fact" | "preference" | "episode" | "derived_summary" | "lesson" | "procedure_ref";
+  state: "candidate" | "active" | "rejected" | "superseded" | "needs_recheck" | "archived";
+  verification_status: "unverified" | "verified" | "unresolved";
+  valid_from: string | null;
+  valid_until: string | null;
+  verified_at: string | null;
 }
 
 export type MemoryWithProject = MemoryRow & { project_name: string | null };
@@ -210,11 +220,16 @@ type IndexRow = Pick<
   "id" | "title" | "content" | "scope" | "project_key" | "content_hash" | "index_generation"
 >;
 type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "merged_into" | "archived_at">;
+interface MergeRevisions {
+  sourceRevision: number;
+  targetRevision: number;
+}
 
 const HIDDEN_DETAIL: MemoryDetail = {
   memory: null,
   mergedInto: null,
   mergeId: null,
+  mergeRevisions: null,
   archived: false,
   versions: [],
   duplicates: [],
@@ -230,6 +245,9 @@ export class MemoryStore {
   readonly sqliteVecVersion: string;
   readonly audit: AuditLog;
   readonly reviews: ReviewLedger;
+  readonly provenance: Provenance;
+  readonly lifecycle: Lifecycle;
+  readonly mutations: MemoryMutations;
   private readonly db: Database;
   private readonly now: () => Date;
   private readonly log: Logger;
@@ -255,10 +273,21 @@ export class MemoryStore {
     migrate(this.db);
     this.audit = new AuditLog(this.db, () => this.ts());
     this.reviews = new ReviewLedger(this.db, this.now);
+    this.provenance = new Provenance(this.db, () => this.ts());
+    this.lifecycle = new Lifecycle(this.db, () => this.ts());
+    this.mutations = new MemoryMutations(this.db, {
+      provenance: this.provenance,
+      lifecycle: this.lifecycle,
+      reviews: this.reviews,
+      now: () => this.ts(),
+      changed: () => this.scheduleIndex(),
+    });
+    this.lifecycle.resume();
   }
 
   close(): void {
     this.closed = true;
+    this.lifecycle.close();
     this.db.close();
   }
 
@@ -354,7 +383,7 @@ export class MemoryStore {
   }
 
   getVisible(access: Access, ids: number[]): MemoryWithProject[] {
-    return this.rowsById(ids).filter((row) => access.allows("read", namespaceOf(row)));
+    return this.rowsById(ids).filter((row) => access.allows("read", namespaceOf(row)) && this.current(row));
   }
 
   /** Ids that exist but are outside the caller's grant; callers report them as missing and audit the denial. */
@@ -401,9 +430,10 @@ export class MemoryStore {
     const ts = this.ts();
     this.db
       .query(
-        `UPDATE memories SET deleted_at = ?, archived_at = ?, record_revision = record_revision + 1 WHERE id = ?`,
+        `UPDATE memories SET state='archived',deleted_at=?,archived_at=?,updated_at=?,record_revision=record_revision+1,index_generation=index_generation+1 WHERE id=?`,
       )
-      .run(ts, ts, id);
+      .run(ts, ts, ts, id);
+    this.lifecycle.invalidate({ id, revision: existing.record_revision });
     dropVectors(this.db, id);
     return "ok";
   }
@@ -457,7 +487,7 @@ export class MemoryStore {
     const next = patched(existing, patch);
     const { textChanged, reindex, changed } = classifyChange(existing, next);
     if (!changed) return false;
-    if (textChanged) this.snapshot(existing);
+    this.lifecycle.invalidate({ id: existing.id, revision: existing.record_revision });
     if (next.project) this.upsertProject(next.project);
     this.db
       .query(
@@ -514,8 +544,11 @@ export class MemoryStore {
         if (hard) this.db.query(`DELETE FROM memories WHERE id = ?`).run(id);
         else {
           this.db
-            .query(`UPDATE memories SET deleted_at = ?, record_revision = record_revision + 1 WHERE id = ?`)
-            .run(this.ts(), id);
+            .query(
+              `UPDATE memories SET state='archived',deleted_at=?,updated_at=?,record_revision=record_revision+1,index_generation=index_generation+1 WHERE id=?`,
+            )
+            .run(this.ts(), this.ts(), id);
+          this.lifecycle.invalidate({ id, revision: existing.record_revision });
         }
         dropVectors(this.db, id);
         return "ok";
@@ -534,7 +567,7 @@ export class MemoryStore {
     if (!access.allows("restore", namespaceOf(existing))) return "denied";
     const old = this.db
       .query<{ title: string; content: string }, [number, number]>(
-        `SELECT title, content FROM memory_versions WHERE memory_id = ? AND version = ?`,
+        `SELECT json_extract(snapshot,'$.title') AS title, json_extract(snapshot,'$.content') AS content FROM memory_revisions WHERE memory_id = ? AND revision = ?`,
       )
       .get(id, version);
     if (!old) return "not_found";
@@ -546,96 +579,54 @@ export class MemoryStore {
    * snapshots are recorded so the merge can be undone.
    */
   mergeAuthorized(access: Access, request: MergeRequest, actor: "owner" | "upkeep" = "owner"): MergeResult {
-    const result = this.db.transaction((): MergeResult => {
-      const { sourceId, targetId } = request;
-      if (sourceId === targetId) return { ok: false, message: "A memory cannot be merged into itself." };
-      const rows = this.rowsById([sourceId, targetId]);
-      const source = rows.find((row) => row.id === sourceId);
-      const target = rows.find((row) => row.id === targetId);
-      // A denied pair reads like a missing one so ids in other namespaces are not confirmed.
-      if (!source || !target || rows.some((row) => !access.allows("merge", namespaceOf(row)))) {
-        return { ok: false, message: "Both memories must exist." };
-      }
-      if (
-        source.record_revision !== request.sourceRevision ||
-        target.record_revision !== request.targetRevision
-      ) {
-        return {
-          ok: false,
-          conflict: true,
-          message: "A memory changed since you looked at it. Reload and check again.",
-        };
-      }
-      const mergeId = this.recordMerge(source, target, actor);
-      return { ok: true, mergeId, message: `Merged #${sourceId} into #${targetId}.` };
-    })();
-    if (result.ok) this.scheduleIndex();
-    return result;
+    try {
+      this.mutations.mutate(
+        { id: actor, actorId: actor, access },
+        {
+          requestId: `merge:${request.sourceId}@${request.sourceRevision}:${request.targetId}@${request.targetRevision}`,
+          operation: "merge",
+          id: request.sourceId,
+          expectedRevision: request.sourceRevision,
+          change: { target: { id: request.targetId, revision: request.targetRevision } },
+        },
+      );
+      return {
+        ok: true,
+        mergeId: this.openMerge(request.sourceId)?.id,
+        message: `Merged #${request.sourceId} into #${request.targetId}.`,
+      };
+    } catch (error) {
+      if (!(error instanceof MutationError)) throw error;
+      return { ok: false, conflict: error.code === "revision_conflict", message: error.message };
+    }
   }
 
-  private recordMerge(source: MemoryRow, target: MemoryRow, actor: string): number {
-    const ts = this.ts();
+  undoMergeAuthorized(
+    access: Access,
+    mergeId: number,
+    expected?: MergeRevisions,
+  ): { ok: boolean; message: string } {
     const merge = this.db
-      .query(
-        `INSERT INTO memory_merges (source_id, target_id, relation, actor, source_snapshot, target_snapshot, created_at)
-         VALUES (?, ?, 'duplicate_of', ?, ?, ?, ?)`,
-      )
-      .run(source.id, target.id, actor, JSON.stringify(source), JSON.stringify(target), ts);
-    this.db
-      .query(
-        `UPDATE memories SET deleted_at = ?, merged_into = ?, record_revision = record_revision + 1 WHERE id = ?`,
-      )
-      .run(ts, target.id, source.id);
-    dropVectors(this.db, source.id);
-    return Number(merge.lastInsertRowid);
-  }
-
-  /** Brings a merged memory back under its own id, with its history, and queues it for indexing again. */
-  undoMergeAuthorized(access: Access, mergeId: number): { ok: boolean; message: string } {
-    const merge = this.db
-      .query<{ source_id: number; target_id: number; undone_at: string | null }, [number]>(
-        `SELECT source_id, target_id, undone_at FROM memory_merges WHERE id = ?`,
+      .query<{ source_id: number; target_id: number }, [number]>(
+        "SELECT source_id,target_id FROM memory_merges WHERE id=?",
       )
       .get(mergeId);
-    const source = merge ? this.removed(merge.source_id) : null;
-    const target = merge ? this.removed(merge.target_id) : null;
-    if (!merge || !source || !target || !access.allows("merge", namespaceOf(source))) {
-      return { ok: false, message: "That merge does not exist." };
+    if (!merge) return { ok: false, message: "That merge does not exist." };
+    const revisions = expected ?? this.mergeRevisionsFor(merge.source_id, merge.target_id);
+    if (!revisions) return { ok: false, message: "Both memories must exist." };
+    try {
+      this.mutations.mutate(ownerMutation(access), {
+        requestId: `undo:${mergeId}:${revisions.sourceRevision}:${revisions.targetRevision}`,
+        operation: "undo_merge",
+        id: merge.source_id,
+        expectedRevision: revisions.sourceRevision,
+        change: { mergeId, target: { id: merge.target_id, revision: revisions.targetRevision } },
+      });
+      return { ok: true, message: `Restored #${merge.source_id}.` };
+    } catch (error) {
+      if (!(error instanceof MutationError)) throw error;
+      return { ok: false, message: error.message };
     }
-    if (merge.undone_at !== null || source.merged_into !== merge.target_id) {
-      return { ok: false, message: "That merge was already undone." };
-    }
-    if (!access.allows("merge", namespaceOf(target)))
-      return { ok: false, message: "That merge does not exist." };
-    const full = this.db
-      .query<MemoryRow, [number]>(`SELECT * FROM memories WHERE id = ?`)
-      .get(merge.source_id);
-    if (!full) return { ok: false, message: "That merge does not exist." };
-    const clash = full.topic_key !== null && this.topicHolder(full) !== null;
-    if (clash) return { ok: false, message: `Another memory now uses the topic key "${full.topic_key}".` };
-    this.db.transaction(() => {
-      this.snapshot(full);
-      this.db
-        .query(
-          `UPDATE memories SET deleted_at = NULL, merged_into = NULL, revision_count = revision_count + 1,
-           record_revision = record_revision + 1, index_generation = index_generation + 1, updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(this.ts(), full.id);
-      this.db.query(`UPDATE memory_merges SET undone_at = ? WHERE id = ?`).run(this.ts(), mergeId);
-    })();
-    this.scheduleIndex();
-    return { ok: true, message: `Restored #${merge.source_id}.` };
-  }
-
-  private topicHolder(row: MemoryRow): number | null {
-    const holder = this.db
-      .query<{ id: number }, [string, string, string, number]>(
-        `SELECT id FROM memories WHERE scope = ? AND ifnull(project_key, '') = ? AND topic_key = ?
-         AND deleted_at IS NULL AND id != ?`,
-      )
-      .get(row.scope, row.project_key ?? "", row.topic_key ?? "", row.id);
-    return holder?.id ?? null;
   }
 
   private openMerge(sourceId: number): { id: number } | null {
@@ -648,24 +639,39 @@ export class MemoryStore {
 
   detailAuthorized(access: Access, id: number): MemoryDetail {
     const row = this.rowsById([id])[0];
-    if (row && !access.allows("read", namespaceOf(row))) return HIDDEN_DETAIL;
     const removed = row ? null : this.removed(id);
-    if (removed && !access.allows("read", namespaceOf(removed))) return HIDDEN_DETAIL;
-    const versions = this.db
-      .query<{ version: number; title: string; content: string; created_at: string }, [number]>(
-        `SELECT version, title, content, created_at FROM memory_versions WHERE memory_id = ? ORDER BY version DESC`,
-      )
-      .all(id)
-      .map((v) => ({ version: v.version, title: v.title, content: v.content, createdAt: v.created_at }));
+    const current = row ?? removed;
+    if (current && !access.allows("read", namespaceOf(current))) return HIDDEN_DETAIL;
+    const lifecycle = this.lifecycleDetail(access, id);
+    const versions = (lifecycle?.revisions ?? [])
+      .filter((revision) => revision.revision !== lifecycle?.memoryRef.revision)
+      .map((revision) => ({
+        version: revision.revision,
+        title: String(revision.snapshot.title ?? ""),
+        content: String(revision.snapshot.content ?? ""),
+        createdAt: revision.changedAt,
+      }));
     const mergedInto = removed ? this.visibleMergeTarget(access, removed) : null;
     return {
       memory: row ? memoryDetail(row) : null,
       mergedInto,
       mergeId: mergedInto === null ? null : (this.openMerge(id)?.id ?? null),
+      mergeRevisions: this.mergeRevisionsFor(id, mergedInto),
       archived: Boolean(removed?.archived_at),
       versions,
       duplicates: row ? this.similarTo(row, access) : [],
     };
+  }
+
+  private mergeRevisionsFor(id: number, targetId: number | null): MergeRevisions | null {
+    if (targetId === null) return null;
+    return this.db
+      .query<
+        MergeRevisions,
+        [number, number]
+      >(`SELECT a.record_revision AS sourceRevision,b.record_revision AS targetRevision
+      FROM memories a JOIN memories b ON b.id=? WHERE a.id=?`)
+      .get(targetId, id);
   }
 
   list(input: {
@@ -675,7 +681,7 @@ export class MemoryStore {
     pinnedOnly?: boolean;
     stale?: boolean;
   }): MemoryHit[] {
-    const filter = input.access.memoryFilter(input.scope ?? "all");
+    const filter = input.access.memoryFilter(input.scope ?? "all", undefined, this.ts());
     const touched = "max(m.updated_at, ifnull(m.last_used_at, ''), ifnull(m.kept_at, ''))";
     const cutoff = new Date(this.now().getTime() - this.config.staleDays * 86_400_000).toISOString();
     const where = [filter.where];
@@ -717,7 +723,7 @@ export class MemoryStore {
     queryVector: Float32Array | null,
   ): Candidate[] {
     const { query, access, scope } = input;
-    const filter = access.memoryFilter(scope, input.type);
+    const filter = access.memoryFilter(scope, input.type, this.ts());
     const ranks = new Map<number, number>();
     addRanks(ranks, this.keywordIds(query, filter));
     if (query.length < 3 || ranks.size === 0) addRanks(ranks, this.likeIds(query, filter));
@@ -739,7 +745,7 @@ export class MemoryStore {
     hits: SearchHit[],
     input: { access: Access; scope: SearchScope; type?: string },
   ): SearchHit[] {
-    const filter = input.access.memoryFilter(input.scope, input.type);
+    const filter = input.access.memoryFilter(input.scope, input.type, this.ts());
     const memoryIds = hits.flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : []));
     const memories = new Map(
       memoryIds.length === 0
@@ -768,9 +774,14 @@ export class MemoryStore {
   }
 
   recordTurn(input: TurnInput): boolean {
+    if (this.sessionInvalidated(input.agentId)) return false;
     if (input.project) this.upsertProject(input.project);
     this.audit.retitle(input.agentId, input.title);
     return recordTurn(this.db, input, this.ts());
+  }
+
+  sessionInvalidated(agentId: string): boolean {
+    return this.lifecycle.contextInvalidated({ agentId });
   }
 
   sessions(input: { projectKey: string | null; query: string; limit: number }): SessionRow[] {
@@ -820,7 +831,7 @@ export class MemoryStore {
       .query<{ n: number }, [string, string]>(
         `SELECT count(*) AS n FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-         WHERE m.deleted_at IS NULL AND ${STALE_VECTOR_SQL}`,
+         WHERE m.deleted_at IS NULL AND ${currentLifecycleSql()} AND ${STALE_VECTOR_SQL}`,
       )
       .get(vectors.spec.model, vectors.fingerprint);
     return row?.n ?? 0;
@@ -873,7 +884,7 @@ export class MemoryStore {
     if (!existing) return null;
     // Saving the same text to a topic again is a duplicate, not a revision.
     if (existing.content_hash === draft.hash && (!draft.input.pinned || existing.pinned === 1)) return null;
-    this.snapshot(existing);
+    this.lifecycle.invalidate({ id: existing.id, revision: existing.record_revision });
     const { input } = draft;
     this.db
       .query(
@@ -961,7 +972,7 @@ export class MemoryStore {
   }
 
   liveRows(access: Access): MemoryWithProject[] {
-    const filter = access.memoryFilter("all");
+    const filter = access.memoryFilter("all", undefined, this.ts());
     return this.db
       .query<MemoryWithProject, (string | number)[]>(
         `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
@@ -1037,14 +1048,6 @@ export class MemoryStore {
     if (!this.vectors) return;
     if (vector) this.vectors.write(target, vector);
     else this.scheduleIndex();
-  }
-
-  private snapshot(row: MemoryRow): void {
-    this.db
-      .query(
-        `INSERT OR REPLACE INTO memory_versions (memory_id, version, title, content, created_at) VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(row.id, row.revision_count, row.title, row.content, row.updated_at);
   }
 
   private async embedOne(text: string, kind: EmbedKind): Promise<Float32Array | null> {
@@ -1126,7 +1129,7 @@ export class MemoryStore {
   ): Neighbor[] {
     const vectors = this.vectors;
     if (near.length === 0 || !vectors) return near;
-    const filter = input.access.memoryFilter(input.scope, input.type);
+    const filter = input.access.memoryFilter(input.scope, input.type, this.ts());
     const live = new Set(
       this.db
         .prepare<{ id: number }, (string | number)[]>(
@@ -1192,7 +1195,8 @@ export class MemoryStore {
       this.indexAgain = true;
       return;
     }
-    this.indexing = this.runIndex()
+    this.indexing = Promise.resolve()
+      .then(() => this.runIndex())
       .catch((error: unknown) => this.log.warn(`background embedding failed: ${errorText(error)}`))
       .finally(() => {
         this.indexing = null;
@@ -1247,7 +1251,7 @@ export class MemoryStore {
       .query<IndexRow, [string, number, string, number]>(
         `SELECT m.id, m.title, m.content, m.scope, m.project_key, m.content_hash, m.index_generation FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-         WHERE m.deleted_at IS NULL AND m.id > ? AND ${STALE_VECTOR_SQL}
+         WHERE m.deleted_at IS NULL AND ${currentLifecycleSql()} AND m.id > ? AND ${STALE_VECTOR_SQL}
          ORDER BY m.id LIMIT ?`,
       )
       .all(vectors.spec.model, afterId, vectors.fingerprint, INDEX_BATCH);
@@ -1258,7 +1262,7 @@ export class MemoryStore {
   private writeBatch(vectors: VectorIndex, rows: IndexRow[], results: Float32Array[]): number {
     const current = this.db.query<IndexRow & { deleted_at: string | null }, [number]>(
       `SELECT id, title, content, scope, project_key, content_hash, index_generation, deleted_at
-       FROM memories WHERE id = ?`,
+       FROM memories m WHERE id = ? AND ${currentLifecycleSql()}`,
     );
     const outcomes = this.db.transaction(() =>
       rows.map((row, i) => this.commitVector(vectors, { row, now: current.get(row.id) ?? null }, results[i])),
@@ -1312,6 +1316,190 @@ export class MemoryStore {
       .run(key, value);
   }
 
+  private current(row: MemoryRow): boolean {
+    const at = this.ts();
+    return Boolean(
+      this.db
+        .query(`SELECT 1 FROM memories m WHERE m.id=? AND ${currentLifecycleSql("m", "?")}`)
+        .get(row.id, at),
+    );
+  }
+
+  lifecycleDetail(access: Access, id: number): LifecycleDetail | null {
+    const row = this.db.query<MemoryRow, [number]>("SELECT * FROM memories WHERE id=?").get(id);
+    if (!row || !access.allows("read", namespaceOf(row))) return null;
+    const revisions = this.db
+      .query<
+        {
+          revision: number;
+          snapshot: string;
+          changed_at: string;
+          actor_id: string | null;
+          reason: string | null;
+          legacy_metadata_unknown: number;
+        },
+        [number]
+      >("SELECT * FROM memory_revisions WHERE memory_id=? ORDER BY revision DESC LIMIT 100")
+      .all(id)
+      .flatMap((revision) => {
+        const snapshot = JSON.parse(revision.snapshot) as Record<string, unknown>;
+        if (!snapshot.scope && access.kind !== "owner") return [];
+        if (
+          snapshot.scope &&
+          !access.allows("read", {
+            scope: snapshot.scope as Scope,
+            projectKey: snapshot.project_key as string | null,
+          })
+        )
+          return [];
+        return [
+          {
+            revision: revision.revision,
+            snapshot,
+            changedAt: revision.changed_at,
+            actorId: revision.actor_id,
+            reason: revision.reason,
+            legacyMetadataUnknown: Boolean(revision.legacy_metadata_unknown),
+          },
+        ];
+      });
+    const evidenceIds = this.db
+      .query<{ evidence_id: string }, [number, number]>(
+        "SELECT evidence_id FROM memory_evidence_links WHERE memory_id=? AND revision=?",
+      )
+      .all(id, row.record_revision)
+      .map((e) => e.evidence_id);
+    return {
+      memoryRef: { id, revision: row.record_revision },
+      recordKind: row.record_kind,
+      state: row.state,
+      verificationStatus: row.verification_status,
+      validFrom: row.valid_from,
+      validUntil: row.valid_until,
+      verifiedAt: row.verified_at,
+      evidence: this.provenance.getVisible(access, evidenceIds),
+      revisions,
+    };
+  }
+
+  historical(access: Access, id: number, asOf: string): MemoryRow | null {
+    const current = this.db.query<MemoryRow, [number]>("SELECT * FROM memories WHERE id=?").get(id);
+    if (!current || !access.allows("read", namespaceOf(current))) return null;
+    const revision = this.db
+      .query<{ snapshot: string; legacy_metadata_unknown: number }, [number, string]>(
+        "SELECT snapshot,legacy_metadata_unknown FROM memory_revisions WHERE memory_id=? AND julianday(changed_at)<=julianday(?) ORDER BY revision DESC LIMIT 1",
+      )
+      .get(id, asOf);
+    if (!revision) return null;
+    const row = JSON.parse(revision.snapshot) as MemoryRow;
+    if (!row.scope) return null;
+    if (
+      !access.allows("read", namespaceOf(row)) ||
+      row.state !== "active" ||
+      row.deleted_at ||
+      (row.valid_from && Date.parse(row.valid_from) > Date.parse(asOf)) ||
+      (row.valid_until && Date.parse(row.valid_until) <= Date.parse(asOf))
+    )
+      return null;
+    if (!this.lifecycle.historicalSourcesValid({ id: row.id, revision: row.record_revision }, asOf))
+      return null;
+    return row;
+  }
+
+  authorizedTopic(
+    access: Access,
+    scope: Scope,
+    projectKey: string | null,
+    topicKey: string,
+  ): MemoryRow | null {
+    if (!access.allows("write", { scope, projectKey })) return null;
+    return this.db
+      .query<MemoryRow, [string, string, string]>(
+        "SELECT * FROM memories WHERE scope=? AND ifnull(project_key,'')=? AND topic_key=? AND deleted_at IS NULL",
+      )
+      .get(scope, projectKey ?? "", topicKey);
+  }
+
+  invalidateSource(access: Access, sourceRef: string): { affected: number } {
+    if (access.kind !== "owner") throw new Error("Only the owner can invalidate a source.");
+    return this.db.transaction(() => {
+      const rows = this.db
+        .query<{ id: number; record_revision: number }, [string]>(`SELECT DISTINCT m.id,m.record_revision
+        FROM memory_evidence e JOIN memory_evidence_links l ON l.evidence_id=e.evidence_id
+        JOIN memories m ON m.id=l.memory_id AND m.record_revision=l.revision WHERE e.source_ref=? AND m.state!='needs_recheck'`)
+        .all(sourceRef);
+      this.db
+        .query(
+          "UPDATE memory_evidence SET status='unresolved',reason='source_changed',excerpt=NULL WHERE source_ref=?",
+        )
+        .run(sourceRef);
+      for (const row of rows) {
+        this.lifecycle.markForRecheck({ id: row.id, revision: row.record_revision });
+        this.lifecycle.invalidate({ id: row.id, revision: row.record_revision });
+      }
+      this.db
+        .query(`UPDATE review_jobs SET state='cancelled',lease_version=lease_version+1,updated_at=?
+        WHERE state IN ('queued','reserved','running') AND id IN (SELECT s.job_id FROM review_job_sources s
+          JOIN memory_evidence e ON e.evidence_id=s.evidence_id WHERE e.source_ref=?)`)
+        .run(this.ts(), sourceRef);
+      return { affected: rows.length };
+    })();
+  }
+
+  forgetSource(access: Access, sourceRef: string, requestId: string): { forgotten: number } {
+    if (access.kind !== "owner") throw new Error("Only the owner can forget a source.");
+    return this.db.transaction(() => {
+      const key = `source-forget:${requestId}`;
+      const hash = sha256(canonicalBody({ sourceRef }));
+      const prior = this.db
+        .query<{ request_body_hash: string; result: string }, [string]>(
+          "SELECT request_body_hash,result FROM memory_mutations WHERE principal_id='owner' AND request_id=?",
+        )
+        .get(key);
+      if (prior) {
+        if (prior.request_body_hash !== hash)
+          throw new MutationError(
+            "request_conflict",
+            "This source-forget request ID was already used for another source.",
+          );
+        return JSON.parse(prior.result) as { forgotten: number };
+      }
+      const rows = this.db
+        .query<{ id: number; record_revision: number }, [string]>(`SELECT DISTINCT m.id,m.record_revision
+        FROM memory_evidence e JOIN memory_evidence_links l ON l.evidence_id=e.evidence_id
+        JOIN memories m ON m.id=l.memory_id WHERE e.source_ref=?`)
+        .all(sourceRef);
+      this.db
+        .query("INSERT OR IGNORE INTO memory_tombstones VALUES ('source',?,?, 'owner')")
+        .run(sourceRef, this.ts());
+      let forgotten = 0;
+      for (const row of rows) {
+        if (!this.db.query("SELECT 1 FROM memories WHERE id=?").get(row.id)) continue;
+        const affected = this.lifecycle.preview(access, row.id).records.length;
+        this.mutations.mutate(ownerMutation(access), {
+          requestId: `${requestId}:${row.id}`,
+          operation: "forget",
+          id: row.id,
+          expectedRevision: row.record_revision,
+          reason: "Owner source forget",
+        });
+        forgotten += affected;
+      }
+      this.db.query("DELETE FROM source_artifacts WHERE source_ref=?").run(sourceRef);
+      this.db
+        .query(
+          "DELETE FROM memory_evidence_links WHERE evidence_id IN (SELECT evidence_id FROM memory_evidence WHERE source_ref=?)",
+        )
+        .run(sourceRef);
+      this.db.query("DELETE FROM memory_evidence WHERE source_ref=?").run(sourceRef);
+      this.db
+        .query(`INSERT INTO memory_mutations
+        (principal_id,request_id,request_body_hash,operation,memory_id,resulting_revision,result,created_at,actor_id,reason)
+        VALUES ('owner',?,?,'source_forget',0,0,?,?,'owner','Owner source forget')`)
+        .run(key, hash, JSON.stringify({ forgotten }), this.ts());
+      return { forgotten };
+    })();
+  }
   private ts(): string {
     return this.now().toISOString();
   }

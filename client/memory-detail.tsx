@@ -67,7 +67,12 @@ function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
       <>
         <MemoryEditor key={`${memory.id}:${memory.updatedAt}`} memory={memory} props={props} />
         <MemoryFacts memory={memory} s={s} />
-        <VersionList memoryId={memory.id} versions={data.versions} s={s} />
+        <VersionList
+          memoryId={memory.id}
+          expectedRevision={memory.recordRevision}
+          versions={data.versions}
+          s={s}
+        />
         <DuplicateList
           memoryId={memory.id}
           revision={memory.recordRevision}
@@ -88,15 +93,28 @@ function DetailBody({ data, props }: { data: MemoryDetail; props: BodyProps }) {
         accessibilityLabel={`Open memory ${mergedInto}`}
         s={s}
       />
-      {data.mergeId === null ? null : <UndoMerge mergeId={data.mergeId} s={s} />}
+      {data.mergeId === null || data.mergeRevisions === null ? null : (
+        <UndoMerge mergeId={data.mergeId} revisions={data.mergeRevisions} s={s} />
+      )}
     </>
   );
 }
 
-function UndoMerge({ mergeId, s }: { mergeId: number; s: Styles }) {
+function UndoMerge({
+  mergeId,
+  revisions,
+  s,
+}: {
+  mergeId: number;
+  revisions: NonNullable<MemoryDetail["mergeRevisions"]>;
+  s: Styles;
+}) {
   const undo = useRpc(undoMergeRpc);
   const refresh = useRefresh();
-  const mutation = useMutation({ mutationFn: () => undo({ mergeId }), onSuccess: () => void refresh() });
+  const mutation = useMutation({
+    mutationFn: () => undo({ mergeId, ...revisions }),
+    onSuccess: () => void refresh(),
+  });
   return (
     <>
       <Link
@@ -124,6 +142,7 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
   const submit = () =>
     save.mutate({
       id: memory.id,
+      expectedRevision: memory.recordRevision,
       title: title.trim(),
       content: content.trim(),
       type: type ?? undefined,
@@ -131,7 +150,7 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
       ...(scope === memory.scope ? {} : { scope, paseoProjectId: scope === "project" ? projectId : null }),
     });
   const del = useMutation({
-    mutationFn: () => remove({ id: memory.id }),
+    mutationFn: () => remove({ id: memory.id, expectedRevision: memory.recordRevision }),
     onSuccess: () => {
       void refresh();
       onBack();
@@ -272,15 +291,16 @@ function MemoryFacts({ memory, s }: { memory: Memory; s: Styles }) {
 
 interface VersionListProps {
   memoryId: number;
+  expectedRevision: number;
   versions: MemoryDetail["versions"];
   s: Styles;
 }
 
-function VersionList({ memoryId, versions, s }: VersionListProps) {
+function VersionList({ memoryId, expectedRevision, versions, s }: VersionListProps) {
   const restore = useRpc(restoreMemoryRpc);
   const refresh = useRefresh();
   const mutation = useMutation({
-    mutationFn: (version: number) => restore({ id: memoryId, version }),
+    mutationFn: (version: number) => restore({ id: memoryId, version, expectedRevision }),
     onSuccess: () => void refresh(),
   });
   if (versions.length === 0) return null;

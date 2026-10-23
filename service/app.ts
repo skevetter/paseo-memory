@@ -17,6 +17,7 @@ import {
 } from "../shared/service-api";
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
 import { type Caller, createMcpHandler } from "./mcp";
+import { MutationError } from "./mutations";
 import { loadReranker, RERANK_MODEL, type Reranker, rerankEnabled } from "./reranker";
 import { createRoutes, type Routes } from "./routes";
 import { errorText, FatalError } from "./sqlite";
@@ -220,10 +221,28 @@ function createInternalHandler(routes: Routes, key: string, log: Logger): Handle
       const handler = routes[route] as (input: unknown) => unknown;
       return Response.json(await handler(parsed.data));
     } catch (error) {
-      log.error(`${route} failed: ${errorText(error)}`);
-      return Response.json({ error: errorText(error) }, { status: 500 });
+      return internalErrorResponse(error, route, log);
     }
   };
+}
+
+function internalErrorResponse(error: unknown, route: ServiceRoute, log: Logger): Response {
+  if (!(error instanceof MutationError)) {
+    log.error(`${route} failed: ${errorText(error)}`);
+    return Response.json({ error: errorText(error) }, { status: 500 });
+  }
+  const status =
+    error.code === "scope_denied"
+      ? 403
+      : ["request_conflict", "revision_conflict", "context_invalidated"].includes(error.code)
+        ? 409
+        : 422;
+  return Response.json(
+    {
+      error: { code: error.code, message: error.message, retryable: false, details: error.details },
+    },
+    { status },
+  );
 }
 
 function rejectInternal(req: Request, expected: Buffer): Response | null {

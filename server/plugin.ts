@@ -11,11 +11,18 @@ import {
   attachmentSearchRpc,
   deleteMemoryRpc,
   dismissPairRpc,
+  evidenceArtifactRpc,
+  forgetPreviewRpc,
+  forgetSourceRpc,
+  invalidateSourceRpc,
   keepMemoryRpc,
   type MemorySettings,
   memoryDetailRpc,
+  memoryHistoricalRpc,
+  memoryLifecycleRpc,
   memorySettings,
   mergeMemoryRpc,
+  mutateMemoryRpc,
   PLUGIN_ID,
   restoreMemoryRpc,
   runtimeConfig,
@@ -453,6 +460,13 @@ function registerRpcs(server: PluginServerContext, state: PluginState): void {
   const { supervisor } = state;
   const call = supervisor.call.bind(supervisor);
   server.handle(searchMemoriesRpc, (input) => call("search", input, RPC_TIMEOUT_MS));
+  server.handle(mutateMemoryRpc, (input) => call("mutate", input, RPC_TIMEOUT_MS));
+  server.handle(memoryLifecycleRpc, (input) => call("lifecycle-detail", input, RPC_TIMEOUT_MS));
+  server.handle(memoryHistoricalRpc, (input) => call("historical", input, RPC_TIMEOUT_MS));
+  server.handle(forgetPreviewRpc, (input) => call("forget-preview", input, RPC_TIMEOUT_MS));
+  server.handle(evidenceArtifactRpc, (input) => call("evidence-artifact", input, RPC_TIMEOUT_MS));
+  server.handle(invalidateSourceRpc, (input) => call("source-invalidate", input, RPC_TIMEOUT_MS));
+  server.handle(forgetSourceRpc, (input) => call("source-forget", input, RPC_TIMEOUT_MS));
   server.handle(saveMemoryRpc, async (input, { paseo }) => {
     const project = await projectForSave(paseo, input.paseoProjectId, state);
     return call("save", { ...input, project }, RPC_TIMEOUT_MS);
