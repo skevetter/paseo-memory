@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MemoryScopeSchema } from "./namespaces";
 
 export const TimestampSchema = z.iso.datetime().transform((value) => new Date(value).toISOString());
 export const RecordKindSchema = z.enum([
@@ -51,7 +52,7 @@ const ChangeSchema = z.strictObject({
   title: z.string().trim().min(1).max(200).optional(),
   content: z.string().trim().min(1).max(4000).optional(),
   type: z.string().min(1).max(50).optional(),
-  scope: z.enum(["global", "project"]).optional(),
+  scope: MemoryScopeSchema.optional(),
   project: z
     .strictObject({
       key: z.string(),
@@ -61,6 +62,7 @@ const ChangeSchema = z.strictObject({
     })
     .nullable()
     .optional(),
+  botId: z.string().min(1).max(200).nullable().optional(),
   topicKey: z.string().max(200).nullable().optional(),
   pinned: z.boolean().optional(),
   recordKind: RecordKindSchema.optional(),

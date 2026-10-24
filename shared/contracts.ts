@@ -1,11 +1,13 @@
 import { defineAttachmentSource, defineRpc, defineSettings, type RpcOutput } from "@getpaseo/plugin";
 import { z } from "zod";
+import { BridgeSettingsSchema } from "./bridge";
 import {
   ForgetPreviewSchema,
   LifecycleDetailSchema,
   MutationRequestSchema,
   MutationResultSchema,
 } from "./lifecycle";
+import { MemoryScopeSchema } from "./namespaces";
 import { ResourceStatusSchema } from "./resources";
 import { RetrievalPolicySettingsSchema } from "./retrieval";
 import {
@@ -45,7 +47,6 @@ export type {
 } from "./service-api";
 export { MAX_CONTENT_CHARS, MEMORY_TYPES, SearchScopeSchema };
 export const MemoryTypeSchema = z.enum(MEMORY_TYPES);
-export const MemoryScopeSchema = z.enum(["global", "project"]);
 
 export const REVIEW_MODES = ["off", "idle", "turns"] as const;
 export { REVIEW_DISPLAYS, type ReviewDisplay };
@@ -81,6 +82,7 @@ const settingsSchema = z.object({
   autoCapture: z.boolean().default(true),
   contextBudgetChars: ranged("contextBudgetChars", DEFAULT_RUNTIME.contextBudgetChars),
   retrievalPolicy: RetrievalPolicySettingsSchema.default(DEFAULT_RUNTIME.retrievalPolicy),
+  bridge: BridgeSettingsSchema.default(DEFAULT_RUNTIME.bridge),
   maxPinned: ranged("maxPinned", DEFAULT_RUNTIME.maxPinned),
   taskMatches: ranged("taskMatches", DEFAULT_RUNTIME.taskMatches),
   taskStrictness: z.enum(STRICTNESS_LEVELS).default(DEFAULT_RUNTIME.taskStrictness),
@@ -132,6 +134,7 @@ export function runtimeConfig(settings: MemorySettings): RuntimeConfig {
   return {
     contextBudgetChars: settings.contextBudgetChars,
     retrievalPolicy: settings.retrievalPolicy,
+    bridge: settings.bridge,
     maxPinned: settings.maxPinned,
     taskMatches: settings.taskMatches,
     taskStrictness: settings.taskStrictness,
@@ -201,6 +204,7 @@ export const saveMemoryRpc = defineRpc({
     content: z.string().min(1).max(MAX_CONTENT_CHARS),
     type: MemoryTypeSchema.default("note"),
     scope: MemoryScopeSchema.default("project"),
+    botId: z.string().min(1).max(200).nullable().default(null),
     paseoProjectId: z.string().nullable(),
     pinned: z.boolean().default(false),
     requestId: z.string().min(1).max(200).optional(),
@@ -219,6 +223,7 @@ export const updateMemoryRpc = defineRpc({
     type: MemoryTypeSchema.optional(),
     pinned: z.boolean().optional(),
     scope: MemoryScopeSchema.optional(),
+    botId: z.string().min(1).max(200).nullable().optional(),
     // Required when scope changes to project.
     paseoProjectId: z.string().nullable().optional(),
   }),

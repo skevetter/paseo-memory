@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { Scope } from "../shared/namespaces";
 import type { TierSpec } from "./embedder";
 import {
   assertIndexWritable,
@@ -26,8 +27,12 @@ function vecTableName(fingerprint: string): string {
   return `vec_${fingerprint.slice(0, 24)}`;
 }
 
-export function scopeKey(scope: "global" | "project", projectKey: string | null): string {
-  return scope === "global" ? "global" : `project:${sha256(projectKey ?? "").slice(0, 16)}`;
+export function scopeKey(scope: Scope, projectKey: string | null, botId: string | null): string {
+  if (scope === "global" && projectKey === null && botId === null) return "global";
+  if (scope === "project" && projectKey && botId === null)
+    return `project:${sha256(projectKey).slice(0, 16)}`;
+  if (scope === "bot" && projectKey === null && botId) return `bot:${sha256(botId).slice(0, 16)}`;
+  throw new Error("A vector partition requires a canonical namespace.");
 }
 
 // Anything that changes what a stored vector means for the same model name must change this value.

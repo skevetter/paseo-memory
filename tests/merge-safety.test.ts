@@ -6,7 +6,8 @@ import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type SaveInput } from "../service/store";
 import { runUpkeep, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME } from "../shared/service-api";
-import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, removePostV6Schema, tempDir } from "./helpers";
+import { createPublishedSchema } from "./fixtures/published-schemas";
+import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, tempDir } from "./helpers";
 
 let store: MemoryStore;
 let path: string;
@@ -172,29 +173,36 @@ describe("revision guarded merge and undo", () => {
 });
 
 describe("v6 review extension upgrade", () => {
-  it("adds review and merge persistence without resetting existing memory revisions or vector generations", async () => {
-    const id = await save();
-    store.updateAuthorized(owner, id, { content: "A corrected durable fact" });
-    await store.indexPending();
-    const before = store.getVisible(owner, [id])[0];
+  it("adds review and merge persistence without resetting existing memory revisions or vector generations", () => {
     store.close();
+    path = join(tempDir("pm-merge-safety-v6-"), "memory.db");
+    const ts = "2026-10-01T00:00:00Z";
     const { db } = openDatabase(path);
-    removePostV6Schema(db);
+    createPublishedSchema(db, 6);
+    db.run(`INSERT INTO projects (key, name, root_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, [
+      dataRepo.key,
+      dataRepo.name,
+      dataRepo.rootPath,
+      ts,
+      ts,
+    ]);
     db.run(
-      "DROP TABLE review_ops; DROP TABLE review_windows; DROP TABLE memory_merges; PRAGMA user_version=6;",
+      `INSERT INTO memories (id, scope, project_key, type, title, content, content_hash, revision_count, record_revision, index_generation, created_at, updated_at)
+       VALUES (1, 'project', ?, 'preference', 'Policy', 'A corrected durable fact', 'hash-1', 2, 3, 2, ?, ?)`,
+      [dataRepo.key, ts, ts],
     );
     db.close();
     store = new MemoryStore({ path });
-    expect(store.getVisible(owner, [id])[0]).toMatchObject({
-      id,
+    expect(store.getVisible(owner, [1])[0]).toMatchObject({
+      id: 1,
       content: "A corrected durable fact",
-      record_revision: before?.record_revision,
-      index_generation: before?.index_generation,
+      record_revision: 3,
+      index_generation: 2,
     });
     store.reviews.open({ agentId: "agent", nonce: "nonce", trigger: "idle", cap: 1 });
     const reservation = store.reviews.admit("nonce", "update", "update");
     if (reservation.kind !== "granted") throw new Error("missing reservation");
-    expect(store.updateAuthorized(owner, id, { pinned: true }, reservation.reservation)).toBe("ok");
+    expect(store.updateAuthorized(owner, 1, { pinned: true }, reservation.reservation)).toBe("ok");
     expect(store.reviews.info("nonce")?.committed).toBe(1);
   });
 });

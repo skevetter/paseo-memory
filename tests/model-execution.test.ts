@@ -123,7 +123,7 @@ function target(store: MemoryStore, ref: MemoryRef): VectorTarget {
   if (!row) throw new Error("The indexed source is missing");
   return {
     id: row.id,
-    partition: scopeKey(row.scope, row.project_key),
+    partition: scopeKey(row.scope, row.project_key, row.bot_id),
     hash: row.content_hash,
     generation: row.index_generation,
   };

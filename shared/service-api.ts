@@ -1,5 +1,20 @@
 import { z } from "zod";
 import {
+  BridgeIdentitySchema,
+  type BridgeOwnerStatus,
+  type BridgeOwnership,
+  type BridgeRotationResult,
+  BridgeRotationSchema,
+  BridgeSettingsSchema,
+  DEFAULT_BRIDGE_SETTINGS,
+} from "./bridge";
+import {
+  BridgeImportInputSchema,
+  type BridgeImportPreview,
+  BridgeImportPreviewInputSchema,
+  type BridgeImportResult,
+} from "./bridge-import";
+import {
   type ForgetPreview,
   type LifecycleDetail,
   MemoryRefSchema,
@@ -10,6 +25,7 @@ import {
   TimestampSchema,
   VerificationSchema,
 } from "./lifecycle";
+import { MemoryScopeSchema } from "./namespaces";
 import {
   FeedbackInputSchema,
   type FeedbackResult,
@@ -51,6 +67,7 @@ export type ReviewDisplay = (typeof REVIEW_DISPLAYS)[number];
 export const RuntimeConfigSchema = z.object({
   contextBudgetChars: z.number().int().min(500),
   retrievalPolicy: RetrievalPolicySettingsSchema.default(DEFAULT_RETRIEVAL_POLICY),
+  bridge: BridgeSettingsSchema.default(DEFAULT_BRIDGE_SETTINGS),
   maxPinned: z.number().int().min(0),
   taskMatches: z.number().int().min(0),
   taskStrictness: z.enum(STRICTNESS_LEVELS),
@@ -69,6 +86,7 @@ export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 export const DEFAULT_RUNTIME: RuntimeConfig = {
   contextBudgetChars: 6000,
   retrievalPolicy: DEFAULT_RETRIEVAL_POLICY,
+  bridge: DEFAULT_BRIDGE_SETTINGS,
   maxPinned: 10,
   taskMatches: 5,
   taskStrictness: "medium",
@@ -107,18 +125,17 @@ export const ProjectRefSchema = z.object({
 });
 export type ProjectRef = z.infer<typeof ProjectRefSchema>;
 
-export const SearchScopeSchema = z.enum(["all", "project", "global"]);
+export const SearchScopeSchema = z.enum(["all", "project", "global", "bot"]);
 export type SearchScope = z.infer<typeof SearchScopeSchema>;
-
-const MemoryScope = z.enum(["global", "project"]);
 
 const RevisionInput = z.number().int().positive();
 const RequestIdInput = z.string().min(1).max(200);
 export const EvidenceArtifactInputSchema = z.strictObject({
   sourceRef: z.string().min(1).max(1000),
   content: z.string().min(1).max(16_384),
-  scope: MemoryScope,
+  scope: MemoryScopeSchema,
   projectKey: z.string().nullable(),
+  botId: z.string().min(1).max(200).nullable().default(null),
   allowExcerpt: z.boolean(),
   sourceEventAt: TimestampSchema.optional(),
 });
@@ -153,6 +170,22 @@ export const serviceInputs = {
   "usage-record": ModelUsageInputSchema,
   "context-admit": ContextAdmissionSchema,
   "context-settle": ContextSettlementSchema,
+  "bridge-create": z.strictObject({
+    bootstrapRef: z.string().min(1).max(200),
+    identity: BridgeIdentitySchema,
+    configHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+  "bridge-open": z.strictObject({
+    agentId: z.string().min(1).max(200),
+    identity: BridgeIdentitySchema,
+    purpose: z.enum(["interactive", "history"]),
+    reason: z.enum(["create", "resume", "refresh", "import"]),
+  }),
+  "bridge-managed": z.strictObject({ agentIds: z.array(z.string().min(1).max(200)).max(100) }),
+  "bridge-status": z.strictObject({}),
+  "bridge-rotate": BridgeRotationSchema,
+  "bridge-import-preview": BridgeImportPreviewInputSchema,
+  "bridge-import": BridgeImportInputSchema,
   feedback: FeedbackInputSchema,
   mutate: MutationRequestSchema,
   "lifecycle-detail": z.strictObject({ id: RevisionInput }),
@@ -226,9 +259,10 @@ export const serviceInputs = {
     title: z.string().min(1),
     content: z.string().min(1),
     type: z.string(),
-    scope: MemoryScope,
+    scope: MemoryScopeSchema,
     paseoProjectId: z.string().nullable(),
     project: ProjectRefSchema.nullable(),
+    botId: z.string().min(1).max(200).nullable().default(null),
     pinned: z.boolean(),
     requestId: RequestIdInput.optional(),
   }),
@@ -240,9 +274,10 @@ export const serviceInputs = {
     content: z.string().min(1).optional(),
     type: z.string().optional(),
     pinned: z.boolean().optional(),
-    scope: MemoryScope.optional(),
+    scope: MemoryScopeSchema.optional(),
     paseoProjectId: z.string().nullable().optional(),
     project: ProjectRefSchema.nullable().optional(),
+    botId: z.string().min(1).max(200).nullable().optional(),
   }),
   delete: z.object({
     id: RevisionInput,
@@ -287,8 +322,9 @@ export const MemoryItemSchema = z.object({
   id: z.string(),
   title: z.string(),
   type: z.string(),
-  scope: MemoryScope,
+  scope: MemoryScopeSchema,
   projectName: z.string().nullable(),
+  botId: z.string().nullable(),
   preview: z.string(),
   pinned: z.boolean(),
   updatedAt: z.string(),
@@ -304,8 +340,9 @@ export const MemoryDetailSchema = z.object({
       title: z.string(),
       content: z.string(),
       type: z.string(),
-      scope: MemoryScope,
+      scope: MemoryScopeSchema,
       projectName: z.string().nullable(),
+      botId: z.string().nullable(),
       topicKey: z.string().nullable(),
       pinned: z.boolean(),
       source: z.string(),
@@ -417,7 +454,8 @@ const PairMemorySchema = z.object({
   id: z.number(),
   title: z.string(),
   type: z.string(),
-  scope: MemoryScope,
+  scope: MemoryScopeSchema,
+  botId: z.string().nullable(),
   preview: z.string(),
   updatedAt: z.string(),
   useCount: z.number(),
@@ -505,6 +543,19 @@ export interface ServiceOutputs {
   "usage-record": { recorded: boolean; duplicate: boolean };
   "context-admit": { admitted: true };
   "context-settle": { recorded: boolean; duplicate: boolean };
+  "bridge-create": {
+    sessionId: string;
+    sessionEpoch: number;
+    nonce: string;
+    ownership: BridgeOwnership;
+    mcpServer: { type: "http"; url: string; headers: Record<string, string> };
+  };
+  "bridge-open": { managed: boolean; nonce: string | null; ownership: BridgeOwnership | null };
+  "bridge-managed": { agentIds: string[] };
+  "bridge-status": BridgeOwnerStatus;
+  "bridge-rotate": BridgeRotationResult;
+  "bridge-import-preview": BridgeImportPreview;
+  "bridge-import": BridgeImportResult;
   feedback: FeedbackResult;
   mutate: MutationResult;
   "lifecycle-detail": LifecycleDetail | null;

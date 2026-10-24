@@ -11,6 +11,7 @@ import { ContentTooLongError, MemoryStore } from "../service/store";
 import { ftsQuery } from "../service/text";
 import { scopeKey, VectorIndex } from "../service/vectors";
 import { EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
+import { createPublishedSchema } from "./fixtures/published-schemas";
 import {
   dataRepo,
   fixtureModelIdentity,
@@ -19,7 +20,6 @@ import {
   mergeRequest,
   otherRepo,
   owner,
-  removePostV6Schema,
   tempDir,
 } from "./helpers";
 
@@ -97,10 +97,11 @@ describe("scopes", () => {
     ).toBe("GraphQL docs live in docs/gql");
   });
 
-  it("falls back to global when project scope is requested without a project", async () => {
-    const r = await store.save({ title: "t", content: "c", type: "note", scope: "project", project: null });
-    expect(r.status).toBe("created");
-    expect(store.list({ access: owner, scope: "global" })).toHaveLength(1);
+  it("rejects unresolved project saves without widening them into global memory", async () => {
+    await expect(
+      store.save({ title: "t", content: "c", type: "note", scope: "project", project: null }),
+    ).rejects.toThrow();
+    expect(store.list({ access: owner, scope: "global" })).toEqual([]);
   });
 
   it("resolves a Paseo project id alias and a project key to the stable project", () => {
@@ -213,9 +214,9 @@ describe("vector search", () => {
     migrate(db);
     db.run("PRAGMA foreign_keys = OFF");
     const index = new VectorIndex(db, hashSpec("test/knn", 4), () => new Date().toISOString());
-    const global = scopeKey("global", null);
-    const projectA = scopeKey("project", dataRepo.key);
-    const projectB = scopeKey("project", otherRepo.key);
+    const global = scopeKey("global", null, null);
+    const projectA = scopeKey("project", dataRepo.key, null);
+    const projectB = scopeKey("project", otherRepo.key, null);
     index.write({ id: 1, partition: global, hash: "h1", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
     index.write({ id: 2, partition: projectA, hash: "h2", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
     index.write({ id: 3, partition: projectB, hash: "h3", generation: 1 }, Float32Array.from([1, 0, 0, 0]));
@@ -335,17 +336,9 @@ describe("migration", () => {
   it("upgrades a v2 database: adds usage and merge columns and the audit tables", () => {
     const path = join(tempDir(), "memory.db");
     const { db } = openDatabase(path);
-    // A 1.0 database: today's schema minus everything v3 added.
-    migrate(db);
-    removePostV6Schema(db);
+    createPublishedSchema(db, 2);
     db.run(`INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
-        VALUES ('global', 'note', 'From 1.0', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-      ALTER TABLE memories DROP COLUMN use_count;
-      ALTER TABLE memories DROP COLUMN last_used_at;
-      ALTER TABLE memories DROP COLUMN merged_into;
-      DROP TABLE agent_links;
-      DROP TABLE audit_events;
-      PRAGMA user_version = 2;`);
+        VALUES ('global', 'note', 'From 1.0', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');`);
     db.close();
     const upgraded = new MemoryStore({ path });
     try {
@@ -369,23 +362,12 @@ describe("session and keyword index migration", () => {
   it("upgrades a v3 database: adds review and usage columns and re-indexes session digests", () => {
     const path = join(tempDir(), "memory.db");
     const { db } = openDatabase(path);
-    // A 1.1 database: today's schema minus everything v4 added, with the 1.1 sessions index.
-    migrate(db);
-    removePostV6Schema(db);
-    db.run(`DROP TRIGGER sessions_ai; DROP TRIGGER sessions_ad; DROP TRIGGER sessions_au; DROP TABLE sessions_fts;
-      DROP TABLE upkeep_dismissed;
-      ALTER TABLE memories DROP COLUMN shown_count; ALTER TABLE memories DROP COLUMN opened_count;
-      ALTER TABLE memories DROP COLUMN kept_at; ALTER TABLE memories DROP COLUMN archived_at;
-      ALTER TABLE sessions DROP COLUMN summary; ALTER TABLE sessions DROP COLUMN outcomes;
-      ALTER TABLE sessions DROP COLUMN reviewed_at; ALTER TABLE agent_links DROP COLUMN tools;
-      CREATE VIRTUAL TABLE sessions_fts USING fts5(title, first_prompt, last_prompt, last_reply,
-        content = 'sessions', content_rowid = 'rowid', tokenize = "porter unicode61 tokenchars '_-./'");
-      INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
+    createPublishedSchema(db, 3);
+    db.run(`INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
         VALUES ('global', 'note', 'From 1.1', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
       INSERT INTO sessions (id, agent_id, last_reply, turns, started_at, updated_at)
         VALUES ('a1', 'a1', 'Fixed the flaky test.', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-      INSERT INTO agent_links (nonce, agent_id, created_at) VALUES ('n1', 'a1', '2026-01-01T00:00:00Z');
-      PRAGMA user_version = 3;`);
+      INSERT INTO agent_links (nonce, agent_id, created_at) VALUES ('n1', 'a1', '2026-01-01T00:00:00Z');`);
     db.close();
     const upgraded = new MemoryStore({ path });
     try {
@@ -412,19 +394,11 @@ describe("session and keyword index migration", () => {
   it("upgrades a v4 database: rebuilds the keyword index, keeps every memory and its id", async () => {
     const path = join(tempDir(), "memory.db");
     const { db } = openDatabase(path);
-    // A 1.2.0 database: today's schema with the memories index that kept "." inside words.
-    migrate(db);
-    removePostV6Schema(db);
-    db.run(`DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au; DROP TABLE memories_fts;
-      CREATE VIRTUAL TABLE memories_fts USING fts5(title, content, topic_key, content = 'memories',
-        content_rowid = 'id', tokenize = "porter unicode61 tokenchars '_-./'");
-      INSERT INTO memories (id, scope, type, title, content, content_hash, created_at, updated_at, deleted_at) VALUES
+    createPublishedSchema(db, 4);
+    db.run(`INSERT INTO memories (id, scope, type, title, content, content_hash, created_at, updated_at, deleted_at) VALUES
         (3, 'global', 'config', 'Config file', 'Settings live in config.ts', 'h3', '2026-01-01', '2026-01-01', NULL),
         (5, 'global', 'note', 'Gone', 'Removed zebra note', 'h5', '2026-01-01', '2026-01-01', '2026-02-01'),
-        (7, 'global', 'decision', 'Retries', 'Payments retry three times with backoff.', 'h7', '2026-01-01', '2026-01-01', NULL);
-      INSERT INTO memories_fts(rowid, title, content, topic_key)
-        SELECT id, title, content, topic_key FROM memories WHERE deleted_at IS NULL;
-      PRAGMA user_version = 4;`);
+        (7, 'global', 'decision', 'Retries', 'Payments retry three times with backoff.', 'h7', '2026-01-01', '2026-01-01', NULL);`);
     const keyword = (q: string) =>
       db
         .query<{ rowid: number }, [string]>(`SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?`)
@@ -717,10 +691,12 @@ describe("curation", () => {
 
   it("moves a memory between scopes", async () => {
     const id = (await store.save({ ...base, title: "Use uv", content: "uv sync" })).id as number;
-    expect(() => store.updateAuthorized(owner, id, { scope: "project", project: null })).not.toThrow();
+    store.updateAuthorized(owner, id, { scope: "project", project: null });
+    expect(store.getVisible(owner, [id])[0]?.project_key).toBe(dataRepo.key);
     expect(store.updateAuthorized(owner, id, { scope: "global" })).toBe("ok");
     expect(store.list({ access: owner, scope: "global" }).map((h) => h.id)).toEqual([String(id)]);
-    expect(() => store.updateAuthorized(owner, id, { scope: "project" })).toThrow(/needs a project/);
+    expect(() => store.updateAuthorized(owner, id, { scope: "project" })).toThrow();
+    expect(store.list({ access: owner, scope: "global" }).map((h) => h.id)).toEqual([String(id)]);
     expect(store.updateAuthorized(owner, id, { scope: "project", project: otherRepo })).toBe("ok");
     expect(store.list({ access: Access.agent(otherRepo.key), scope: "project" }).map((h) => h.id)).toEqual([
       String(id),

@@ -1,14 +1,18 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import {
   type Evidence,
   type MutationRequest,
   MutationRequestSchema,
   type MutationResult,
+  MutationResultSchema,
   type ParsedMutation,
   RecordStateSchema,
 } from "../shared/lifecycle";
-import type { Access, Namespace, Operation } from "./access";
+import { type MemoryNamespace, namespaceColumns, namespaceOf, sameNamespace } from "../shared/namespaces";
+import type { Access, Operation } from "./access";
+import { eraseBridgeCopies } from "./bridge-privacy";
 import { retractFeedbackEvidence } from "./feedback";
 import type { Lifecycle } from "./lifecycle";
 import type { Provenance } from "./provenance";
@@ -24,6 +28,9 @@ export interface MutationPrincipal {
   access: Access;
   agentId?: string | null;
   provider?: string | null;
+  defaultNamespace?: MemoryNamespace;
+  assertCurrent?: () => void;
+  allowedMutations?: readonly ParsedMutation["operation"][];
 }
 interface MutationOptions {
   provenance: Provenance;
@@ -58,6 +65,7 @@ type AuthoritativeFields = Pick<
   | "type"
   | "scope"
   | "project_key"
+  | "bot_id"
   | "pinned"
   | "topic_key"
   | "content_hash"
@@ -80,6 +88,7 @@ export class MutationError extends Error {
 }
 
 export function assertCurrentPrincipal(lifecycle: Lifecycle, principal: MutationPrincipal) {
+  principal.assertCurrent?.();
   const context = {
     principalId: principal.id,
     agentId: principal.agentId,
@@ -190,6 +199,7 @@ export class MemoryMutations {
       "type",
       "scope",
       "project",
+      "botId",
       "topicKey",
       "pinned",
       "recordKind",
@@ -230,6 +240,7 @@ export class MemoryMutations {
   }
 
   private previous(principal: MutationPrincipal, request: ParsedMutation): MutationResult | null {
+    assertOperationAllowed(principal, request.operation);
     const prior = this.prior(principal, request.requestId);
     if (!prior) return null;
     this.authorizeReplay(principal, prior);
@@ -238,7 +249,7 @@ export class MemoryMutations {
         "request_conflict",
         "This request ID was already used with a different canonical body.",
       );
-    return JSON.parse(prior.result) as MutationResult;
+    return MutationResultSchema.parse(JSON.parse(prior.result));
   }
 
   private authorizeReplay(principal: MutationPrincipal, prior: PriorMutation): void {
@@ -248,7 +259,7 @@ export class MemoryMutations {
         "This memory was forgotten; its old result cannot be replayed.",
       );
     const row = this.row(prior.memory_id);
-    if (row && !principal.access.allows("write", namespace(row)))
+    if (row && !rowAllows(principal.access, row, "write"))
       throw new MutationError("scope_denied", "The current namespace is outside the mutation grant.");
   }
 
@@ -271,8 +282,8 @@ export class MemoryMutations {
       request.change.recordKind === "preference";
     if (principal.access.kind !== "owner" && ownerOnly)
       throw new MutationError("scope_denied", "This operation requires owner authority.");
-    if (request.change.scope !== undefined || request.change.project !== undefined)
-      this.authorizeDestination(principal.access, request.change, current);
+    if (!creating && current && hasNamespaceFields(request.change))
+      this.authorizeDestination(principal.access, request.change, rowNamespace(current));
   }
 
   private authorizeExisting(
@@ -289,8 +300,13 @@ export class MemoryMutations {
       undo_merge: "merge",
       restore: "restore",
     };
-    if (!principal.access.allows(operations[request.operation] ?? "write", namespace(current)))
+    if (!rowAllows(principal.access, current, operations[request.operation] ?? "write"))
       throw new MutationError("scope_denied", "Memory is unavailable.");
+    if (request.operation !== "forget" && !namespaceOf(current))
+      throw new MutationError(
+        "invalid_state",
+        "Memory namespace is unknown; forget it or repair it before changing it.",
+      );
     if (principal.access.kind !== "owner" && current.record_kind === "preference")
       throw new MutationError(
         "scope_denied",
@@ -298,19 +314,10 @@ export class MemoryMutations {
       );
   }
 
-  private authorizeDestination(access: Access, change: RecordChange, current: MemoryRow | null): void {
-    const scope = change.scope ?? current?.scope ?? "global";
-    const target: Namespace = {
-      scope,
-      projectKey: scope === "global" ? null : (change.project?.key ?? current?.project_key ?? null),
-    };
-    if (target.scope === "project" && !target.projectKey)
-      throw new MutationError("scope_denied", "A project namespace requires a resolved project.");
-    if (!access.allows("write", target))
+  private authorizeDestination(access: Access, change: RecordChange, base: MemoryNamespace): void {
+    assertProjectGrant(access, change);
+    if (!access.allows("write", destinationNamespace(change, base)))
       throw new MutationError("scope_denied", "The destination namespace is outside the mutation grant.");
-    if (change.project && !access.allows("write", { scope: "project", projectKey: change.project.key })) {
-      throw new MutationError("scope_denied", "The supplied project metadata is outside the mutation grant.");
-    }
   }
 
   private assertRevision(access: Access, request: ParsedMutation, current: MemoryRow | null): void {
@@ -333,13 +340,14 @@ export class MemoryMutations {
   }
 
   private diff(access: Access, current: MemoryRow, expectedRevision: number): unknown[] {
+    if (!access.allows("read", namespaceOf(current))) return [];
     const expected = this.db
       .query<{ snapshot: string }, [number, number]>(
         "SELECT snapshot FROM memory_revisions WHERE memory_id=? AND revision=?",
       )
       .get(current.id, expectedRevision);
-    let old = expected ? (JSON.parse(expected.snapshot) as Record<string, unknown>) : {};
-    if (!historicalAllowed(access, old)) old = {};
+    const old = expected ? z.record(z.string(), z.unknown()).parse(JSON.parse(expected.snapshot)) : null;
+    if (!old || !historicalAllowed(access, old)) return [];
     return Object.entries(current)
       .filter(
         ([key, value]) =>
@@ -508,8 +516,7 @@ export class MemoryMutations {
       title,
       content,
       type,
-      scope: change.scope ?? current.scope,
-      project_key: destinationProject(change, current),
+      ...namespaceColumns(destinationNamespace(change, rowNamespace(current))),
       ...curationFields(current, change),
       content_hash: sha256(`${type}\n${title}\n${content}`),
       record_kind: change.recordKind ?? current.record_kind,
@@ -588,14 +595,15 @@ export class MemoryMutations {
     const change = request.change;
     if (!change.title || !change.content)
       throw new MutationError("invalid_input", "Create requires title and content.");
-    const { scope, projectKey } = this.creationNamespace(principal.access, change);
-    const fields = this.createdFields(principal, request, validation);
+    const namespace = this.creationNamespace(principal, change);
+    const fields = this.createdFields(principal, request, validation, namespace);
     this.project(change.project);
+    const location = namespaceColumns(namespace);
     const duplicate = this.db
-      .query<MemoryRow, [string, string, string]>(
-        "SELECT * FROM memories WHERE content_hash=? AND scope=? AND ifnull(project_key,'')=? AND deleted_at IS NULL",
+      .query<MemoryRow, [string, string, string, string]>(
+        "SELECT * FROM memories WHERE content_hash=? AND scope=? AND ifnull(project_key,'')=? AND ifnull(bot_id,'')=? AND deleted_at IS NULL",
       )
-      .get(fields.content_hash, scope, projectKey ?? "");
+      .get(fields.content_hash, location.scope, location.project_key ?? "", location.bot_id ?? "");
     if (duplicate && this.compatibleDuplicate(duplicate, fields))
       return this.result(duplicate, "duplicate", validation);
     const maxId =
@@ -619,19 +627,19 @@ export class MemoryMutations {
     return this.result(this.row(Number(write.lastInsertRowid)) as MemoryRow, "created", validation);
   }
 
-  private creationNamespace(access: Access, change: RecordChange): Namespace {
-    const scope = change.scope ?? "global";
-    const projectKey = scope === "project" ? (change.project?.key ?? null) : null;
-    if (scope === "project" && !projectKey) throw new MutationError("scope_denied", "Project is unresolved.");
-    if (!access.allows("write", { scope, projectKey }))
+  private creationNamespace(principal: MutationPrincipal, change: RecordChange): MemoryNamespace {
+    assertProjectGrant(principal.access, change);
+    const namespace = destinationNamespace(change, principal.defaultNamespace ?? { kind: "global" });
+    if (!principal.access.allows("write", namespace))
       throw new MutationError("scope_denied", "The namespace is outside the mutation grant.");
-    return { scope, projectKey };
+    return namespace;
   }
 
   private createdFields(
     principal: MutationPrincipal,
     request: ParsedMutation,
     validation: MutationResult["evidenceValidation"],
+    namespace: MemoryNamespace,
   ): AuthoritativeFields {
     const change = request.change;
     const title = redact(change.title ?? "").trim();
@@ -644,12 +652,13 @@ export class MemoryMutations {
       title,
       content,
       type,
-      ...creationLocation(change),
+      ...namespaceColumns(namespace),
       ...creationCuration(change),
       content_hash: sha256(`${type}\n${title}\n${content}`),
       record_kind: kind,
       state: disposition,
-      ...verifiedFields(validation, this.options.now()),
+      // Resolved source provenance does not verify a proposed claim.
+      ...verifiedFields(request.operation === "propose" ? "none" : validation, this.options.now()),
       valid_from: change.validFrom ?? null,
       valid_until: change.validUntil ?? null,
     };
@@ -700,13 +709,13 @@ export class MemoryMutations {
     if (!target || target.id === current.id)
       throw new MutationError("invalid_input", "A distinct target memory reference is required.");
     const replacement = this.row(target.id);
-    if (replacement?.state !== "active" || !principal.access.allows("write", namespace(replacement)))
+    if (replacement?.state !== "active" || !rowAllows(principal.access, replacement, "write"))
       throw new MutationError("scope_denied", "Replacement memory is unavailable.");
     if (replacement.record_revision !== target.revision)
       throw new MutationError("revision_conflict", "The replacement changed.", {
         currentRevision: replacement.record_revision,
       });
-    if (replacement.scope !== current.scope || replacement.project_key !== current.project_key)
+    if (!sameNamespace(rowNamespace(replacement), rowNamespace(current)))
       throw new MutationError("scope_denied", "Merge and supersession cannot cross namespaces.");
     this.db
       .query("INSERT OR IGNORE INTO memory_relations VALUES (?, ?, ?, ?, ?, ?, ?, 'verified')")
@@ -758,7 +767,7 @@ export class MemoryMutations {
     if (!target || !request.change.mergeId)
       throw new MutationError("invalid_input", "Undo requires mergeId and the current target reference.");
     const destination = this.row(target.id);
-    if (!destination || !principal.access.allows("merge", namespace(destination)))
+    if (!destination || !rowAllows(principal.access, destination, "merge"))
       throw new MutationError("scope_denied", "Merge target is unavailable.");
     if (destination.record_revision !== target.revision)
       throw new MutationError("revision_conflict", "The merge target changed.", {
@@ -809,9 +818,9 @@ export class MemoryMutations {
     if (!current.topic_key) return previousState;
     const clash = this.db
       .query(
-        "SELECT 1 FROM memories WHERE scope=? AND ifnull(project_key,'')=? AND topic_key=? AND deleted_at IS NULL AND id!=?",
+        "SELECT 1 FROM memories WHERE scope=? AND ifnull(project_key,'')=? AND ifnull(bot_id,'')=? AND topic_key=? AND deleted_at IS NULL AND id!=?",
       )
-      .get(current.scope, current.project_key ?? "", current.topic_key, current.id);
+      .get(current.scope, current.project_key ?? "", current.bot_id ?? "", current.topic_key, current.id);
     if (clash) throw new MutationError("request_conflict", "Another memory now owns the restored topic key.");
     return previousState;
   }
@@ -832,6 +841,7 @@ export class MemoryMutations {
     this.eraseSessionCopies(principal, preview.affectedAgentIds);
     this.eraseCallerCopies(principal, nonces, ids);
     this.eraseEvidence(preview.evidenceIds, new Set(ids));
+    eraseBridgeCopies(this.db, ts, (agents) => this.invalidateContexts(principal, agents));
     for (const source of preview.sources)
       this.db.query("DELETE FROM source_artifacts WHERE source_ref=?").run(source);
     for (const ref of preview.records) {
@@ -864,6 +874,14 @@ export class MemoryMutations {
     };
   }
 
+  invalidateContexts(principal: MutationPrincipal, agents: readonly string[]): void {
+    if (principal.access.kind !== "owner")
+      throw new MutationError("scope_denied", "Only the owner can erase controlled context copies.");
+    const closure = this.options.lifecycle.contextClosure(agents);
+    this.eraseSessionCopies(principal, closure.agents);
+    this.eraseCallerCopies(principal, closure.nonces, []);
+  }
+
   private eraseSessionCopies(principal: MutationPrincipal, agentIds: string[]): void {
     this.options.cancelReviews(agentIds);
     for (const agentId of agentIds) {
@@ -891,10 +909,11 @@ export class MemoryMutations {
         .query("UPDATE review_windows SET closed_at=? WHERE nonce=? AND closed_at IS NULL")
         .run(ts, nonce);
     }
+    if (ids.length === 0) return;
     this.db
       .prepare(`INSERT OR IGNORE INTO memory_tombstones(kind,identifier,forgotten_at,principal_id)
       SELECT 'principal',principal_id,?,? FROM memory_mutations WHERE memory_id IN (${ids.map(() => "?").join(",")})
-        AND (principal_id LIKE 'nonce:%' OR principal_id LIKE 'agent:%' OR principal_id LIKE 'credential:%')`)
+        AND (principal_id LIKE 'nonce:%' OR principal_id LIKE 'agent:%' OR principal_id LIKE 'credential:%' OR principal_id LIKE 'bridge:%')`)
       .run(ts, principal.id, ...ids);
   }
 
@@ -977,25 +996,75 @@ export class MemoryMutations {
 export function ownerMutation(access: Access): MutationPrincipal {
   return { id: "owner", actorId: "owner", access };
 }
+function assertOperationAllowed(principal: MutationPrincipal, operation: ParsedMutation["operation"]): void {
+  if (principal.allowedMutations && !principal.allowedMutations.includes(operation))
+    throw new MutationError("scope_denied", "This mutation is outside the caller grant.");
+}
 export function mutationRequestId(): string {
   return randomUUID();
 }
-function namespace(row: MemoryRow): Namespace {
-  return { scope: row.scope, projectKey: row.project_key };
+function rowNamespace(row: MemoryRow): MemoryNamespace {
+  const namespace = namespaceOf(row);
+  if (!namespace)
+    throw new MutationError(
+      "invalid_state",
+      "Memory namespace is unknown; forget it or repair it before changing it.",
+    );
+  return namespace;
+}
+function rowAllows(access: Access, row: MemoryRow, operation: Operation): boolean {
+  if (access.kind === "owner") return true;
+  const namespace = namespaceOf(row);
+  return namespace !== null && access.allows(operation, namespace);
 }
 function bounded(value: unknown): unknown {
   return typeof value === "string" ? value.slice(0, 240) : (value ?? null);
 }
 function historicalAllowed(access: Access, old: Partial<MemoryRow> | Record<string, unknown>): boolean {
-  if (!old.scope) return access.kind === "owner";
-  return access.allows("read", {
-    scope: old.scope as Namespace["scope"],
-    projectKey: old.project_key as string | null,
-  });
+  if (access.kind === "owner") return true;
+  const namespace = namespaceOf({ scope: old.scope, project_key: old.project_key, bot_id: old.bot_id });
+  return namespace !== null && access.allows("read", namespace);
 }
-function destinationProject(change: RecordChange, current: MemoryRow): string | null {
-  if ((change.scope ?? current.scope) === "global") return null;
-  return change.project?.key ?? current.project_key;
+function hasNamespaceFields(change: RecordChange): boolean {
+  return change.scope !== undefined || change.project !== undefined || change.botId !== undefined;
+}
+function contradictoryNamespace(): MutationError {
+  return new MutationError("invalid_input", "The destination namespace fields contradict each other.");
+}
+function assertProjectGrant(access: Access, change: RecordChange): void {
+  const key = change.project?.key;
+  if (key && !access.allows("write", { kind: "project", projectKey: key }))
+    throw new MutationError("scope_denied", "The supplied project is outside the mutation grant.");
+}
+// Kind comes only from explicit scope, else the trusted base; project metadata never picks a namespace alone.
+function destinationNamespace(change: RecordChange, base: MemoryNamespace): MemoryNamespace {
+  assertNamespaceFields(change, base);
+  const kind = change.scope ?? base.kind;
+  if (kind === "global") return { kind: "global" };
+  if (kind === "project") return projectDestination(change, base);
+  const botId = change.botId ?? (base.kind === "bot" ? base.botId : null);
+  if (!botId) throw new MutationError("scope_denied", "Bot namespace is unresolved.");
+  return { kind: "bot", botId };
+}
+function projectDestination(change: RecordChange, base: MemoryNamespace): MemoryNamespace {
+  const projectKey = change.project?.key ?? (base.kind === "project" ? base.projectKey : null);
+  if (!projectKey) throw new MutationError("scope_denied", "Project is unresolved.");
+  return { kind: "project", projectKey };
+}
+function assertNamespaceFields(change: RecordChange, base: MemoryNamespace): void {
+  const kind = change.scope ?? base.kind;
+  if (change.botId != null && kind !== "bot") throw contradictoryNamespace();
+  if (change.scope === undefined) {
+    assertImplicitNamespace(change, base);
+    return;
+  }
+  if (change.scope !== "project" && change.project != null) throw contradictoryNamespace();
+}
+function assertImplicitNamespace(change: RecordChange, base: MemoryNamespace): void {
+  if (base.kind === "bot" && change.botId != null && change.botId !== base.botId)
+    throw contradictoryNamespace();
+  if (base.kind === "project" && change.project != null && change.project.key !== base.projectKey)
+    throw contradictoryNamespace();
 }
 function sameFields(current: MemoryRow, next: AuthoritativeFields): boolean {
   return Object.entries(next).every(([key, value]) => current[key as keyof AuthoritativeFields] === value);
@@ -1017,12 +1086,6 @@ function verifiedFields(
   };
 }
 
-function creationLocation(change: RecordChange): Pick<MemoryRow, "scope" | "project_key"> {
-  return {
-    scope: change.scope ?? "global",
-    project_key: change.scope === "project" ? (change.project?.key ?? null) : null,
-  };
-}
 function creationCuration(change: RecordChange): Pick<MemoryRow, "pinned" | "topic_key"> {
   return { pinned: Number(change.pinned ?? false), topic_key: change.topicKey ?? null };
 }
@@ -1031,16 +1094,16 @@ const CLAIM_FIELDS = {
   title: "title",
   content: "content",
   type: "type",
-  scope: "scope",
   recordKind: "record_kind",
   validFrom: "valid_from",
   validUntil: "valid_until",
 } as const satisfies Partial<Record<keyof RecordChange, keyof MemoryRow>>;
 function claimChanged(current: MemoryRow, change: RecordChange): boolean {
+  const namespace = namespaceOf(current);
   if (
-    change.project &&
-    (change.scope ?? current.scope) === "project" &&
-    change.project.key !== current.project_key
+    namespace &&
+    hasNamespaceFields(change) &&
+    !sameNamespace(destinationNamespace(change, namespace), namespace)
   )
     return true;
   return Object.entries(CLAIM_FIELDS).some(([key, column]) => {

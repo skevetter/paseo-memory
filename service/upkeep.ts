@@ -1,3 +1,4 @@
+import { namespaceOf, sameNamespace } from "../shared/namespaces";
 import type { UpkeepList } from "../shared/service-api";
 import { Access } from "./access";
 import type { MemoryStore, MemoryWithProject, ProjectRef } from "./store";
@@ -26,6 +27,7 @@ export function candidatePairs(store: MemoryStore): MemoryPair[] {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const pairs = new Map<string, MemoryPair>();
   const add = (a: MemoryWithProject, b: MemoryWithProject, similarity: number | null) => {
+    if (!mayPair(a, b)) return;
     const [low, high] = a.id < b.id ? [a, b] : [b, a];
     const key = `${low.id}:${high.id}`;
     const sameTopic = low.topic_key !== null && low.topic_key === high.topic_key;
@@ -83,8 +85,16 @@ export function possibleConflict(pair: MemoryPair): Conflict | null {
 
 const canonical = (text: string) => text.normalize("NFC").trim();
 
-const sameNamespace = (pair: MemoryPair) =>
-  pair.a.scope === pair.b.scope && pair.a.project_key === pair.b.project_key;
+// Actual namespace equality includes bot_id, so two bots never match on the null project key alone.
+const sameRowNamespace = (a: MemoryWithProject, b: MemoryWithProject) => {
+  const left = namespaceOf(a);
+  const right = namespaceOf(b);
+  return left !== null && right !== null && sameNamespace(left, right);
+};
+const pairSameNamespace = (pair: MemoryPair) => sameRowNamespace(pair.a, pair.b);
+// A bot memory never pairs outside its own namespace, so it cannot become a global or project-wide suggestion.
+const mayPair = (a: MemoryWithProject, b: MemoryWithProject) =>
+  (a.scope !== "bot" && b.scope !== "bot") || sameRowNamespace(a, b);
 
 /**
  * The only pairs automatic merging may touch: the same canonical text, type, namespace and authority. A similar
@@ -93,7 +103,7 @@ const sameNamespace = (pair: MemoryPair) =>
 export function isExactDuplicate(pair: MemoryPair): boolean {
   const { a, b } = pair;
   return (
-    sameNamespace(pair) &&
+    pairSameNamespace(pair) &&
     a.type === b.type &&
     a.source === b.source &&
     a.agent_id === b.agent_id &&
@@ -124,6 +134,7 @@ const pairMemory = (row: MemoryWithProject) => ({
   title: row.title,
   type: row.type,
   scope: row.scope,
+  botId: row.bot_id,
   preview: clip(row.content, 240),
   updatedAt: row.updated_at,
   useCount: row.use_count,
@@ -149,7 +160,7 @@ export function upkeepPairs(
     };
     const conflict = possibleConflict(pair);
     if (conflict) result.conflicts.push({ ...view, ...conflict });
-    else if (sameNamespace(pair)) {
+    else if (pairSameNamespace(pair)) {
       result.duplicates.push({ ...view, targetId: mergeTarget(pair).id, exact: isExactDuplicate(pair) });
     }
   }
@@ -178,7 +189,7 @@ export function runUpkeep(store: MemoryStore, at: string): UpkeepRun {
       run.conflicts++;
       continue;
     }
-    if (!sameNamespace(pair)) continue;
+    if (!pairSameNamespace(pair)) continue;
     run.duplicates++;
     if (store.config.duplicateMerge === "auto" && isExactDuplicate(pair) && autoMerge(store, pair, gone)) {
       run.merged++;

@@ -1,0 +1,381 @@
+{
+  "fixtureVersion": 1,
+  "protocolVersion": 1,
+  "purpose": "Canonical wire and behavioral vectors; actual implementation, approvals and runtime evidence are recorded separately.",
+  "sourceProvenance": {
+    "memoryAuthoritativeMessageRecord": "c50bbf7d",
+    "memoryAuthoritativeMessageSha256": "a2ff57908260c1aaddf35a1f40677b9620ffda1c2bf492815691864cc1538317",
+    "botsAccessibleMemoryDocumentSha256": "ec6065c99fe1f425463ebcba4e9528afb6dbc2b6db9b6813be8885618e1bb7d8",
+    "botsOriginalDocumentSha256": "6170a9d532bb8697a8101c51b204f5f7245ee6f69d26a31ebea224a4ff46f57c",
+    "agreement": "Typed Memory section7.7.3 and Bots section9 fields agree; source document bytes are not claimed identical."
+  },
+  "decisions": {
+    "bootstrapEnv": "PASEO_MEMORY_BOOTSTRAP_REF",
+    "bootstrapReferenceAuthorizesOperations": false,
+    "controllerOrSessionCredentialInEnvironment": false,
+    "defaultBackend": "files",
+    "defaultBridgeEnabled": false,
+    "namespaceKinds": ["global", "project", "bot"],
+    "bridgePurposes": ["task", "memory_review", "evaluation", "maintenance"],
+    "hostSessionPurposes": ["interactive", "history"],
+    "unknownSessionEpoch": 0,
+    "firstObservedManagedSessionEpoch": 1,
+    "activationRequiresObservedBindAndCreateSeen": true,
+    "pureTtlRenewPreservesLeaseVersion": true,
+    "authorityOrInteractiveEpochChangeAdvancesFence": true,
+    "initialBindAdvancesFence": true,
+    "releaseRevokesActiveRightsAndAdvancesFence": true,
+    "registerMayAuthorizeControllerContextPreparationBeforeBind": true,
+    "agentToolsRequireSuccessfulBind": true,
+    "eventEnvelope": "nested_event",
+    "eventReference": "opaque_committed_server_evidence_reference",
+    "requestDedupeFields": ["consumerPrincipalId", "endpoint", "requestId"],
+    "sourceEventDedupeFields": ["consumerPrincipalId", "executionId", "sessionEpoch", "eventId"],
+    "sourceEventKeyUsesProviderTurnId": false,
+    "activeAndTerminalAuthUseSameLogicalProducer": true,
+    "changedCanonicalBodyConflicts": true,
+    "sameTransportReplayPreservesCommittedStatus": true,
+    "feedbackBatchStatus": "accepted_if_any_new_fact_duplicate_only_if_all_same_source_duplicates",
+    "changedFeedbackContentMayBeSilentlyDropped": false,
+    "terminalEnvelopeUsesOriginatingBoundLease": true,
+    "terminalDeadlineAnchor": "first_terminal_transition_or_originating_lease_expiry",
+    "terminalRetryOrRestartExtendsDeadline": false,
+    "terminalDeliveryRestoresContextOrToolRights": false,
+    "contextReplayRevalidatesCurrentAuthorityAndSources": true,
+    "contextInvalidationRequiresNewRequestId": true,
+    "attachedMeans": "controller_confirmed_bundle_in_accepted_configuration_not_provider_consumption",
+    "taskSucceededRequires": "identified_trusted_verification_and_current_resolvable_evidence",
+    "verifiedNoChangeStatus": "succeeded",
+    "verifiedNoChangeEligibleForLearningByDefault": false,
+    "unverifiedCompletionStatus": "unknown",
+    "validatorFeedbackVerifierSource": "already_committed_matching_execution_epoch_run_cycle_event",
+    "unknownVerifierOrEvidenceCreatesValidatedBoost": false,
+    "rawFilesystemPathIsResolvedEvidence": false,
+    "positiveValidatorRequiresExplicitTrustedOwnerResolver": true,
+    "unresolvedProductionReferencesRefused": true,
+    "b06PrivateRunArtifactRefsAreExternalEvidence": false,
+    "privateRunArtifactsMayContainPromptsAndConfiguration": true,
+    "privateRunArtifactsAreAutomaticallyExported": false,
+    "b08ProducerOrSafeResolverReadinessEstablishedByFixture": false,
+    "modelUsageMayBeInferredFromLastUsage": false,
+    "nativeSessionOpenCanPrecedeConfigurationPersistence": true,
+    "nativeBindRequiresAgentsRefRefresh": false,
+    "historyBindsRenewsAdvancesEpochActivatesToolsOrReviews": false,
+    "missingAllHostGatesUniversallyBlocksProviderLaunch": false,
+    "declaredSdkCompatibilityIsRuntimeProof": false,
+    "sameOsUserUnrestrictedShellIsolationClaim": false
+  },
+  "limits": {
+    "maxInboundRequestBytes": 16384,
+    "inboundRequestLimitTruncatesContextResponse": false,
+    "defaultLeaseSeconds": 300,
+    "hardMaxLeaseSeconds": 900,
+    "bootstrapTtlSeconds": 120,
+    "maxTerminalDeliverySeconds": 86400,
+    "defaultOwnerProfileMaxContextTokens": 8192,
+    "defaultOwnerGlobalMaxContextChars": 6000,
+    "absoluteMaxContextTokens": 32768,
+    "absoluteMaxContextChars": 20000,
+    "absoluteMaxLatencyMs": 5000,
+    "advertisedContextLimits": "actual_consumer_granted_owner_policy_not_ungranted_absolute_ceiling",
+    "wholeSerializedContextMustFitRequestedAllowance": true
+  },
+  "authRoles": {
+    "capabilities": "controller",
+    "register": "controller",
+    "bind": "controller",
+    "renew": "controller",
+    "release": "controller",
+    "context": "scoped_session_token_held_by_controller",
+    "activeEventsAndFeedback": "scoped_session_token_held_by_controller",
+    "terminalEventsAndFeedback": "controller_with_bound_origin_history_and_current_grants",
+    "agentMcp": "separate_registered_purpose_scoped_tool_credential",
+    "bootstrapBearer": "unauthorized"
+  },
+  "examples": {
+    "namespaces": [
+      {"kind": "global"},
+      {"kind": "project", "projectKey": "fixture-project"},
+      {"kind": "bot", "botId": "fixture-bot"}
+    ],
+    "ownership": {
+      "contextOwner": "paseo-bots",
+      "captureOwner": "paseo-bots",
+      "reviewOwner": "paseo-bots"
+    },
+    "capabilities": {
+      "protocolVersion": 1,
+      "serverInstanceId": "fixture-server-instance",
+      "features": {
+        "botNamespaces": true,
+        "ownershipLeases": true,
+        "tokenBudget": true,
+        "cycleEvents": true,
+        "feedback": true
+      },
+      "limits": {
+        "maxContextTokens": 8192,
+        "maxContextChars": 6000,
+        "maxBodyBytes": 16384,
+        "maxLeaseSeconds": 900
+      }
+    },
+    "register": {
+      "protocolVersion": 1,
+      "requestId": "fixture-register-request",
+      "action": "register",
+      "botId": "fixture-bot",
+      "runId": "fixture-run",
+      "cycleId": "fixture-cycle",
+      "attemptId": "fixture-attempt",
+      "executionId": "fixture-execution",
+      "sessionEpoch": 1,
+      "agentId": "00000000-0000-4000-8000-000000000001",
+      "providerTurnId": null,
+      "purpose": "task",
+      "expectedIdentity": {
+        "workspaceId": null,
+        "provider": "omp",
+        "cwd": "/workspaces/fixture-bot"
+      },
+      "requestedNamespaces": [
+        {"kind": "global"},
+        {"kind": "project", "projectKey": "fixture-project"},
+        {"kind": "bot", "botId": "fixture-bot"}
+      ],
+      "ownership": {
+        "contextOwner": "paseo-bots",
+        "captureOwner": "paseo-bots",
+        "reviewOwner": "paseo-bots"
+      }
+    },
+    "registered": {
+      "protocolVersion": 1,
+      "sessionId": "fixture-session",
+      "leaseVersion": 1,
+      "expiresAt": "2030-01-01T00:05:00.000Z",
+      "grantedNamespaces": [
+        {"kind": "global"},
+        {"kind": "project", "projectKey": "fixture-project"},
+        {"kind": "bot", "botId": "fixture-bot"}
+      ],
+      "ownership": {
+        "contextOwner": "paseo-bots",
+        "captureOwner": "paseo-bots",
+        "reviewOwner": "paseo-bots"
+      },
+      "sessionToken": "EXAMPLE-NOT-A-CREDENTIAL-session-token",
+      "bootstrapRef": "EXAMPLE-NONAUTHORIZING-bootstrap-ref"
+    },
+    "bind": {
+      "protocolVersion": 1,
+      "requestId": "fixture-bind-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 1,
+      "action": "bind",
+      "actualAgentId": "00000000-0000-4000-8000-000000000001",
+      "observedIdentity": {
+        "workspaceId": null,
+        "provider": "omp",
+        "cwd": "/workspaces/fixture-bot"
+      },
+      "sessionEpoch": 1,
+      "bootstrapRef": "EXAMPLE-NONAUTHORIZING-bootstrap-ref"
+    },
+    "bound": {
+      "protocolVersion": 1,
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "expiresAt": "2030-01-01T00:05:00.000Z",
+      "grantedNamespaces": [
+        {"kind": "global"},
+        {"kind": "project", "projectKey": "fixture-project"},
+        {"kind": "bot", "botId": "fixture-bot"}
+      ],
+      "ownership": {
+        "contextOwner": "paseo-bots",
+        "captureOwner": "paseo-bots",
+        "reviewOwner": "paseo-bots"
+      },
+      "sessionToken": "EXAMPLE-NOT-A-CREDENTIAL-session-token"
+    },
+    "renew": {
+      "protocolVersion": 1,
+      "requestId": "fixture-renew-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "action": "renew"
+    },
+    "release": {
+      "protocolVersion": 1,
+      "requestId": "fixture-release-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "action": "release"
+    },
+    "resume": {
+      "protocolVersion": 1,
+      "requestId": "fixture-resume-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "action": "bind",
+      "actualAgentId": "00000000-0000-4000-8000-000000000001",
+      "observedIdentity": {
+        "workspaceId": null,
+        "provider": "omp",
+        "cwd": "/workspaces/fixture-bot"
+      },
+      "sessionEpoch": 2
+    },
+    "context": {
+      "protocolVersion": 1,
+      "requestId": "fixture-context-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "query": "Fixture release policy",
+      "namespaceFilter": [
+        {"kind": "global"},
+        {"kind": "project", "projectKey": "fixture-project"},
+        {"kind": "bot", "botId": "fixture-bot"}
+      ],
+      "recordKinds": ["fact", "preference", "lesson", "derived_summary"],
+      "budget": {"maxTokens": 4096, "maxChars": 3000, "maxLatencyMs": 500}
+    },
+    "contextResult": {
+      "protocolVersion": 1,
+      "retrievalId": "fixture-retrieval",
+      "contextText": "Fixture context",
+      "memoryRefs": [{"id": 501, "revision": 3}],
+      "evidenceRefs": ["fixture-evidence"],
+      "usage": {
+        "tokenCount": 15,
+        "tokenCountIsEstimate": true,
+        "estimator": "utf8-byte-upper-bound",
+        "chars": 15,
+        "latencyMs": 1
+      },
+      "truncated": false,
+      "omittedCount": 0,
+      "fallbackReason": null,
+      "policyRevision": 1,
+      "indexGeneration": 2
+    },
+    "event": {
+      "protocolVersion": 1,
+      "requestId": "fixture-event-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "event": {
+        "botId": "fixture-bot",
+        "runId": "fixture-run",
+        "cycleId": "fixture-cycle",
+        "attemptId": "fixture-attempt",
+        "executionId": "fixture-execution",
+        "sessionEpoch": 1,
+        "agentId": "00000000-0000-4000-8000-000000000001",
+        "providerTurnId": null,
+        "purpose": "task",
+        "type": "cycle.completed",
+        "eventId": "fixture-event",
+        "startedAt": "2030-01-01T00:00:01.000Z",
+        "completedAt": "2030-01-01T00:00:30.000Z",
+        "summary": "Synthetic fixture cycle; unverified completion remains unknown.",
+        "sourceRefs": [],
+        "memoryRefs": [{"id": 501, "revision": 3}],
+        "outcome": {"status": "unknown", "evidenceRefs": []},
+        "modelUsageRefs": []
+      }
+    },
+    "eventAck": {
+      "protocolVersion": 1,
+      "eventId": "fixture-event",
+      "status": "accepted",
+      "eventRef": "fixture-opaque-committed-event-ref"
+    },
+    "eventDuplicateAck": {
+      "protocolVersion": 1,
+      "eventId": "fixture-event",
+      "status": "duplicate",
+      "eventRef": "fixture-opaque-committed-event-ref"
+    },
+    "feedbackDelivery": {
+      "protocolVersion": 1,
+      "requestId": "fixture-delivery-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "retrievalId": "fixture-retrieval",
+      "runId": "fixture-run",
+      "cycleId": "fixture-cycle",
+      "delivery": {
+        "status": "attached",
+        "executionId": "fixture-execution",
+        "promptFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "assessments": []
+    },
+    "feedbackAgentReport": {
+      "protocolVersion": 1,
+      "requestId": "fixture-assessment-request",
+      "sessionId": "fixture-session",
+      "leaseVersion": 2,
+      "retrievalId": "fixture-retrieval",
+      "runId": "fixture-run",
+      "cycleId": "fixture-cycle",
+      "assessments": [
+        {
+          "memoryRef": {"id": 501, "revision": 3},
+          "signal": "helpful",
+          "basis": "agent_report",
+          "evidenceRefs": []
+        }
+      ]
+    },
+    "feedbackAck": {
+      "protocolVersion": 1,
+      "retrievalId": "fixture-retrieval",
+      "status": "accepted"
+    },
+    "feedbackDuplicateAck": {
+      "protocolVersion": 1,
+      "retrievalId": "fixture-retrieval",
+      "status": "duplicate"
+    }
+  },
+  "errors": [
+    {"httpStatus": 401, "body": {"error": {"code": "unauthorized", "message": "Credential is absent or invalid.", "retryable": false}}},
+    {"httpStatus": 403, "body": {"error": {"code": "scope_denied", "message": "Current grants do not allow the operation.", "retryable": false}}},
+    {"httpStatus": 409, "body": {"error": {"code": "lease_expired", "message": "Execution read and tool rights have expired.", "retryable": false}}},
+    {"httpStatus": 409, "body": {"error": {"code": "lease_conflict", "message": "Use the current authority lease version.", "retryable": false}}},
+    {"httpStatus": 409, "body": {"error": {"code": "request_conflict", "message": "Request identity already names different content.", "retryable": false}}},
+    {"httpStatus": 409, "body": {"error": {"code": "context_invalidated", "message": "Discard the bundle and use a new request identity.", "retryable": false}}},
+    {"httpStatus": 409, "body": {"error": {"code": "revision_conflict", "message": "Reload the current canonical revision.", "retryable": false}}},
+    {"httpStatus": 422, "body": {"error": {"code": "budget_exhausted", "message": "The requested allowance cannot contain a context bundle.", "retryable": false}}},
+    {"httpStatus": 503, "body": {"error": {"code": "budget_exhausted", "message": "Transient bounded capacity is occupied.", "retryable": true}}},
+    {"httpStatus": 503, "body": {"error": {"code": "unavailable", "message": "The required integration is temporarily unavailable.", "retryable": true}}},
+    {"httpStatus": 422, "body": {"error": {"code": "unsupported_version", "message": "The encoded semantics are not supported by this service.", "retryable": false}}}
+  ],
+  "behaviorVectors": [
+    {"id": "discovery", "requires": ["configured_data_dir", "dynamic_loopback_endpoint", "owner_only_descriptor", "limited_consumer_credential_reference", "running_features_not_compiled_claims"]},
+    {"id": "credential_roles", "requires": ["controller_for_discovery_and_all_session_actions", "controller_held_session_token_for_context_and_active_delivery", "controller_for_bounded_terminal_delivery", "separate_tool_credential", "bootstrap_bearer_unauthorized"]},
+    {"id": "pre_native_save_bind", "requires": ["durable_intended_managed_claim", "trusted_hook_actual_identity", "matching_create_seen", "atomic_reference_consumption_and_receipt", "no_native_snapshot_refresh", "reserved_key_removed_before_provider"]},
+    {"id": "initial_activation", "requires": ["register_intended_epoch1_is_not_observed_bind1", "tools_inert_before_bind", "pending_controller_context_does_not_activate_tools", "denied_provider_receives_no_memory_tools"]},
+    {"id": "bind_conflicts", "requires": ["missing_create_seen_rejected", "wrong_actual_agent_rejected", "wrong_workspace_provider_cwd_rejected", "stale_version_rejected", "identical_retry_reuses_receipt", "two_identical_directories_do_not_conflate_agents"]},
+    {"id": "native_create_retry", "requires": ["persisted_host_idempotency_key", "one_physical_agent", "no_reference_reconsumption", "no_assumed_config_persistence_before_session_open"]},
+    {"id": "resume_and_history", "requires": ["interactive_resume_uses_persisted_mapping_and_new_observed_epoch", "no_reused_bootstrap_reference", "history_only_strips_reference", "history_does_not_bind_renew_advance_activate_or_review", "native_turn_ids_do_not_invent_epochs"]},
+    {"id": "ownership", "requires": ["one_context_block", "one_cycle_capture", "create_session_open_capture_review_schedule_and_execution_checks", "cancel_generic_pending_reviews_on_ownership_change", "queued_work_reauthorizes", "no_silent_live_switch_to_files_or_generic_owner"]},
+    {"id": "context", "requires": ["namespace_filter_only_narrows", "whole_serialized_allowance", "honest_estimator", "memory_revision_and_evidence_references", "exact_rendered_session_snapshot", "privacy_and_policy_revalidation_before_replay", "new_request_id_after_invalidation"]},
+    {"id": "source_event", "requires": ["registered_origin_only", "event_and_processing_intent_durable_before_ack", "changed_source_body_conflicts", "new_request_id_does_not_duplicate_event", "assistant_done_does_not_create_success", "unresolved_proof_remains_unknown"]},
+    {"id": "feedback", "requires": ["exact_delivered_revision", "delivery_only_ack_allowed", "attached_not_consumed", "agent_report_not_validated", "actual_verifier_identity_and_current_proof_required", "idempotent_attachment_and_assessment", "historical_assessment_not_current_boost"]},
+    {"id": "terminal_delivery", "requires": ["release_or_expiry_immediately_blocks_context_and_mcp", "fixed_origin_bound_lease_history", "first_terminal_deadline_persisted", "restart_retry_renew_do_not_resurrect", "active_to_terminal_auth_does_not_duplicate", "current_grants_and_forget_rechecked", "dead_letter_reason_visible", "never_relaunch_task_to_repair_capture"]},
+    {"id": "hook_disable_reload", "requires": ["surviving_service_without_create_hook_cannot_bind_initially", "active_bind_gate_rejects_missing_proof", "reload_between_register_create_open_is_tested", "absence_of_all_gates_is_explicitly_conditional_not_universal_fail_closure"]},
+    {"id": "files_migration", "requires": ["files_remains_default", "owner_approved_preview", "stable_source_ids_paths_hashes_and_counts", "source_files_preserved", "one_canonical_writer_after_opt_in", "exports_labelled_read_only_snapshots", "mirror_edits_are_conflicts_not_auto_dual_write"]},
+    {"id": "standalone", "requires": ["ordinary_non_bot_agents_unchanged", "unresolved_project_does_not_broaden_scope", "bridge_disabled_without_tested_runtime_and_explicit_grants", "no_unproved_sdk_app_daemon_combination_claim"]}
+  ],
+  "notes": [
+    "Example IDs, paths, times, credentials and text are synthetic contract data, not secrets or runtime evidence.",
+    "At authoring, B06 RunArtifactRef is LOCAL private {id,sha256} with equal64hex values, not an approved external evidence/source/usage reference; B08 producer and cross-repo safe resolution are not implemented or approved. Generic string wire fields remain, but paired validator acceptance requires actual approved current proof, never mocks or private artifact export.",
+    "Context example text and error messages are illustrative, not wording or rendering golden tests; test consumer-visible invariants and structured codes.",
+    "Both repositories consume and pin the same exact fixture bytes; peer approval is recorded outside this file so approval does not alter its SHA.",
+    "No bridge endpoint, ownership activation, paired SDK readiness, released upgrade or full-roadmap completion follows from this fixture alone."
+  ]
+}

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { Evidence, MemoryRef } from "../shared/lifecycle";
+import { namespaceOf } from "../shared/namespaces";
 import {
   type FeedbackInput,
   FeedbackInputSchema,
@@ -45,6 +46,14 @@ export class MemoryFeedback {
     const result = this.db.transaction(() => this.commit(principal, input, hash)).immediate();
     if (!result.duplicate) this.options.changed();
     return result;
+  }
+  assertDelivery(principal: MutationPrincipal, raw: FeedbackInput): void {
+    const input = FeedbackInputSchema.parse(raw);
+    const context = assertCurrentPrincipal(this.options.lifecycle, principal);
+    this.authorizeReference(principal, input.memoryRef);
+    this.authorizeEvidence(principal, input);
+    if (!this.disclosed(principal, input, context.nonce))
+      throw new MutationError("scope_denied", "The canonical reference was not disclosed in this retrieval.");
   }
 
   expire(): void {
@@ -176,21 +185,17 @@ export class MemoryFeedback {
         "This memory was forgotten; feedback cannot be replayed.",
       );
     const row = this.db.query<MemoryRow, [number]>("SELECT * FROM memories WHERE id=?").get(ref.id);
-    if (
-      tombstone ||
-      !row ||
-      !principal.access.allows("read", { scope: row.scope, projectKey: row.project_key })
-    )
-      this.unavailable();
+    const namespace = row ? namespaceOf(row) : null;
+    if (tombstone || !row || !namespace || !principal.access.allows("read", namespace)) this.unavailable();
     const revision = this.db
-      .query<{ scope: string | null; project_key: string | null }, [number, number]>(
-        "SELECT json_extract(snapshot,'$.scope') AS scope,json_extract(snapshot,'$.project_key') AS project_key FROM memory_revisions WHERE memory_id=? AND revision=?",
+      .query<{ scope: string | null; project_key: string | null; bot_id: string | null }, [number, number]>(
+        "SELECT json_extract(snapshot,'$.scope') AS scope,json_extract(snapshot,'$.project_key') AS project_key,json_extract(snapshot,'$.bot_id') AS bot_id FROM memory_revisions WHERE memory_id=? AND revision=?",
       )
       .get(ref.id, ref.revision);
     if (!revision) this.unavailable();
-    if (revision.scope !== "global" && revision.scope !== "project") {
-      if (principal.access.kind !== "owner") this.unavailable();
-    } else if (!principal.access.allows("read", { scope: revision.scope, projectKey: revision.project_key }))
+    // Unknown historical namespace stays owner-only; known namespaces use the canonical read check.
+    const historical = namespaceOf(revision);
+    if (historical ? !principal.access.allows("read", historical) : principal.access.kind !== "owner")
       this.unavailable();
   }
   private authorizeEvidence(principal: MutationPrincipal, input: ParsedFeedback): string | null {
