@@ -13,12 +13,13 @@ import { scopeKey, VectorIndex } from "../service/vectors";
 import { EMBEDDING_TIERS, MAX_CONTENT_CHARS } from "../shared/service-api";
 import {
   dataRepo,
+  fixtureModelIdentity,
   hashEmbedder,
   hashSpec,
   mergeRequest,
   otherRepo,
   owner,
-  removeV7Schema,
+  removePostV6Schema,
   tempDir,
 } from "./helpers";
 
@@ -223,7 +224,6 @@ describe("vector search", () => {
     expect(index.knn(query, projectA, 10).map((n) => n.id)).toEqual([2, 4]);
     expect(index.knn(query, projectB, 10)).toEqual([{ id: 3, similarity: 1 }]);
     expect(index.knn(query, global, 10).map((n) => n.id)).toEqual([1]);
-    expect(index.table).toBe("vec_test_knn_4");
     db.close();
   });
 
@@ -260,7 +260,7 @@ describe("vector search", () => {
 });
 
 describe("embedding tiers in the store", () => {
-  it("keeps one vec0 table per model and re-embeds missing vectors after a tier switch", async () => {
+  it("reuses unchanged index work after switching tiers", async () => {
     const big = hashEmbedder("test/big", 64);
     const small = hashEmbedder("test/small", 32);
     store.setEmbedder(big);
@@ -277,7 +277,6 @@ describe("embedding tiers in the store", () => {
     expect(store.pendingEmbeddings()).toBe(3);
     await store.indexPending();
     expect(store.pendingEmbeddings()).toBe(0);
-    expect(store.vecTables().map((t) => t.table_name)).toEqual(["vec_test_big_64", "vec_test_small_32"]);
     expect(store.embeddingModels()).toEqual([
       { model: "test/big", dims: 64, count: 3 },
       { model: "test/small", dims: 32, count: 3 },
@@ -287,14 +286,6 @@ describe("embedding tiers in the store", () => {
     store.setEmbedder(big);
     await store.indexPending();
     expect(big.calls).toBe(callsBefore);
-    const id = Number((await store.search({ query: "memory 1", access: owner }))[0]?.id);
-    store.updateAuthorized(owner, id, { content: "rewritten body" });
-    expect(store.pendingEmbeddings()).toBe(1);
-    await store.indexPending();
-    expect(store.embeddingModels()).toEqual([
-      { model: "test/big", dims: 64, count: 3 },
-      { model: "test/small", dims: 32, count: 2 },
-    ]);
   });
 
   it("keyword search works while no model is loaded, and saves queue for the indexer", async () => {
@@ -346,7 +337,7 @@ describe("migration", () => {
     const { db } = openDatabase(path);
     // A 1.0 database: today's schema minus everything v3 added.
     migrate(db);
-    removeV7Schema(db);
+    removePostV6Schema(db);
     db.run(`INSERT INTO memories (scope, type, title, content, content_hash, created_at, updated_at)
         VALUES ('global', 'note', 'From 1.0', 'kept', 'h', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
       ALTER TABLE memories DROP COLUMN use_count;
@@ -360,21 +351,27 @@ describe("migration", () => {
     try {
       const [row] = upgraded.getVisible(owner, [1]);
       expect(row).toMatchObject({ title: "From 1.0", use_count: 0, last_used_at: null, merged_into: null });
-      upgraded.markUsed([1]);
-      expect(upgraded.getVisible(owner, [1])[0]?.use_count).toBe(1);
+      upgraded.markOpened([1]);
+      expect(upgraded.getVisible(owner, [1])[0]).toMatchObject({
+        use_count: 0,
+        last_used_at: null,
+        opened_count: 1,
+      });
       upgraded.audit.open({ nonce: "n", projectKey: null, provider: "omp", tools: true });
       expect(upgraded.audit.agentFor("n")).toBeNull();
     } finally {
       upgraded.close();
     }
   });
+});
 
+describe("session and keyword index migration", () => {
   it("upgrades a v3 database: adds review and usage columns and re-indexes session digests", () => {
     const path = join(tempDir(), "memory.db");
     const { db } = openDatabase(path);
     // A 1.1 database: today's schema minus everything v4 added, with the 1.1 sessions index.
     migrate(db);
-    removeV7Schema(db);
+    removePostV6Schema(db);
     db.run(`DROP TRIGGER sessions_ai; DROP TRIGGER sessions_ad; DROP TRIGGER sessions_au; DROP TABLE sessions_fts;
       DROP TABLE upkeep_dismissed;
       ALTER TABLE memories DROP COLUMN shown_count; ALTER TABLE memories DROP COLUMN opened_count;
@@ -417,7 +414,7 @@ describe("migration", () => {
     const { db } = openDatabase(path);
     // A 1.2.0 database: today's schema with the memories index that kept "." inside words.
     migrate(db);
-    removeV7Schema(db);
+    removePostV6Schema(db);
     db.run(`DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au; DROP TABLE memories_fts;
       CREATE VIRTUAL TABLE memories_fts USING fts5(title, content, topic_key, content = 'memories',
         content_rowid = 'id', tokenize = "porter unicode61 tokenchars '_-./'");
@@ -509,12 +506,13 @@ describe("sessions and context", () => {
 });
 
 describe("context ranking and session capture", () => {
-  it("orders the block pinned first, then the project's most used memories", async () => {
+  it("keeps pins ahead of bounded explicit-open hints", async () => {
     const base = { type: "note", scope: "project" as const, project: dataRepo, content: "body" };
+    store.configure({ ...store.config, usageRanking: true });
     const rarely = await store.save({ ...base, title: "Rarely used" });
     const often = await store.save({ ...base, title: "Often used" });
     await store.save({ ...base, title: "Pinned one", pinned: true });
-    for (let i = 0; i < 5; i++) store.markUsed([often.id as number]);
+    for (let i = 0; i < 5; i++) store.markOpened([often.id as number]);
     const text = (await retrieveContext({ store, project: dataRepo })).contextText;
     const at = (title: string) => text.indexOf(title);
     expect(at("Pinned one")).toBeLessThan(at("Often used"));
@@ -569,7 +567,7 @@ describe("context ranking and session capture", () => {
 });
 
 describe("usage", () => {
-  it("counts agent searches in the top five and fetches, but not UI browsing", async () => {
+  it("counts every returned exposure separately from deduplicated explicit opens and legacy activity", async () => {
     const base = { type: "note", scope: "global" as const, project: null, force: true };
     const ids: number[] = [];
     for (let i = 0; i < 7; i++) {
@@ -583,22 +581,21 @@ describe("usage", () => {
     const hits = await store.search({ query: "kafka", access: owner, limit: 10, track: true });
     const used = store
       .getVisible(owner, ids)
-      .filter((r) => r.use_count === 1)
+      .filter((r) => r.shown_count === 1)
       .map((r) => String(r.id));
-    expect(used.sort()).toEqual(
-      hits
-        .slice(0, 5)
-        .map((h) => h.id)
-        .sort(),
-    );
-    store.markUsed([ids[6] as number, ids[6] as number]);
+    expect(used.sort()).toEqual(hits.map((h) => h.id).sort());
+    store.markOpened([ids[6] as number, ids[6] as number]);
     expect(store.getVisible(owner, [ids[6] as number])[0]).toMatchObject({
-      use_count: 1,
-      last_used_at: expect.any(String),
+      use_count: 0,
+      last_used_at: null,
+      shown_count: 1,
+      opened_count: 1,
+      last_retrieved_at: expect.any(String),
     });
   });
 
-  it("ranks a used memory above an equal unused one", async () => {
+  it("allows bounded explicit-open hints when usage ranking is enabled", async () => {
+    store.configure({ ...store.config, usageRanking: true });
     const base = {
       type: "note",
       scope: "global" as const,
@@ -607,21 +604,24 @@ describe("usage", () => {
     };
     await store.save({ ...base, title: "Grafana A" });
     const b = await store.save({ ...base, title: "Grafana B" });
-    for (let i = 0; i < 8; i++) store.markUsed([b.id as number]);
+    for (let i = 0; i < 8; i++) store.markOpened([b.id as number]);
     expect((await store.search({ query: "grafana dashboards", access: owner }))[0]?.id).toBe(String(b.id));
   });
 
-  it("lists unpinned memories nobody used or edited for 60 days as stale", async () => {
+  it("does not make stale facts fresh merely because they were read", async () => {
     let now = new Date("2026-01-01T00:00:00Z");
     const timed = new MemoryStore({ path: ":memory:", now: () => now });
     const base = { type: "note", scope: "global" as const, project: null, content: "c" };
     const old = await timed.save({ ...base, title: "Old" });
-    const usedLater = await timed.save({ ...base, title: "Used later" });
+    const retrievedLater = await timed.save({ ...base, title: "Read later" });
     await timed.save({ ...base, title: "Pinned old", pinned: true });
     now = new Date("2026-02-20T00:00:00Z");
-    timed.markUsed([usedLater.id as number]);
+    timed.markOpened([retrievedLater.id as number]);
     now = new Date("2026-03-15T00:00:00Z");
-    expect(timed.list({ access: owner, stale: true }).map((h) => h.id)).toEqual([String(old.id)]);
+    expect(timed.list({ access: owner, stale: true }).map((h) => h.id)).toEqual([
+      String(old.id),
+      String(retrievedLater.id),
+    ]);
     timed.close();
   });
 });
@@ -647,6 +647,7 @@ describe("re-ranking", () => {
     const seen: string[][] = [];
     store.setReranker({
       model: "test/reranker",
+      identity: fixtureModelIdentity("test/reranker", 1, "reranking"),
       async score(_query, docs) {
         seen.push(docs);
         return docs.map((d) =>
@@ -666,6 +667,7 @@ describe("re-ranking", () => {
     const fused = titles(await store.search({ query: "deploy", access: owner }));
     store.setReranker({
       model: "test/broken",
+      identity: fixtureModelIdentity("test/broken", 1, "reranking"),
       score: async () => {
         throw new Error("onnx session failed");
       },

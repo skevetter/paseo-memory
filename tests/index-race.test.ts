@@ -7,7 +7,15 @@ import { migrate, SCHEMA_VERSION, SchemaTooNewError } from "../service/schema";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type StoreOptions } from "../service/store";
 import { scopeKey } from "../service/vectors";
-import { dataRepo, hashEmbedder, otherRepo, owner, removeV7Schema, tempDir } from "./helpers";
+import {
+  dataRepo,
+  fixtureModelIdentity,
+  hashEmbedder,
+  otherRepo,
+  owner,
+  removePostV6Schema,
+  tempDir,
+} from "./helpers";
 
 const stores: MemoryStore[] = [];
 afterEach(() => {
@@ -328,6 +336,7 @@ describe("search after async work", () => {
     const calls = new Gate<{ release: () => void }>();
     const reranker: Reranker = {
       model: "test/deferred-rerank",
+      identity: fixtureModelIdentity("test/deferred-rerank", 1, "reranking"),
       score(_query, docs) {
         const { promise, resolve } = Promise.withResolvers<number[]>();
         calls.push({ release: () => resolve(docs.map((_, i) => 1 - i * 0.1)) });
@@ -425,7 +434,7 @@ async function v5Database() {
   await store.indexPending();
   store.close();
   const { db } = openDatabase(path);
-  removeV7Schema(db);
+  removePostV6Schema(db);
   db.run(`ALTER TABLE memories DROP COLUMN index_generation; ALTER TABLE memories DROP COLUMN record_revision;
     ALTER TABLE memory_embeddings DROP COLUMN index_generation;
     ALTER TABLE memory_embeddings DROP COLUMN model_fingerprint;

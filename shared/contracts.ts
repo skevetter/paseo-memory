@@ -6,6 +6,7 @@ import {
   MutationRequestSchema,
   MutationResultSchema,
 } from "./lifecycle";
+import { ResourceStatusSchema } from "./resources";
 import { RetrievalPolicySettingsSchema } from "./retrieval";
 import {
   AgentAuditSchema,
@@ -333,6 +334,7 @@ export const statusRpc = defineRpc({
   name: "memory.status",
   input: z.object({}),
   output: z.object({
+    resources: ResourceStatusSchema.nullable(),
     service: z.object({
       state: ServiceStateSchema,
       detail: z.string().nullable(),

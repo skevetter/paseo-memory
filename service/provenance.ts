@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { type Evidence, type EvidenceInput, EvidenceInputSchema } from "../shared/lifecycle";
 import type { Access, Namespace } from "./access";
+import { currentLifecycleSql, sourceRevisionsSql } from "./lifecycle";
 import { MutationError } from "./mutations";
 import { redact } from "./redact";
 import { sha256 } from "./text";
@@ -17,6 +18,11 @@ const RevisionSnapshotSchema = z.object({
   project_key: z.string().nullable().optional(),
   updated_at: z.string().optional(),
 });
+
+interface EvidenceSupport {
+  readonly validUntil: string | null;
+}
+const UNBOUNDED_SUPPORT: EvidenceSupport = Object.freeze({ validUntil: null });
 
 type MemorySource = { id: number; revision: number };
 type Source = Namespace & {
@@ -101,6 +107,36 @@ export class Provenance {
       if (evidence) visible.push(evidence);
     }
     return visible;
+  }
+
+  isCurrent(evidence: Evidence): boolean {
+    return this.currentSupport(evidence) !== null;
+  }
+
+  currentSupport(evidence: Evidence): EvidenceSupport | null {
+    if (evidence.status !== "resolved") return null;
+    if (evidence.sourceKind !== "memory") return UNBOUNDED_SUPPORT;
+    const match = /^memory:(\d+)@(\d+)$/.exec(evidence.sourceRef);
+    if (!match) return null;
+    const id = Number(match[1]);
+    const revision = Number(match[2]);
+    const source = this.db
+      .query<{ support_valid_until: string | null }, [number, number, number, number, string]>(
+        `${sourceRevisionsSql("?", "?")}
+        SELECT (SELECT candidate.valid_until FROM (
+          SELECT m.valid_until
+          UNION ALL SELECT dependency.valid_until FROM sources s JOIN memories dependency
+            ON dependency.id=s.id AND dependency.record_revision=s.revision
+        ) candidate WHERE candidate.valid_until IS NOT NULL
+          ORDER BY julianday(candidate.valid_until) LIMIT 1) AS support_valid_until
+        FROM memories m WHERE m.id=? AND m.record_revision=? AND m.deleted_at IS NULL
+          AND ${currentLifecycleSql("m", "?")}`,
+      )
+      .get(id, revision, id, revision, this.now());
+    if (!source) return null;
+    return source.support_valid_until === null
+      ? UNBOUNDED_SUPPORT
+      : { validUntil: new Date(source.support_valid_until).toISOString() };
   }
 
   registerArtifact(

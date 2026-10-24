@@ -1,28 +1,36 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EmbeddingTier, Strictness } from "../shared/service-api";
+import type { ModelIdentity } from "./model-manifest";
+import {
+  createModelIdentity,
+  ensureModelArtifacts,
+  loadLocalTransformers,
+  MODEL_MANIFESTS,
+} from "./model-manifest";
 
 export type EmbedKind = "document" | "query";
 
 export interface TierSpec {
-  tier: EmbeddingTier;
-  model: string;
-  backend: "model2vec" | "transformers";
-  dtype: "q8" | "fp32";
-  pooling: "cls" | "mean";
-  dims: number;
-  queryPrefix: string;
-  documentPrefix: string;
-  duplicateThreshold: number;
-  searchFloor: { min: number; relative: number };
-  taskFloor: Record<Strictness, number>;
+  readonly tier: EmbeddingTier;
+  readonly model: string;
+  readonly backend: "model2vec" | "transformers";
+  readonly dtype: "q8" | "fp32";
+  readonly pooling: "cls" | "mean";
+  readonly dims: number;
+  readonly queryPrefix: string;
+  readonly documentPrefix: string;
+  readonly duplicateThreshold: number;
+  readonly searchFloor: Readonly<{ min: number; relative: number }>;
+  readonly taskFloor: Readonly<Record<Strictness, number>>;
+  readonly identity: Readonly<ModelIdentity>;
 }
 
 const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
 
 // Thresholds are calibrated per tier on tests/fixtures/calibration.ts by the "tier calibration" tests.
-export const TIERS: Record<EmbeddingTier, TierSpec> = {
-  zero: {
+export const TIERS: Readonly<Record<EmbeddingTier, TierSpec>> = Object.freeze({
+  zero: tierSpec({
     tier: "zero",
     model: "minishlab/potion-base-8M",
     backend: "model2vec",
@@ -34,8 +42,8 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     duplicateThreshold: 0.92,
     searchFloor: { min: 0.12, relative: 0.5 },
     taskFloor: { low: 0.15, medium: 0.22, high: 0.32 },
-  },
-  low: {
+  }),
+  low: tierSpec({
     tier: "low",
     model: "Xenova/bge-small-en-v1.5",
     backend: "transformers",
@@ -47,8 +55,8 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.55, relative: 0.88 },
     taskFloor: { low: 0.53, medium: 0.57, high: 0.62 },
-  },
-  medium: {
+  }),
+  medium: tierSpec({
     tier: "medium",
     model: "Alibaba-NLP/gte-modernbert-base",
     backend: "transformers",
@@ -60,8 +68,8 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.5, relative: 0.85 },
     taskFloor: { low: 0.5, medium: 0.56, high: 0.62 },
-  },
-  high: {
+  }),
+  high: tierSpec({
     tier: "high",
     model: "Xenova/bge-large-en-v1.5",
     backend: "transformers",
@@ -73,8 +81,8 @@ export const TIERS: Record<EmbeddingTier, TierSpec> = {
     duplicateThreshold: 0.9,
     searchFloor: { min: 0.5, relative: 0.88 },
     taskFloor: { low: 0.49, medium: 0.53, high: 0.6 },
-  },
-};
+  }),
+});
 
 export interface Embedder {
   readonly spec: TierSpec;
@@ -83,24 +91,64 @@ export interface Embedder {
 
 const MAX_EMBED_CHARS = 8000;
 
+function tierSpec(input: Omit<TierSpec, "identity">): TierSpec {
+  let identity: Readonly<ModelIdentity> | undefined;
+  return Object.freeze({
+    ...input,
+    searchFloor: Object.freeze(input.searchFloor),
+    taskFloor: Object.freeze(input.taskFloor),
+    get identity() {
+      identity ??= createModelIdentity(MODEL_MANIFESTS[input.tier], {
+        task: "embedding",
+        implementation:
+          input.backend === "model2vec" ? "paseo-wordpiece-sum-l2-v1" : "transformers-feature-extraction-v1",
+        dtype: input.dtype,
+        dims: input.dims,
+        pooling: input.pooling,
+        normalization: "l2",
+        queryPrefix: input.queryPrefix,
+        documentPrefix: input.documentPrefix,
+        maxInputChars: MAX_EMBED_CHARS,
+        maxDocumentChars: null,
+        maxPairTokens: null,
+        padding: input.backend === "transformers",
+        truncation: input.backend === "transformers",
+        scoreTransform: "none",
+      });
+      return identity;
+    },
+  });
+}
+
 export function loadEmbedder(tier: EmbeddingTier, modelsDir: string): Promise<Embedder> {
   const spec = TIERS[tier];
   return spec.backend === "model2vec" ? loadModel2Vec(spec, modelsDir) : loadTransformers(spec, modelsDir);
 }
 
 async function loadModel2Vec(spec: TierSpec, modelsDir: string): Promise<Embedder> {
-  const embedOne = loadStaticEmbedder(await ensureModelFiles({ modelsDir, model: spec.model }));
-  return { spec, embed: async (texts) => texts.map((t) => embedOne(t.slice(0, MAX_EMBED_CHARS))) };
+  const dir = await ensureModelArtifacts({ modelsDir, manifest: MODEL_MANIFESTS[spec.tier] });
+  const embedOne = loadStaticEmbedder(dir);
+  // Resolve and retain the exact runtime/preprocessing identity used by this instance.
+  const loadedSpec = Object.freeze({ ...spec, identity: spec.identity });
+  return {
+    spec: loadedSpec,
+    embed: async (texts) => texts.map((t) => embedOne(t.slice(0, MAX_EMBED_CHARS))),
+  };
 }
 
 async function loadTransformers(spec: TierSpec, modelsDir: string): Promise<Embedder> {
-  // Dynamic import: the zero tier must not depend on onnxruntime-node's native addon.
-  const transformers = await import("@huggingface/transformers");
-  mkdirSync(modelsDir, { recursive: true });
-  transformers.env.cacheDir = modelsDir;
-  const extractor = await transformers.pipeline("feature-extraction", spec.model, { dtype: spec.dtype });
+  const loadedSpec = Object.freeze({ ...spec, identity: spec.identity });
+  const dir = await ensureModelArtifacts({ modelsDir, manifest: MODEL_MANIFESTS[spec.tier] });
+  const transformers = await loadLocalTransformers();
+  const extractor = await transformers.pipeline("feature-extraction", dir, {
+    dtype: spec.dtype,
+    device: "cpu",
+    local_files_only: true,
+    revision: spec.identity.modelRevision,
+    use_external_data_format: false,
+  });
   return {
-    spec,
+    spec: loadedSpec,
     async embed(texts, kind) {
       if (texts.length === 0) return [];
       const prefix = kind === "document" ? spec.documentPrefix : spec.queryPrefix;
@@ -116,30 +164,6 @@ async function loadTransformers(spec: TierSpec, modelsDir: string): Promise<Embe
       return texts.map((_, i) => data.slice(i * dims, (i + 1) * dims));
     },
   };
-}
-
-const STATIC_FILES = ["model.safetensors", "tokenizer.json"] as const;
-
-export async function ensureModelFiles(input: {
-  modelsDir: string;
-  model: string;
-  fetchImpl?: typeof fetch;
-}): Promise<string> {
-  const dir = join(input.modelsDir, input.model.replace("/", "__"));
-  mkdirSync(dir, { recursive: true });
-  const doFetch = input.fetchImpl ?? fetch;
-  for (const file of STATIC_FILES) {
-    const target = join(dir, file);
-    if (existsSync(target)) continue;
-    const url = `https://huggingface.co/${input.model}/resolve/main/${file}`;
-    const response = await doFetch(url, { redirect: "follow" });
-    if (!response.ok) throw new Error(`download ${url} failed: HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const partial = `${target}.partial`;
-    writeFileSync(partial, bytes);
-    renameSync(partial, target);
-  }
-  return dir;
 }
 
 export function loadStaticEmbedder(dir: string): (text: string) => Float32Array {
@@ -212,7 +236,7 @@ interface TokenizerJson {
 }
 
 // Matches HF BertNormalizer/BertPreTokenizer; unknown words are dropped, as model2vec does.
-export class WordPieceTokenizer {
+class WordPieceTokenizer {
   private readonly vocab: Map<string, number>;
   private readonly prefix: string;
   private readonly maxChars: number;

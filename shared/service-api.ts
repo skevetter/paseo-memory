@@ -11,6 +11,12 @@ import {
   VerificationSchema,
 } from "./lifecycle";
 import {
+  FeedbackInputSchema,
+  type FeedbackResult,
+  ModelUsageInputSchema,
+  type ResourceStatus,
+} from "./resources";
+import {
   DEFAULT_RETRIEVAL_POLICY,
   RetrievalPolicySettingsSchema,
   RetrievalRequestSchema,
@@ -128,14 +134,26 @@ export const HistoricalMemorySchema = z.object({
 });
 export type HistoricalMemory = z.infer<typeof HistoricalMemorySchema>;
 
+// Current service authority for a selected hook output, not provider-session or consumption admission.
 export const ContextAdmissionSchema = z.strictObject({
   retrievalId: RequestIdInput.nullable(),
   nonce: RequestIdInput,
 });
 export type ContextAdmission = z.input<typeof ContextAdmissionSchema>;
 
+// Acknowledges only the selected agent-create hook output, never provider consumption or billing.
+export const ContextSettlementSchema = z.strictObject({
+  retrievalId: RequestIdInput,
+  nonce: RequestIdInput,
+  status: z.enum(["attached", "discarded"]),
+});
+export type ContextSettlement = z.input<typeof ContextSettlementSchema>;
 export const serviceInputs = {
   status: z.object({}),
+  "usage-record": ModelUsageInputSchema,
+  "context-admit": ContextAdmissionSchema,
+  "context-settle": ContextSettlementSchema,
+  feedback: FeedbackInputSchema,
   mutate: MutationRequestSchema,
   "lifecycle-detail": z.strictObject({ id: RevisionInput }),
   historical: z.strictObject({ id: RevisionInput, asOf: TimestampSchema }),
@@ -188,7 +206,8 @@ export const serviceInputs = {
   "review-end": z.object({
     agentId: z.string().min(1),
     reply: z.string().nullable(),
-    failed: z.boolean(),
+    outcome: z.enum(["completed", "failed", "cancelled"]),
+    turnId: z.string().min(1).nullable(),
   }),
   "review-skip": z.object({
     agentId: z.string().min(1),
@@ -479,10 +498,15 @@ export interface ServiceStatus {
   projects: number;
   embedder: EmbedderStatus;
   reranker: RerankerStatus;
+  resources: ResourceStatus;
 }
 
 export interface ServiceOutputs {
   status: ServiceStatus;
+  "usage-record": { recorded: boolean; duplicate: boolean };
+  "context-admit": { admitted: true };
+  "context-settle": { recorded: boolean; duplicate: boolean };
+  feedback: FeedbackResult;
   mutate: MutationResult;
   "lifecycle-detail": LifecycleDetail | null;
   historical: HistoricalMemory | null;

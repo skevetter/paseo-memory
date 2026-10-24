@@ -113,7 +113,9 @@ export function isExactDuplicate(pair: MemoryPair): boolean {
 
 export function mergeTarget(pair: MemoryPair): MemoryWithProject {
   const { a, b } = pair;
-  if (a.use_count !== b.use_count) return a.use_count > b.use_count ? a : b;
+  const activity = (row: MemoryWithProject) => row.application_count + row.validated_helpful_count;
+  if (activity(a) !== activity(b)) return activity(a) > activity(b) ? a : b;
+  if (a.opened_count !== b.opened_count) return a.opened_count > b.opened_count ? a : b;
   return a.updated_at > b.updated_at ? a : b;
 }
 

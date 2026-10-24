@@ -17,6 +17,7 @@ import { signCaller } from "./mcp";
 import { MutationError, mutationRequestId, ownerMutation } from "./mutations";
 import { redact } from "./redact";
 import { finishReview } from "./review";
+import { sessionVersion } from "./sessions";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
 import type { TaskInput } from "./task";
 import { clip } from "./text";
@@ -46,6 +47,10 @@ export function createRoutes(ctx: RouteContext): Routes {
     paseoProjectId ? store.projectByPaseoId(paseoProjectId) : null;
   return {
     status: () => ctx.status(),
+    "usage-record": (input) => store.usage.record("paseo_host", input),
+    "context-admit": (input) => store.admitContext(input),
+    "context-settle": (input) => store.usage.settleContext(input),
+    feedback: (input) => store.feedback.record(ownerMutation(OWNER), input),
     ...lifecycleRoutes(store),
     configure: (input) => {
       store.configure(input);
@@ -178,7 +183,7 @@ function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-
         };
       const nonce = store.audit.toolNonceFor(input.agentId);
       if (!nonce) return { ok: false, reason: "This agent has no memory tools.", cap };
-      store.reviews.open({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
+      store.openReviewWindow({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
       return { ok: true, reason: null, cap };
     },
     "review-end": (input) => finishReview(store, input),

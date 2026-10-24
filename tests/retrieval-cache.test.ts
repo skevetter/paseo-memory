@@ -7,7 +7,7 @@ import { RetrievalCache } from "../service/retrieval-cache";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore } from "../service/store";
 import type { MutationRequest, MutationResult } from "../shared/lifecycle";
-import { dataRepo, hashEmbedder, hashSpec, otherRepo, owner, tempDir } from "./helpers";
+import { dataRepo, fixtureModelIdentity, hashEmbedder, hashSpec, otherRepo, owner, tempDir } from "./helpers";
 
 let store: MemoryStore;
 let now: Date;
@@ -50,6 +50,7 @@ function inference(model = "test/retrieval") {
   store.setEmbedder(embedder);
   store.setReranker({
     model: "test/retrieval-rerank",
+    identity: fixtureModelIdentity("test/retrieval-rerank", 1, "reranking"),
     async score(_query, docs) {
       documents.push([...docs]);
       return docs.map((_, index) => 1 - index / 100);
@@ -319,6 +320,7 @@ it("recovers from failed reranking without fabricating relevance or caching the 
   let calls = 0;
   store.setReranker({
     model: "test/rerank-recovery",
+    identity: fixtureModelIdentity("test/rerank-recovery", 1, "reranking"),
     async score(_query, docs) {
       if (++calls === 1) throw new Error("reranker temporarily unavailable");
       return docs.map(() => 0.75);
@@ -429,6 +431,7 @@ it("reauthorizes before reranking and drops corrected revisions after asynchrono
   const seen: string[][] = [];
   store.setReranker({
     model: "test/final-reauth",
+    identity: fixtureModelIdentity("test/final-reauth", 1, "reranking"),
     async score(_query, docs) {
       seen.push([...docs]);
       started.resolve();

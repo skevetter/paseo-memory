@@ -397,7 +397,7 @@ describe("task-aware start", () => {
     await agent.call("memory_get", { ids: [Number(other.json.id)] });
     expect((await internal("detail", { id })).json).toMatchObject({ memory: { openedCount: 1 } });
     expect((await internal("detail", { id: Number(other.json.id) })).json).toMatchObject({
-      memory: { openedCount: 0, useCount: 1 },
+      memory: { openedCount: 1, useCount: 0, lastUsedAt: null },
     });
   });
 });
@@ -429,7 +429,7 @@ describe("session review", () => {
     const fourth = await agent.call("memory_save", { title: "Review fact 4", content: "one too many" });
     expect(fourth.isError).toBe(true);
     const reply = `[paseo-memory:review-reply v1 collapsed]\nSummary: Capped retries at three and kept backoff.\nSaved: #${ids.join(", #")}\nUpdated: none`;
-    const ended = await internal("review-end", { agentId, reply, failed: false });
+    const ended = await internal("review-end", { agentId, reply, outcome: "completed", turnId: null });
     expect(ended.json).toEqual({
       ok: true,
       saved: ids,

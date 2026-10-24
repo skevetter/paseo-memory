@@ -5,7 +5,7 @@ import { MemoryStore } from "../service/store";
 import type { MutationRequest } from "../shared/lifecycle";
 import { DEFAULT_RETRIEVAL_POLICY } from "../shared/retrieval";
 import { DEFAULT_RUNTIME } from "../shared/service-api";
-import { dataRepo, hashEmbedder, otherRepo, owner } from "./helpers";
+import { dataRepo, fixtureModelIdentity, hashEmbedder, otherRepo, owner } from "./helpers";
 
 let store: MemoryStore;
 beforeEach(() => {
@@ -111,6 +111,7 @@ it("applies owner policy narrowing before reranking and final disclosure", async
   });
   store.setReranker({
     model: "test/policy-rerank",
+    identity: fixtureModelIdentity("test/policy-rerank", 1, "reranking"),
     async score(_query, documents) {
       reranked += documents.length;
       return documents.map(() => 1);
@@ -201,6 +202,7 @@ it.each(["embedder", "reranker"])(
     const gate = Promise.withResolvers<void>();
     store.setReranker({
       model: "test/old-reranker",
+      identity: fixtureModelIdentity("test/old-reranker", 1, "reranking"),
       async score(_query, documents) {
         started.resolve();
         await gate.promise;

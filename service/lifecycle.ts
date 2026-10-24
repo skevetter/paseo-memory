@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import type { ForgetPreview, MemoryRef } from "../shared/lifecycle";
 import type { Access } from "./access";
+import { retractFeedbackEvidence } from "./feedback";
 import { dropVectors } from "./vectors";
 
 const DISCLOSURES_SQL = `WITH RECURSIVE disclosed(nonce,memory_id) AS (
@@ -29,7 +30,7 @@ export function currentLifecycleSql(alias = "m", at = "strftime('%Y-%m-%dT%H:%M:
     ))`;
 }
 
-function sourceRevisionsSql(id: string, revision: string): string {
+export function sourceRevisionsSql(id: string, revision: string): string {
   return `WITH RECURSIVE sources(id,revision) AS (
     SELECT r.from_id,r.from_revision FROM memory_relations r
       WHERE r.to_id=${id} AND r.to_revision=${revision} AND r.kind='derived_from'
@@ -158,6 +159,7 @@ export class Lifecycle {
   }
 
   private processInvalidation(ref: MemoryRef, remaining: number): number {
+    this.retractAssessments(ref);
     const children = this.db
       .query<{ id: number; record_revision: number }, [number, number, number]>(
         `SELECT DISTINCT m.id,m.record_revision FROM memory_relations r JOIN memories m ON m.id=r.to_id
@@ -184,6 +186,7 @@ export class Lifecycle {
   }
 
   markForRecheck(ref: MemoryRef): void {
+    this.retractAssessments(ref);
     this.db
       .query(`UPDATE memories SET state='needs_recheck',verification_status='unresolved',verified_at=NULL,
       record_revision=record_revision+1,index_generation=index_generation+1,updated_at=? WHERE id=? AND record_revision=?`)
@@ -198,6 +201,16 @@ export class Lifecycle {
       FROM memory_relations WHERE to_id=? AND to_revision=?`)
       .run(ref.revision + 1, ref.id, ref.revision);
     dropVectors(this.db, ref.id);
+  }
+
+  private retractAssessments(ref: MemoryRef): void {
+    const ids = this.db
+      .query<{ evidence_id: string }, [string]>(
+        "SELECT evidence_id FROM memory_evidence WHERE source_kind='memory' AND source_ref=?",
+      )
+      .all(`memory:${ref.id}@${ref.revision}`)
+      .map((row) => row.evidence_id);
+    retractFeedbackEvidence(this.db, ids, "invalidate");
   }
 
   preview(access: Access, id: number): ForgetPreview {

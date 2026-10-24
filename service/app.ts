@@ -17,6 +17,7 @@ import {
 } from "../shared/service-api";
 import type { ContextTokenizer } from "./context-budget";
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
+import type { InferenceQueueOptions } from "./inference-queue";
 import { type Caller, createMcpHandler } from "./mcp";
 import { MutationError } from "./mutations";
 import { loadReranker, RERANK_MODEL, type Reranker, rerankEnabled } from "./reranker";
@@ -44,6 +45,7 @@ export interface ServiceOptions {
   loadEmbedder?: (tier: EmbeddingTier, modelsDir: string) => Promise<Embedder>;
   loadReranker?: (modelsDir: string) => Promise<Reranker>;
   contextTokenizers?: ReadonlyMap<string, ContextTokenizer>;
+  inference?: InferenceQueueOptions;
 }
 
 export interface RunningService {
@@ -81,6 +83,7 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     path: join(options.dataDir, "memory.db"),
     sqlitePath: options.sqlitePath,
     log,
+    inference: options.inference,
   });
   const models = initialStates(options);
 
@@ -170,6 +173,7 @@ function serviceStatus(store: MemoryStore, models: ModelStates, mcpUrl: string):
     ...store.stats(),
     embedder: { ...models.embedder, ...embedderIndexStatus(store) },
     reranker: { ...models.reranker },
+    resources: store.resourceStatus(),
   };
 }
 
@@ -309,33 +313,33 @@ const modelsDirOf = (options: ServiceOptions) => options.modelsDir ?? join(optio
 
 function activateEmbedder({ store, models, options, log }: Activation): Promise<void> {
   const { embedder } = models;
-  return (options.loadEmbedder ?? loadEmbedder)(options.tier, modelsDirOf(options)).then(
-    (loaded) => {
+  return (options.loadEmbedder ?? loadEmbedder)(options.tier, modelsDirOf(options))
+    .then((loaded) => {
       store.setEmbedder(loaded);
       embedder.state = "ready";
       log.info(`embeddings ready: ${loaded.spec.model} (${loaded.spec.dims}d, tier ${options.tier})`);
-    },
-    (error: unknown) => {
+    })
+    .catch((error: unknown) => {
+      store.setEmbedder(null);
       embedder.state = "error";
       embedder.error = errorText(error);
       log.warn(`embeddings unavailable, keyword search only: ${errorText(error)}`);
-    },
-  );
+    });
 }
 
 function activateReranker({ store, models, options, log }: Activation): Promise<void> {
   const { reranker } = models;
   if (!reranker.enabled) return Promise.resolve();
-  return (options.loadReranker ?? loadReranker)(modelsDirOf(options)).then(
-    (loaded) => {
+  return (options.loadReranker ?? loadReranker)(modelsDirOf(options))
+    .then((loaded) => {
       store.setReranker(loaded);
       reranker.state = "ready";
       log.info(`re-ranker ready: ${loaded.model}`);
-    },
-    (error: unknown) => {
+    })
+    .catch((error: unknown) => {
+      store.setReranker(null);
       reranker.state = "error";
       reranker.error = errorText(error);
       log.warn(`re-ranker unavailable, using fused order: ${errorText(error)}`);
-    },
-  );
+    });
 }

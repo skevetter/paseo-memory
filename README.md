@@ -11,6 +11,7 @@ Local memory for Paseo agents. One SQLite file stores global and project memory.
 - **Upkeep:** duplicate suggestions, possible-conflict flags and a stale list. Automatic merges require compatible exact content and namespace; merges retain snapshots and support undo.
 - **Lifecycle:** canonical ID/revision references, evidence and validity, compare-and-swap corrections, historical queries, source invalidation and explicit forget. [API and migration limits](docs/lifecycle.md).
 - **Audit:** each agent's injected memories, tool calls and reviews.
+- **Resources:** bounded local inference, current index fingerprints, process-wide CPU/RSS, queue outcomes and latency samples. Prepared Memory tokens, maintenance observations and provider billing remain separate; unavailable values are not zero.
 - **UI:** a Memory panel, a settings screen and a `/remember` command.
 
 ## Embeddings
@@ -22,7 +23,11 @@ Local memory for Paseo agents. One SQLite file stores global and project memory.
 | medium (default) | gte-modernbert-base | 768 |
 | high | bge-large-en-v1.5 | 1024 |
 
-Models run on the host and download on first use.
+Models run on the host and download on first use. Model and tokenizer revisions, finite artifact lists, sizes and SHA256 digests are pinned. Downloads activate atomically only after verification; corrupt or unavailable models leave keyword retrieval available rather than loading unchecked weights.
+
+Model/index identity also includes runtime versions, preprocessing, dimensions, pooling, normalization and prefixes. Different fingerprints never share vector entries. Replaced indexes are read-only; at most two retired indexes are retained, and indexes older than seven retired days are pruned on replacement readiness and periodic maintenance. Forget purges the affected rows from every retained index.
+
+Document embeddings, query embeddings and reranking share a bounded queue: two active and 32 pending by default, with absolute limits of eight and 256. Cancellation settles callers promptly, but an uncooperative backend occupies its slot until it actually finishes. Settings reports loading/index failures, queue pressure, latest-256 latency percentiles and nullable usage values. [Execution and accounting limits](docs/retrieval.md#execution-and-accounting).
 
 ## Requirements
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type {
@@ -247,8 +248,9 @@ function registerTurnHooks(server: PluginServerContext, state: PluginState): voi
   });
   server.on("agent.turn_ended", async (event, { paseo }) => {
     state.paseo = paseo;
+    const turnKey = await recordNativeTurn(state, event);
     await linkByMatch(state, event.agent);
-    if (!firstSighting(seenTurns, `${event.agent.id}:${event.turnId ?? event.timeline.length}`)) return;
+    if (turnKey && !firstSighting(seenTurns, turnKey)) return;
     const digest = digestLatestTurn(event.timeline);
     if (digest.userText !== null && reviewPromptDisplay(digest.userText) !== null) {
       await endReview(state, event, digest);
@@ -262,7 +264,41 @@ function registerTurnHooks(server: PluginServerContext, state: PluginState): voi
   });
 }
 
-// The turn-end hook can fire more than once for a turn; each turn is handled once.
+async function recordNativeTurn(state: PluginState, event: TurnEnded): Promise<string | null> {
+  if (!event.turnId) {
+    state.log.warn(
+      `native turn usage omitted for agent ${event.agent.id}: the host supplied no turn identity`,
+    );
+    return null;
+  }
+  const turnKey = `native-turn:${createHash("sha256")
+    .update(JSON.stringify([event.agent.id, event.turnId]))
+    .digest("hex")}`;
+  // SDK 0.11 has no event-correlated session epoch or scoped billing. Reopened IDs may coalesce.
+  await state.supervisor
+    .call(
+      "usage-record",
+      {
+        eventId: `ended:${turnKey}`,
+        attemptId: turnKey,
+        sourceSequence: 0,
+        stage: "provider_turn",
+        status: event.outcome.kind === "canceled" ? "cancelled" : event.outcome.kind,
+        provenance: "unavailable",
+        sourceEventId: turnKey,
+        model: null,
+        inputTokens: null,
+        outputTokens: null,
+        costAmount: null,
+        currency: null,
+      },
+      RPC_TIMEOUT_MS,
+    )
+    .catch((error: unknown) => state.log.warn(`native turn usage not recorded: ${String(error)}`));
+  return turnKey;
+}
+
+// Only an actual non-null host identity deduplicates capture; timeline length is not a turn identity.
 function firstSighting(seen: Set<string>, key: string): boolean {
   if (seen.has(key)) return false;
   if (seen.size > 2000) seen.clear();
@@ -325,7 +361,7 @@ async function sendReview(
     state.log.info(`memory review sent to agent ${handle.id}`);
   } catch (error) {
     state.reviews.reviewSkipped(handle.id);
-    const input = { agentId: handle.id, reply: null, failed: true };
+    const input = { agentId: handle.id, reply: null, outcome: "failed" as const, turnId: null };
     await state.supervisor.call("review-end", input, RPC_TIMEOUT_MS).catch(() => undefined);
     throw error;
   }
@@ -334,8 +370,9 @@ async function sendReview(
 async function endReview(state: PluginState, event: TurnEnded, digest: TurnDigest): Promise<void> {
   const agentId = event.agent.id;
   state.reviews.reviewEnded(agentId);
-  const failed = event.outcome.kind !== "completed" || !isUsableReply(digest.assistantText);
-  const input = { agentId, reply: digest.assistantText, failed };
+  const outcome = event.outcome.kind === "canceled" ? "cancelled" : event.outcome.kind;
+  const reply = isUsableReply(digest.assistantText) ? digest.assistantText : null;
+  const input = { agentId, reply, outcome, turnId: event.turnId } as const;
   await state.supervisor
     .call("review-end", input, RPC_TIMEOUT_MS)
     .then((result) =>
@@ -420,10 +457,15 @@ async function injectMemory(
     },
     remaining,
   );
-  if (!(await admitInjection(state, injected, delivery))) return request;
+  if (!(await admitInjection(state, injected, delivery))) {
+    settleInjection(state, injected, "discarded");
+    return request;
+  }
   return withInjection(request, injected, state, delivery);
 }
 
+// Current at the service read snapshot; later revocation can race the reply or hook return.
+// The SDK exposes no atomic handoff to provider execution.
 async function admitInjection(
   state: PluginState,
   injected: ServiceOutputs["agent-context"],
@@ -448,6 +490,30 @@ async function admitInjection(
   }
 }
 
+function settleInjection(
+  state: PluginState,
+  injected: ServiceOutputs["agent-context"],
+  status: "attached" | "discarded",
+): void {
+  if (!injected.context) return;
+  if (!injected.nonce) {
+    state.log.warn("agent-create fragment settlement skipped: the issued context has no nonce");
+    return;
+  }
+  // The chosen hook output is known; provider consumption is not. Telemetry cannot delay or discard it.
+  void state.supervisor
+    .call(
+      "context-settle",
+      {
+        retrievalId: injected.context.retrievalId,
+        nonce: injected.nonce,
+        status,
+      },
+      RPC_TIMEOUT_MS,
+    )
+    .catch((error: unknown) => state.log.warn(`agent-create fragment settlement failed: ${String(error)}`));
+}
+
 function agentTask(
   state: PluginState,
   config: AgentCreateRequest["config"],
@@ -468,7 +534,10 @@ function withInjection(
   state: PluginState,
   delivery: InjectionDelivery,
 ): AgentCreateRequest {
-  if (delivery.expired || Date.now() >= delivery.deadline) return request;
+  if (delivery.expired || Date.now() >= delivery.deadline) {
+    settleInjection(state, injected, "discarded");
+    return request;
+  }
   const config = request.config;
   const next = { ...config };
   if (injected.mcpServer) {
@@ -482,6 +551,7 @@ function withInjection(
   const env = injected.nonce ? { ...request.env, [NONCE_ENV]: injected.nonce } : request.env;
   const output = { ...request, config: next, ...(env ? { env } : {}) };
   if (injected.nonce) state.links.add(injected.nonce, config.cwd, String(config.provider));
+  settleInjection(state, injected, injected.context?.contextText ? "attached" : "discarded");
   return output;
 }
 
@@ -536,6 +606,9 @@ function registerRpcs(server: PluginServerContext, state: PluginState): void {
     const live = supervisor.running
       ? await supervisor.call("status", {}, 1500).catch(() => supervisor.lastStatus())
       : null;
-    return { service: supervisor.snapshot(), paths: supervisor.paths(), live };
+    const base = { service: supervisor.snapshot(), paths: supervisor.paths() };
+    if (!live) return { ...base, live: null, resources: null };
+    const { resources, ...summary } = live;
+    return { ...base, live: summary, resources };
   });
 }

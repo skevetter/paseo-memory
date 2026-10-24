@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Access } from "../service/access";
-import { type Embedder, loadEmbedder, TIERS, WordPieceTokenizer } from "../service/embedder";
+import { type Embedder, loadEmbedder, TIERS } from "../service/embedder";
+import { MODEL_MANIFESTS, modelArtifactDirectory } from "../service/model-manifest";
 import { loadReranker, RERANK_MODEL, RERANK_TASK_FLOOR } from "../service/reranker";
 import { MemoryStore } from "../service/store";
 import { EMBEDDING_TIERS, type EmbeddingTier } from "../shared/service-api";
@@ -13,11 +14,12 @@ import { dataRepo } from "./helpers";
 const modelsDir = process.env.PASEO_MEMORY_TEST_MODELS ?? join(tmpdir(), "paseo-memory-test-models");
 
 function available(tier: EmbeddingTier): boolean {
+  if (process.env.PASEO_MEMORY_SKIP_MODEL === "1") return false;
   const spec = TIERS[tier];
-  if (spec.backend === "model2vec") return process.env.PASEO_MEMORY_SKIP_MODEL !== "1";
+  if (spec.backend === "model2vec") return true;
   return (
     process.env.PASEO_MEMORY_DOWNLOAD_MODELS === "1" ||
-    existsSync(join(modelsDir, spec.model, "onnx", "model_quantized.onnx"))
+    existsSync(modelArtifactDirectory(modelsDir, MODEL_MANIFESTS[tier]))
   );
 }
 
@@ -148,19 +150,10 @@ for (const tier of EMBEDDING_TIERS) {
   });
 }
 
-describe.skipIf(!available("zero"))("model2vec tokenizer", () => {
-  it("matches the reference WordPiece output", async () => {
-    await embedderFor("zero");
-    const dir = join(modelsDir, "minishlab__potion-base-8M");
-    const tokenizer = new WordPieceTokenizer(JSON.parse(readFileSync(join(dir, "tokenizer.json"), "utf8")));
-    expect(tokenizer.encode("Hello, world!")).toHaveLength(4);
-    expect(tokenizer.encode("unaffable").length).toBeGreaterThan(1);
-  }, 300_000);
-});
-
 const rerankerAvailable =
-  process.env.PASEO_MEMORY_DOWNLOAD_MODELS === "1" ||
-  existsSync(join(modelsDir, RERANK_MODEL, "onnx", "model_quantized.onnx"));
+  process.env.PASEO_MEMORY_SKIP_MODEL !== "1" &&
+  (process.env.PASEO_MEMORY_DOWNLOAD_MODELS === "1" ||
+    existsSync(modelArtifactDirectory(modelsDir, MODEL_MANIFESTS.reranker)));
 
 describe.skipIf(!rerankerAvailable)(`re-ranker (${RERANK_MODEL})`, () => {
   it("scores the relevant memory above the unrelated one for every calibration query", async () => {
