@@ -43,6 +43,7 @@ export interface ContextInput {
     result: RetrievalResult,
     scores: ReadonlyMap<string, number>,
     policy: ResolvedRetrievalPolicy,
+    sessionVersions: ReadonlyMap<string, string>,
   ): void;
 }
 
@@ -82,7 +83,8 @@ export async function retrieveContext(input: ContextInput): Promise<RetrievalRes
     collected.fallbackReason = "policy_changed";
   }
   const tokenizer = selectedTokenizer(input, request);
-  const entries = input.signal?.aborted ? [] : materialize(snapshot, policy, collected);
+  const sessionVersions = new Map<string, string>();
+  const entries = input.signal?.aborted ? [] : materialize(snapshot, policy, collected, sessionVersions);
   const result = new ContextBudget({
     ...policy,
     indexGeneration: input.store.retrievalGeneration,
@@ -94,7 +96,12 @@ export async function retrieveContext(input: ContextInput): Promise<RetrievalRes
   }).pack(entries);
   result.usage.latencyMs = performance.now() - started;
   if (!input.signal?.aborted)
-    input.complete?.(result, new Map(entries.map((entry) => [entry.key, entry.score])), policy);
+    input.complete?.(
+      result,
+      new Map(entries.map((entry) => [entry.key, entry.score])),
+      policy,
+      sessionVersions,
+    );
   return result;
 }
 
@@ -322,6 +329,7 @@ function materialize(
   input: ResolvedContextInput,
   policy: ResolvedRetrievalPolicy,
   collection: Collected,
+  sessionVersions: Map<string, string>,
 ): ContextEntry[] {
   const access = Access.agent(input.project?.key ?? null);
   const rows = new Map(
@@ -353,7 +361,7 @@ function materialize(
       if (own) entries.push(own);
     }
   }
-  entries.push(...materializeSessions(input, policy, collection.sessions));
+  entries.push(...materializeSessions(input, policy, collection.sessions, sessionVersions));
   return entries.slice(0, policy.limits.maxCandidates);
 }
 
@@ -375,6 +383,7 @@ function materializeSessions(
   input: ResolvedContextInput,
   policy: ResolvedRetrievalPolicy,
   candidates: SessionCandidateRef[],
+  sessionVersions: Map<string, string>,
 ): ContextEntry[] {
   if (!policy.recordKinds.includes("episode")) return [];
   const rows = input.store.visibleSessions(
@@ -391,6 +400,7 @@ function materializeSessions(
     const entry = sessionEntry(row, ref.detail);
     entry.score = ref.score;
     entries.push(entry);
+    sessionVersions.set(ref.id, ref.version);
   }
   return entries;
 }

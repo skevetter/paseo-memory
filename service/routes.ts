@@ -52,6 +52,7 @@ export function createRoutes(ctx: RouteContext): Routes {
       return { ok: true };
     },
     "agent-context": (input, signal) => agentContext(ctx, input, signal),
+    "context-admit": (input) => store.admitContext(input),
     "link-agent": (input) => {
       store.audit.link(input);
       return { ok: true };
@@ -255,7 +256,7 @@ async function agentContext(
         assemblyPrefix: input.assemblyPrefix,
         maxLatencyMs: input.taskBudgetMs,
         tokenizer: ctx.tokenizers?.get(provider),
-        complete: (result, scores, policy) => {
+        complete: (result, scores, policy, sessionVersions) => {
           store.markShown(result.memoryRefs.map((ref) => ref.id));
           store.audit.record(nonce, {
             kind: "inject",
@@ -264,11 +265,32 @@ async function agentContext(
             chars: result.usage.chars,
             budget: policy.limits.maxChars,
             retrieval: retrievalAudit(result),
+            admission: {
+              policyRevision: result.policyRevision,
+              indexGeneration: result.indexGeneration,
+              sessionVersions: [...sessionVersions]
+                .filter(([id]) => result.sessionIds.includes(id))
+                .map(([id, version]) => ({ id, version })),
+            },
             task: input.task && taskAudit(input.task, result, scores),
           });
         },
       })
     : null;
+  if (!input.includeContext && input.includeTools) {
+    store.audit.record(nonce, {
+      kind: "inject",
+      memories: [],
+      sessions: [],
+      chars: 0,
+      budget: 0,
+      admission: {
+        policyRevision: store.retrievalPolicies.revision,
+        indexGeneration: store.retrievalGeneration,
+        sessionVersions: [],
+      },
+    });
+  }
   const caller = { projectKey: project?.key ?? null, agentId: null, provider, nonce };
   const mcpServer = input.includeTools
     ? { url: ctx.mcpUrl(), headers: signCaller(ctx.secret, caller) }

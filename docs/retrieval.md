@@ -48,6 +48,14 @@ Before final disclosure, memory references retain searched revisions and request
 
 Deadline expiry returns bounded lexical fallback and marks `deadline_lexical_fallback`. Canceled requests do not disclose or record late selections. Uncancelable backend work may finish internally; Memory drops its result. Native SQL and packing are bounded by candidate/item ceilings but are not preemptible inference tasks; large-corpus latency still requires measurement.
 
+## Native create handoff
+
+Before adding Memory text or new Memory tools to a native agent-create request, the plugin calls the private `context-admit` endpoint with the issued nonce and retrieval ID. Admission requires the actual injection audit, current policy and retrieval generations, exact authorized memory revisions, visible evidence and unchanged selected session digests. Historical issuance without the admission snapshot is not accepted. Genuine tools-only issuance uses a null retrieval ID and does not fabricate a retrieval or prepared fragment.
+
+Admission shares the original create-hook deadline. Revoked, changed, unavailable or late admission leaves the complete original caller request unchanged, including its prompt, MCP servers and environment. The plugin registers its pending agent link only after admission and output selection.
+
+This is authorization at one synchronous service read snapshot, not an atomic host/provider handoff. Revocation or expiry after that snapshot can race the response, hook return or provider dispatch; the supported SDK supplies no atomic lease for these boundaries. Admission does not prove provider consumption and does not enable M07 session ownership or Bridge v1.
+
 ## Result and API cutover
 
 A retrieval bundle contains `retrievalId`, `contextText`, `memoryRefs`, `evidenceRefs`, `sessionIds`, `taskIds`, `usage`, `truncated`, `omittedCount`, `omittedPins`, `fallbackReason`, `policyRevision` and `indexGeneration`.
