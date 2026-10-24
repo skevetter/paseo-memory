@@ -373,3 +373,52 @@ async function blindWriteTarget(h: { post(path: string, input: unknown): Promise
   ).toBe(200);
   return ref;
 }
+
+it("lists owner bot memories in a project panel without widening its ordinary All filter", async () => {
+  const h = await boot();
+  const project = {
+    key: "qa-project",
+    name: "QA project",
+    rootPath: null,
+    paseoProjectId: "qa-paseo-project",
+  };
+  expect((await h.post("/v1/project-upsert", { project })).status).toBe(200);
+  const seeds = [
+    { title: "QA bot alpha", scope: "bot", botId: "alpha", project: null },
+    { title: "QA bot beta", scope: "bot", botId: "beta", project: null },
+    { title: "QA global", scope: "global", botId: null, project: null },
+    { title: "QA project", scope: "project", botId: null, project },
+  ];
+  for (const seed of seeds)
+    expect(
+      (
+        await h.post("/v1/save", {
+          ...seed,
+          content: `${seed.title} isolated statement.`,
+          type: "note",
+          paseoProjectId: seed.scope === "project" ? project.paseoProjectId : null,
+          pinned: false,
+        })
+      ).status,
+    ).toBe(200);
+  const result = z.object({
+    items: z.array(z.object({ title: z.string(), scope: z.string(), botId: z.string().nullable() })),
+  });
+  const request = { query: "", paseoProjectId: project.paseoProjectId, limit: 30 };
+  const bots = await h.post("/v1/search", { ...request, scope: "bot" });
+  expect(bots.status).toBe(200);
+  expect(
+    result
+      .parse(await bots.json())
+      .items.map((row) => row.botId)
+      .sort(),
+  ).toEqual(["alpha", "beta"]);
+  const all = await h.post("/v1/search", { ...request, scope: "all" });
+  expect(all.status).toBe(200);
+  expect(
+    result
+      .parse(await all.json())
+      .items.map((row) => row.title)
+      .sort(),
+  ).toEqual(["QA global", "QA project"]);
+});

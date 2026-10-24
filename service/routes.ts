@@ -77,7 +77,7 @@ export function createRoutes(ctx: RouteContext): Routes {
       const project = projectOf(input.paseoProjectId);
       const hits = await store.search({
         query: input.query,
-        access: Access.owner(project?.key),
+        access: input.scope === "bot" ? OWNER : Access.owner(project?.key),
         scope: input.scope,
         limit: input.limit,
       });
