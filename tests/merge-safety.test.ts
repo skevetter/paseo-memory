@@ -6,7 +6,7 @@ import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type SaveInput } from "../service/store";
 import { runUpkeep, upkeepPairs } from "../service/upkeep";
 import { DEFAULT_RUNTIME } from "../shared/service-api";
-import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, removeV7Schema, tempDir } from "./helpers";
+import { dataRepo, hashSpec, mergeRequest, otherRepo, owner, removePostV6Schema, tempDir } from "./helpers";
 
 let store: MemoryStore;
 let path: string;
@@ -91,7 +91,7 @@ describe("conservative automatic consolidation", () => {
   it("automatically merges only matching canonical text, namespace, authority and validity", async () => {
     const a = await save({ title: "Caf\u00e9" });
     const b = await save({ title: "Cafe\u0301" });
-    store.markUsed([b]);
+    store.markOpened([b]);
     expect(run().merged).toBe(1);
     expect(store.detailAuthorized(owner, a)).toMatchObject({
       memory: null,
@@ -179,7 +179,7 @@ describe("v6 review extension upgrade", () => {
     const before = store.getVisible(owner, [id])[0];
     store.close();
     const { db } = openDatabase(path);
-    removeV7Schema(db);
+    removePostV6Schema(db);
     db.run(
       "DROP TABLE review_ops; DROP TABLE review_windows; DROP TABLE memory_merges; PRAGMA user_version=6;",
     );
@@ -217,7 +217,7 @@ it("does not merge a permanent fact into an otherwise identical temporary except
     operation: "create",
     change: { ...claim, validUntil: "2100-01-01T00:00:00Z" },
   });
-  store.markUsed([temporary.memoryRef.id]);
+  store.markOpened([temporary.memoryRef.id]);
   await store.indexPending();
   expect(run().merged).toBe(0);
   store.mutations.mutate(principal, {

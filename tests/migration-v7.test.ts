@@ -70,6 +70,10 @@ function legacy(version: number, path = newPath()): { db: Database; path: string
       INSERT INTO memory_embeddings VALUES (41, 'old-model', 2, 'current-hash', '${currentTime}');`);
   }
   if (version >= 3) {
+    db.run(`CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY, nonce TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE INDEX ix_audit_nonce ON audit_events(nonce,id);
+      CREATE INDEX ix_audit_created ON audit_events(created_at);`);
     db.run(`ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE memories ADD COLUMN last_used_at TEXT;
       ALTER TABLE memories ADD COLUMN merged_into INTEGER;
@@ -87,6 +91,8 @@ function legacy(version: number, path = newPath()): { db: Database; path: string
       UPDATE memories SET shown_count = 12, opened_count = 5, kept_at = '${originalTime}', archived_at = '${currentTime}' WHERE id = 83;`);
   }
   if (version === 6) {
+    db.run(`CREATE TABLE vec_tables(model TEXT NOT NULL,dims INTEGER NOT NULL,table_name TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,PRIMARY KEY(model,dims));`);
     db.run(`ALTER TABLE memories ADD COLUMN record_revision INTEGER NOT NULL DEFAULT 1;
       ALTER TABLE memories ADD COLUMN index_generation INTEGER NOT NULL DEFAULT 1;
       ALTER TABLE memory_embeddings ADD COLUMN index_generation INTEGER NOT NULL DEFAULT 0;
@@ -127,7 +133,7 @@ describe("schema v7 migration", () => {
       const { db } = legacy(sourceVersion);
       const before = [row(db), row(db, 83)];
       migrate(db);
-      expect(version(db)).toBe(7);
+      expect(version(db)).toBe(SCHEMA_VERSION);
       for (const prior of before) expect(row(db, Number(prior.id))).toMatchObject(prior);
       expect(row(db)).toMatchObject({
         record_kind: "fact",
@@ -190,13 +196,17 @@ describe("schema v7 migration", () => {
       expect(db.query(`PRAGMA foreign_key_check`).all()).toEqual([]);
     });
   }
+});
 
-  it("keeps existing v6 vector generations and fingerprints without scheduling a rebuild", () => {
+describe("retained generations and historical selection", () => {
+  it("preserves existing v6 vector generations and legacy fingerprints", () => {
     const { db } = legacy(6);
     migrate(db);
-    expect(db.query(`SELECT index_generation, model_fingerprint FROM memory_embeddings`).get()).toEqual({
+    expect(
+      db.query(`SELECT index_generation, legacy_model_fingerprint FROM memory_embeddings`).get(),
+    ).toEqual({
       index_generation: 17,
-      model_fingerprint: "pinned-model",
+      legacy_model_fingerprint: "pinned-model",
     });
   });
 
@@ -235,7 +245,12 @@ describe("verified migration backups", () => {
     migrate(db);
     const backupPath = `${path}.pre-v${SCHEMA_VERSION}-from-v6.bak`;
     const metadata = JSON.parse(readFileSync(`${backupPath}.json`, "utf8"));
-    expect(metadata).toMatchObject({ fromSchema: 6, toSchema: 7, integrity: "ok", foreignKeys: "ok" });
+    expect(metadata).toMatchObject({
+      fromSchema: 6,
+      toSchema: SCHEMA_VERSION,
+      integrity: "ok",
+      foreignKeys: "ok",
+    });
     const backup = open(metadata.backupPath);
     expect(version(backup)).toBe(6);
     expect(row(backup)).toMatchObject({

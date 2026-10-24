@@ -1,13 +1,10 @@
 import { parseReviewReply } from "../shared/review";
+import type { ServiceParsedInput } from "../shared/service-api";
 import { Access } from "./access";
 import type { AuditDetail } from "./audit";
 import type { MemoryStore } from "./store";
 
-export interface ReviewEnd {
-  agentId: string;
-  reply: string | null;
-  failed: boolean;
-}
+export type ReviewEnd = ServiceParsedInput<"review-end">;
 
 export interface ReviewOutcome {
   ok: boolean;
@@ -17,11 +14,11 @@ export interface ReviewOutcome {
 }
 
 export function finishReview(store: MemoryStore, end: ReviewEnd): ReviewOutcome {
-  const closed = store.reviews.close(end.agentId);
-  const nonce = closed?.nonce ?? store.audit.nonceFor(end.agentId);
-  const base = { trigger: closed?.trigger ?? "unknown", durationMs: closed?.durationMs ?? null };
-  if (end.failed || !end.reply) {
-    const reason = end.failed ? "The review turn did not finish." : "The agent did not reply.";
+  if (store.sessionInvalidated(end.agentId)) return { ok: false, saved: [], updated: [], summary: null };
+  const { closed, nonce, base } = closeReview(store, end);
+  if (end.outcome !== "completed" || !end.reply) {
+    const reason =
+      end.outcome !== "completed" ? "The review turn did not finish." : "The agent did not reply.";
     store.audit.record(nonce, {
       kind: "review",
       ...base,
@@ -52,6 +49,15 @@ export function finishReview(store: MemoryStore, end: ReviewEnd): ReviewOutcome 
     summary: reply.summary,
   });
   return { ok: true, saved, updated, summary: reply.summary };
+}
+
+function closeReview(store: MemoryStore, end: ReviewEnd) {
+  const closed = store.closeReviewWindow(end);
+  return {
+    closed,
+    nonce: closed?.nonce ?? store.audit.nonceFor(end.agentId),
+    base: { trigger: closed?.trigger ?? "unknown", durationMs: closed?.durationMs ?? null },
+  };
 }
 
 // The audit trail of the review window is the record of what changed; the reply's own list can be wrong.

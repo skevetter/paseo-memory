@@ -358,7 +358,7 @@ function searchTool(ctx: ToolContext): ToolDefinition {
           },
         },
         complete: (result, scores) => {
-          ctx.store.markShown(result.memoryRefs.slice(0, 5).map((ref) => ref.id));
+          ctx.store.markShown(result.memoryRefs.map((ref) => ref.id));
           ctx.store.audit.record(request.auditNonce, {
             kind: "search",
             query: args.query,
@@ -451,9 +451,7 @@ function recordGet(
   input: { request: InvocationRequest; ids: number[]; result: RetrievalResult },
 ): void {
   const found = input.result.memoryRefs.map((ref) => ref.id);
-  ctx.store.markUsed(found);
-  const shown = ctx.store.audit.shownTo(input.request.auditNonce);
-  ctx.store.markOpened(found.filter((id) => shown.has(id)));
+  ctx.store.markOpened(found);
   ctx.store.audit.record(input.request.auditNonce, {
     kind: "get",
     ids: input.ids,

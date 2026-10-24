@@ -78,7 +78,7 @@ export function cardMeta(item: MemoryItem): string {
   const label = item.kind === "session" ? "session" : `#${item.id} · ${item.type}`;
   const parts = [label, where, formatDate(item.updatedAt)];
   if (item.pinned) parts.push("pinned");
-  if (item.useCount > 0) parts.push(`used ${plural(item.useCount, "time", "times")}`);
+  if (item.useCount > 0) parts.push(`legacy activity ${item.useCount}`);
   return parts.join(" · ");
 }
 

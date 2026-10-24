@@ -30,10 +30,11 @@ export type Admission =
   | { kind: "in_flight"; windowId: string };
 
 export interface ClosedReview {
+  windowId: string;
   nonce: string;
   trigger: string;
   startedAt: string;
-  durationMs: number;
+  durationMs: number | null;
 }
 
 export interface ReviewWindowInfo {
@@ -84,10 +85,12 @@ export class ReviewLedger {
     this.releaseStale();
   }
 
-  open(input: { agentId: string; nonce: string; trigger: string; cap: number }): void {
+  open(input: { agentId: string; nonce: string; trigger: string; cap: number }): string {
     const startedMs = this.now().getTime();
-    this.db.transaction(() => {
-      if (this.openWindow(input.nonce)) return;
+    return this.db.transaction(() => {
+      const existing = this.openWindow(input.nonce);
+      if (existing) return existing.window_id;
+      const windowId = randomUUID();
       this.db
         .query(`UPDATE review_windows SET closed_at = ? WHERE agent_id = ? AND closed_at IS NULL`)
         .run(new Date(startedMs).toISOString(), input.agentId);
@@ -99,7 +102,7 @@ export class ReviewLedger {
         )
         .run(
           input.nonce,
-          randomUUID(),
+          windowId,
           input.agentId,
           input.trigger,
           input.cap,
@@ -108,6 +111,7 @@ export class ReviewLedger {
           new Date(startedMs + WINDOW_MS).toISOString(),
         );
       this.db.query(`DELETE FROM review_ops WHERE nonce = ?`).run(input.nonce);
+      return windowId;
     })();
   }
 
@@ -199,14 +203,16 @@ export class ReviewLedger {
       .get(agentId);
     if (!window) return null;
     const now = this.now();
+    const durationMs = now.getTime() - Date.parse(window.started_at);
     this.db
       .query(`UPDATE review_windows SET closed_at = ? WHERE nonce = ?`)
       .run(now.toISOString(), window.nonce);
     return {
+      windowId: window.window_id,
       nonce: window.nonce,
       trigger: window.trigger,
       startedAt: window.started_at,
-      durationMs: now.getTime() - Date.parse(window.started_at),
+      durationMs: Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : null,
     };
   }
 

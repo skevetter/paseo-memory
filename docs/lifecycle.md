@@ -45,6 +45,10 @@ A correction or source invalidation marks explicit dependents needs-recheck and 
 
 Supplying new evidence replaces the current revision's support set. Promotion also replaces support, and claim-changing edits without new evidence do not inherit proof for an older claim. Prior evidence remains available on historical revisions. Restores use the selected historical revision's support unless replacement evidence is supplied.
 
+Exposure and explicit-read counters do not update factual age, verification or canonical revisions. Schema v8 retains `use_count` and `last_used_at` as legacy activity, adds retrieval time separately, and resets application/validated-assessment hints when the target receives a new authoritative revision. Validator feedback must name an actually delivered canonical reference and current authorized supporting evidence. Normal source correction/archive, explicit invalidation and forget retract affected current validation hints; historical assessments remain recorded unless erased.
+
+Pending transitive invalidation suppresses affected current hints immediately without deleting historical assessments or unrelated valid hints. Ranking re-evaluates current support at its final read boundary, including proof expiry during inference; activity and assessment changes still do not freshen the fact.
+
 The owner historical RPC `memory.historical` accepts `{id, asOf}`. It checks current access, the historical namespace, the historical state/validity and the source revisions valid at that instant. Partial legacy snapshots remain available as explicitly unknown history, not fabricated active historical facts.
 
 ## Archive, source invalidation and forget
@@ -63,10 +67,12 @@ Forgetting cannot retract already attached prompts, host chat history or provide
 
 Native admission is current at its service read snapshot. Later revocation or expiry can race the admission response, hook return or provider dispatch because the supported SDK has no atomic handoff lease. This boundary does not provide provider-consumption proof or M07 session ownership.
 
-## Schema v7 and rollback
+## Schema upgrades and rollback
 
 Migration preserves existing IDs, timestamps, namespace assignments, usage metadata and v6 index generations. Existing removed records become archived or superseded. Legacy preferences keep their preference kind but receive no fabricated verification. Old text versions are imported with `legacy_metadata_unknown`; the current complete row is also recorded without inventing an author or evidence.
 
-Before a write migration, Memory checks free space, writes a WAL-consistent `VACUUM INTO` backup, verifies its integrity, schema and foreign keys, and writes a private JSON report beside it. For a v6 database these are `memory.db.pre-v7-from-v6.bak` and its `.json` report; a unique suffix avoids overwriting an existing backup. Backup and report failures refuse migration. The migration itself is transactional. Reopening v7 does not rewrite history or create another migration backup.
+The v8 migration preserves existing v7 canonical snapshots byte-for-byte and retains old vector rows, generations and opaque fingerprints. Their model identity remains unknown rather than inventing a verified descriptor. New model/runtime fingerprints build separate indexes; legacy and retired indexes are not writable targets. Previously stored feedback gains no inferred validation authority or verifier.
+
+Before a write migration, Memory checks free space, writes a WAL-consistent `VACUUM INTO` backup, verifies its integrity, schema and foreign keys, and writes a private JSON report beside it. For a v7 database these are `memory.db.pre-v8-from-v7.bak` and its `.json` report; a unique suffix avoids overwriting an existing backup. Older pre-v7 backups remain separate recovery points. Backup and report failures refuse migration. The migration itself is transactional. Reopening the current v8 schema does not rewrite history or create another migration backup.
 
 Keep the verified backup independently. An older binary refuses a newer schema. Disabling a feature does not reverse migration: rollback requires a compatible binary or restoring a verified database backup while its service is stopped. Do not replace only the main SQLite file while WAL transactions are live.

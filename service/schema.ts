@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { getLoadablePath } from "sqlite-vec";
 import { FatalError } from "./sqlite";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export class SchemaTooNewError extends FatalError {
   constructor(found: number, supported: number) {
@@ -22,27 +22,10 @@ export function migrate(db: Database): void {
   if (current === SCHEMA_VERSION) return;
   backupBeforeMigration(db, current);
   db.transaction(() => {
-    if (current < 6) {
-      if (current === 1) dropV1Vectors(db);
-      db.run(SCHEMA_SQL);
-      addColumns(db, "memories", V3_MEMORY_COLUMNS);
-      db.run(V3_SQL);
-      addColumns(db, "memories", V4_MEMORY_COLUMNS);
-      addColumns(db, "sessions", V4_SESSION_COLUMNS);
-      addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
-      db.run(V4_SQL);
-      db.run(V5_SQL);
-      addColumns(db, "memories", V6_MEMORY_COLUMNS);
-      addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
-      db.run(V6_SQL);
-    }
-    db.run(REVIEW_SQL);
-    addColumns(db, "memories", V7_MEMORY_COLUMNS);
-    db.run(`UPDATE memories SET state=CASE WHEN merged_into IS NOT NULL THEN 'superseded'
-      WHEN deleted_at IS NOT NULL OR archived_at IS NOT NULL THEN 'archived' ELSE 'active' END,
-      record_kind=CASE WHEN type='preference' THEN 'preference' ELSE 'fact' END`);
-    db.run(V7_SQL);
-    initializeRevisions(db);
+    if (current < 6) migratePreV6(db, current);
+    if (current < 7) migrateLifecycle(db);
+    migrateResources(db, current);
+    if (current < 7) importLegacyRevisions(db);
     if (db.query(`PRAGMA foreign_key_check`).all().length !== 0) {
       throw new FatalError(
         "Memory migration failed foreign-key verification; the migration was rolled back.",
@@ -50,6 +33,48 @@ export function migrate(db: Database): void {
     }
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   })();
+}
+
+function migratePreV6(db: Database, from: number): void {
+  if (from === 1) dropV1Vectors(db);
+  db.run(SCHEMA_SQL);
+  addColumns(db, "memories", V3_MEMORY_COLUMNS);
+  db.run(V3_SQL);
+  addColumns(db, "memories", V4_MEMORY_COLUMNS);
+  addColumns(db, "sessions", V4_SESSION_COLUMNS);
+  addColumns(db, "agent_links", [["tools", "INTEGER NOT NULL DEFAULT 1"]]);
+  db.run(V4_SQL);
+  db.run(V5_SQL);
+  addColumns(db, "memories", V6_MEMORY_COLUMNS);
+  addColumns(db, "memory_embeddings", V6_EMBEDDING_COLUMNS);
+  db.run(V6_SQL);
+}
+
+function migrateLifecycle(db: Database): void {
+  db.run(REVIEW_SQL);
+  addColumns(db, "memories", V7_MEMORY_COLUMNS);
+  db.run(`UPDATE memories SET state=CASE WHEN merged_into IS NOT NULL THEN 'superseded'
+    WHEN deleted_at IS NOT NULL OR archived_at IS NOT NULL THEN 'archived' ELSE 'active' END,
+    record_kind=CASE WHEN type='preference' THEN 'preference' ELSE 'fact' END`);
+  db.run(V7_SQL);
+}
+
+function migrateResources(db: Database, from: number): void {
+  if (from >= 7) db.run("DROP TRIGGER memory_revision_ai; DROP TRIGGER memory_revision_au;");
+  addColumns(db, "memories", [
+    ["last_retrieved_at", "TEXT"],
+    ["application_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["validated_helpful_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["validated_harmful_count", "INTEGER NOT NULL DEFAULT 0"],
+  ]);
+  addColumns(db, "memory_feedback", [
+    ["validated", "INTEGER NOT NULL DEFAULT 0"],
+    ["verifier_id", "TEXT"],
+    ["verifier_version", "TEXT"],
+    ["support_valid_until", "TEXT"],
+  ]);
+  db.run(V8_SQL);
+  createRevisionTriggers(db);
 }
 
 // VACUUM INTO writes a consistent snapshot including pages still in the WAL, which a plain file copy would miss.
@@ -115,27 +140,84 @@ const V7_MEMORY_COLUMNS: [string, string][] = [
   ["verified_at", "TEXT"],
 ];
 
-function initializeRevisions(db: Database): void {
-  const columns = db.query<{ name: string }, []>(`PRAGMA table_info(memories)`).all();
-  const snapshot = (prefix: string) =>
-    `json_object(${columns.map(({ name }) => `'${name.replaceAll("'", "''")}', ${prefix}."${name.replaceAll('"', '""')}"`).join(", ")})`;
+function snapshotSql(db: Database, prefix: string): string {
+  const columns = db.query<{ name: string }, []>("PRAGMA table_info(memories)").all();
+  return `json_object(${columns.map(({ name }) => `'${name.replaceAll("'", "''")}', ${prefix}."${name.replaceAll('"', '""')}"`).join(", ")})`;
+}
+
+function importLegacyRevisions(db: Database): void {
   db.run(`
     INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, legacy_metadata_unknown)
-      SELECT id, record_revision, ${snapshot("memories")}, updated_at, 1 FROM memories;
+      SELECT id, record_revision, ${snapshotSql(db, "memories")}, updated_at, 1 FROM memories;
     INSERT OR IGNORE INTO memory_revisions (memory_id, revision, snapshot, changed_at, legacy_metadata_unknown)
       SELECT memory_id, version, json_object('title', title, 'content', content), created_at, 1 FROM memory_versions;
+  `);
+}
+
+function createRevisionTriggers(db: Database): void {
+  const snapshot = snapshotSql(db, "new");
+  const updateSnapshot = snapshotSql(db, "m");
+  db.run(`
     CREATE TRIGGER memory_revision_ai AFTER INSERT ON memories BEGIN
       INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, actor_id, reason, legacy_metadata_unknown)
-        VALUES (new.id, new.record_revision, ${snapshot("new")}, new.updated_at,
+        VALUES (new.id, new.record_revision, ${snapshot}, new.updated_at,
           (SELECT value FROM meta WHERE key = 'mutation_actor'), (SELECT value FROM meta WHERE key = 'mutation_reason'), 0);
     END;
     CREATE TRIGGER memory_revision_au AFTER UPDATE ON memories WHEN new.record_revision != old.record_revision BEGIN
+      UPDATE memories SET application_count=0,validated_helpful_count=0,validated_harmful_count=0
+        WHERE id=new.id AND (application_count!=0 OR validated_helpful_count!=0 OR validated_harmful_count!=0);
       INSERT INTO memory_revisions (memory_id, revision, snapshot, changed_at, actor_id, reason, legacy_metadata_unknown)
-        VALUES (new.id, new.record_revision, ${snapshot("new")}, new.updated_at,
-          (SELECT value FROM meta WHERE key = 'mutation_actor'), (SELECT value FROM meta WHERE key = 'mutation_reason'), 0);
+        SELECT new.id,new.record_revision,${updateSnapshot},new.updated_at,
+          (SELECT value FROM meta WHERE key='mutation_actor'),(SELECT value FROM meta WHERE key='mutation_reason'),0
+        FROM memories m WHERE m.id=new.id;
     END;
   `);
 }
+
+const V8_SQL = `
+  CREATE TABLE embedding_indexes (
+    fingerprint TEXT PRIMARY KEY, generation INTEGER NOT NULL UNIQUE, model TEXT NOT NULL, dims INTEGER NOT NULL,
+    table_name TEXT UNIQUE, identity_json TEXT,
+    state TEXT NOT NULL CHECK (state IN ('building','ready','retired','legacy')),
+    created_at TEXT, ready_at TEXT, retired_at TEXT);
+  INSERT INTO embedding_indexes (fingerprint,generation,model,dims,table_name,state,created_at)
+    SELECT 'legacy:' || model || ':' || dims,row_number() OVER (ORDER BY model,dims),model,dims,table_name,'legacy',created_at
+    FROM (
+      SELECT model,dims,table_name,created_at FROM vec_tables
+      UNION ALL SELECT e.model,e.dims,NULL,NULL FROM memory_embeddings e
+        WHERE NOT EXISTS (SELECT 1 FROM vec_tables v WHERE v.model=e.model AND v.dims=e.dims)
+        GROUP BY e.model,e.dims);
+  INSERT INTO meta(key,value)
+    SELECT 'embedding_index_generation',CAST(coalesce(max(generation),0) AS TEXT) FROM embedding_indexes;
+  ALTER TABLE memory_embeddings RENAME TO memory_embeddings_v7;
+  CREATE TABLE memory_embeddings (
+    memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    index_fingerprint TEXT NOT NULL REFERENCES embedding_indexes(fingerprint) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,index_generation INTEGER NOT NULL,embedded_at TEXT NOT NULL,
+    legacy_model_fingerprint TEXT,PRIMARY KEY (memory_id,index_fingerprint));
+  INSERT INTO memory_embeddings
+    SELECT memory_id,'legacy:' || model || ':' || dims,content_hash,index_generation,embedded_at,model_fingerprint
+    FROM memory_embeddings_v7;
+  DROP TABLE memory_embeddings_v7;
+  DROP TABLE vec_tables;
+  CREATE INDEX ix_memory_embeddings_index ON memory_embeddings(index_fingerprint,memory_id);
+  CREATE INDEX ix_memory_feedback_ref ON memory_feedback(memory_id,revision,signal,validated);
+  CREATE INDEX ix_memory_feedback_expiry ON memory_feedback(support_valid_until)
+    WHERE validated=1 AND support_valid_until IS NOT NULL;
+  CREATE INDEX ix_audit_retrieval ON audit_events (
+    json_extract(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END,'$.retrieval.retrievalId'));
+  CREATE TABLE model_usage (
+    producer_id TEXT NOT NULL,event_id TEXT NOT NULL,attempt_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL CHECK (typeof(source_sequence)='integer' AND source_sequence BETWEEN 0 AND 9007199254740991),
+    stage TEXT NOT NULL,status TEXT NOT NULL,provenance TEXT NOT NULL,model TEXT,
+    input_tokens INTEGER,output_tokens INTEGER,cost_amount REAL,currency TEXT,
+    source_event_id TEXT,retrieval_id TEXT,job_id TEXT,estimator TEXT,duration_ms REAL,created_at TEXT NOT NULL,
+    PRIMARY KEY (producer_id,event_id),UNIQUE (producer_id,attempt_id,stage,source_sequence));
+  CREATE INDEX ix_model_usage_attempt ON model_usage(stage,attempt_id,created_at);
+  CREATE UNIQUE INDEX ix_model_usage_provider_source ON model_usage(producer_id,source_event_id)
+    WHERE provenance='provider_observed' AND source_event_id IS NOT NULL;
+  INSERT INTO meta(key,value) VALUES ('resource_observation_epoch',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+`;
 
 const V7_SQL = `
   CREATE TABLE memory_revisions (

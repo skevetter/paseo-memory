@@ -157,7 +157,11 @@ export class AuditLog {
   private readonly db: Database;
   private readonly now: () => string;
 
-  constructor(db: Database, now: () => string) {
+  constructor(
+    db: Database,
+    now: () => string,
+    private readonly onRetrieval: (result: RetrievalAudit) => void,
+  ) {
     this.db = db;
     this.now = now;
   }
@@ -238,22 +242,6 @@ export class AuditLog {
     );
   }
 
-  // Memories this agent was given or found in a search's top five; memory_get on these counts as an open.
-  shownTo(nonce: string): Set<number> {
-    const rows = this.db
-      .query<{ kind: AuditKind; detail: string }, [string]>(
-        `SELECT kind, detail FROM audit_events WHERE nonce = ? AND kind IN ('inject', 'context', 'search')`,
-      )
-      .all(nonce);
-    const shown = new Set<number>();
-    for (const row of rows) {
-      const detail = { kind: row.kind, ...JSON.parse(row.detail) } as AuditDetail;
-      const ids = detail.kind === "search" ? memoryIds(detail).slice(0, 5) : memoryIds(detail);
-      for (const id of ids) shown.add(id);
-    }
-    return shown;
-  }
-
   eventsSince(nonce: string, since: string): AuditDetail[] {
     return this.db
       .query<{ kind: AuditKind; detail: string }, [string, string]>(
@@ -272,9 +260,12 @@ export class AuditLog {
     if (!nonce) return;
     const { kind, ...rest } = detail;
     const stored = "query" in rest ? { ...rest, query: clip(redact(rest.query), 200) } : rest;
-    this.db
-      .query(`INSERT INTO audit_events (nonce, kind, detail, created_at) VALUES (?, ?, ?, ?)`)
-      .run(nonce, kind, JSON.stringify(stored), this.now());
+    this.db.transaction(() => {
+      this.db
+        .query(`INSERT INTO audit_events (nonce, kind, detail, created_at) VALUES (?, ?, ?, ?)`)
+        .run(nonce, kind, JSON.stringify(stored), this.now());
+      if ("retrieval" in detail && detail.retrieval) this.onRetrieval(detail.retrieval);
+    })();
   }
 
   prune(cutoff: string): number {

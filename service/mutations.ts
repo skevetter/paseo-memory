@@ -9,13 +9,14 @@ import {
   RecordStateSchema,
 } from "../shared/lifecycle";
 import type { Access, Namespace, Operation } from "./access";
-import { currentLifecycleSql, type Lifecycle } from "./lifecycle";
+import { retractFeedbackEvidence } from "./feedback";
+import type { Lifecycle } from "./lifecycle";
 import type { Provenance } from "./provenance";
 import { redact } from "./redact";
 import type { Reservation, ReviewLedger } from "./review-ledger";
 import type { MemoryRow } from "./store";
 import { sha256 } from "./text";
-import { dropVectors } from "./vectors";
+import { dropVectors, purgeVectors } from "./vectors";
 
 export interface MutationPrincipal {
   id: string;
@@ -29,6 +30,7 @@ interface MutationOptions {
   lifecycle: Lifecycle;
   reviews: ReviewLedger;
   now: () => string;
+  cancelReviews: (agentIds: string[]) => void;
   changed: (operation: MutationRequest["operation"]) => void;
 }
 interface CompatibilityRequest {
@@ -75,6 +77,24 @@ export class MutationError extends Error {
   ) {
     super(message);
   }
+}
+
+export function assertCurrentPrincipal(lifecycle: Lifecycle, principal: MutationPrincipal) {
+  const context = {
+    principalId: principal.id,
+    agentId: principal.agentId,
+    nonce: principal.id.startsWith("nonce:")
+      ? principal.id.slice(6)
+      : /^(agent|credential):/.test(principal.id)
+        ? principal.id
+        : null,
+  };
+  if (lifecycle.contextInvalidated(context))
+    throw new MutationError(
+      "context_invalidated",
+      "A source in this caller context was forgotten. Start a fresh authorized context.",
+    );
+  return context;
 }
 
 /** Object-key order is irrelevant to request identity. */
@@ -201,22 +221,7 @@ export class MemoryMutations {
   }
 
   private prior(principal: MutationPrincipal, requestId: string): PriorMutation | null {
-    if (
-      this.options.lifecycle.contextInvalidated({
-        principalId: principal.id,
-        agentId: principal.agentId,
-        nonce: principal.id.startsWith("nonce:")
-          ? principal.id.slice(6)
-          : /^(agent|credential):/.test(principal.id)
-            ? principal.id
-            : null,
-      })
-    ) {
-      throw new MutationError(
-        "context_invalidated",
-        "A source in this caller context was forgotten. Start a fresh authorized context.",
-      );
-    }
+    assertCurrentPrincipal(this.options.lifecycle, principal);
     return this.db
       .query<PriorMutation, [string, string]>(
         "SELECT request_body_hash,memory_id,operation,expected_revision,result FROM memory_mutations WHERE principal_id=? AND request_id=?",
@@ -363,23 +368,10 @@ export class MemoryMutations {
     const outcome =
       records.length === 0
         ? "none"
-        : records.every((e) => this.evidenceCurrent(e))
+        : records.every((e) => this.options.provenance.isCurrent(e))
           ? "resolved"
           : "unresolved";
     return { records, ids: [...new Set(records.map((e) => e.evidenceId))], outcome };
-  }
-
-  private evidenceCurrent(evidence: Evidence): boolean {
-    if (evidence.status !== "resolved") return false;
-    if (evidence.sourceKind !== "memory") return true;
-    const match = /^memory:(\d+)@(\d+)$/.exec(evidence.sourceRef);
-    if (!match) return false;
-    const source = this.db
-      .query<{ record_revision: number }, [number, string]>(
-        `SELECT m.record_revision FROM memories m WHERE m.id=? AND m.deleted_at IS NULL AND ${currentLifecycleSql("m", "?")}`,
-      )
-      .get(Number(match[1]), this.options.now());
-    return source?.record_revision === Number(match[2]);
   }
 
   private linkEvidence(
@@ -778,7 +770,7 @@ export class MemoryMutations {
     const resolved =
       validation !== "unresolved" &&
       evidence.length === ids.length &&
-      evidence.every((entry) => this.evidenceCurrent(entry));
+      evidence.every((entry) => this.options.provenance.isCurrent(entry));
     const state = previousState === "active" && !resolved ? "needs_recheck" : previousState;
     this.db
       .query(`UPDATE memories SET state=?,deleted_at=NULL,archived_at=NULL,merged_into=NULL,
@@ -842,7 +834,10 @@ export class MemoryMutations {
     this.eraseEvidence(preview.evidenceIds, new Set(ids));
     for (const source of preview.sources)
       this.db.query("DELETE FROM source_artifacts WHERE source_ref=?").run(source);
-    for (const ref of preview.records) this.invalidate({ id: ref.id, record_revision: ref.revision });
+    for (const ref of preview.records) {
+      this.options.lifecycle.invalidate(ref);
+      purgeVectors(this.db, ref.id);
+    }
     this.db
       .prepare(
         `DELETE FROM memory_merges WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})`,
@@ -870,6 +865,7 @@ export class MemoryMutations {
   }
 
   private eraseSessionCopies(principal: MutationPrincipal, agentIds: string[]): void {
+    this.options.cancelReviews(agentIds);
     for (const agentId of agentIds) {
       this.db
         .query("INSERT OR IGNORE INTO memory_tombstones VALUES ('session',?,?,?)")
@@ -903,6 +899,7 @@ export class MemoryMutations {
   }
 
   private eraseEvidence(evidenceIds: string[], forgottenIds: Set<number>): void {
+    retractFeedbackEvidence(this.db, evidenceIds, "forget");
     for (const evidenceId of evidenceIds) {
       const linked = this.db
         .query<{ memory_id: number; revision: number }, [string]>(

@@ -271,7 +271,7 @@ function memoryFacts(memory: Memory): string[] {
     memory.topicKey ? `Topic: ${memory.topicKey}` : null,
     `Created ${formatDateTime(memory.createdAt)} · Updated ${formatDateTime(memory.updatedAt)}`,
     origin ? `Saved by ${origin}` : null,
-    `Used ${plural(memory.useCount, "time", "times")}${lastUsed}`,
+    `Legacy activity ${memory.useCount}${lastUsed} (not validated application)`,
     `Shown ${plural(memory.shownCount, "time", "times")} · opened ${plural(memory.openedCount, "time", "times")}`,
     plural(memory.revisionCount, "revision", "revisions"),
   ].filter((line): line is string => line !== null);

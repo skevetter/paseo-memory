@@ -3,6 +3,7 @@ import { type RetrievalRequest, RetrievalRequestSchema, type RetrievalResult } f
 import type { ProjectUnresolved, RuntimeConfig, SearchScope } from "../shared/service-api";
 import { Access } from "./access";
 import { ContextBudget, type ContextEntry, type ContextTokenizer, clipUnicode } from "./context-budget";
+import { MutationError } from "./mutations";
 import type { ResolvedRetrievalPolicy } from "./retrieval-policy";
 import { sessionVersion } from "./sessions";
 import {
@@ -71,6 +72,25 @@ interface Collected {
 /** Final authorization/materialization and disclosure recording occur after the asynchronous stages. */
 export async function retrieveContext(input: ContextInput): Promise<RetrievalResult> {
   const started = performance.now();
+  try {
+    const result = await prepareContext(input, started);
+    input.store.retrievalMetrics.record(
+      input.signal?.aborted ? "cancelled" : "completed",
+      performance.now() - started,
+    );
+    return result;
+  } catch (error) {
+    const outcome = input.signal?.aborted
+      ? "cancelled"
+      : error instanceof MutationError && error.code === "scope_denied"
+        ? "rejected"
+        : "failed";
+    input.store.retrievalMetrics.record(outcome, performance.now() - started);
+    throw error;
+  }
+}
+
+async function prepareContext(input: ContextInput, started: number): Promise<RetrievalResult> {
   const request = RetrievalRequestSchema.parse(input.request ?? {});
   let policy = input.store.retrievalPolicies.resolve(request);
   const snapshot = { ...input, request, settings: input.store.config };
@@ -511,9 +531,13 @@ function evidenceCitation(evidence: Evidence, full: boolean) {
     : reference;
 }
 function relevance(row: MemoryRow, usage: boolean): number {
-  const touched = Math.max(Date.parse(row.updated_at), row.last_used_at ? Date.parse(row.last_used_at) : 0);
+  const touched = Math.max(Date.parse(row.updated_at), row.verified_at ? Date.parse(row.verified_at) : 0);
   const recency = 1 / (1 + Math.max(0, Date.now() - touched) / (14 * 86400000));
-  const rank = recency + 0.5 * Math.log2(1 + row.use_count);
+  const assessedActivity = Math.max(
+    0,
+    row.application_count + row.validated_helpful_count - row.validated_harmful_count,
+  );
+  const rank = recency + (usage ? 0.5 * Math.min(1, Math.log2(1 + assessedActivity) / 5) : 0);
   return usage ? rank * usageFactor({ shown: row.shown_count, opened: row.opened_count }) : rank;
 }
 

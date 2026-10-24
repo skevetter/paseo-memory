@@ -46,13 +46,16 @@ export function createRoutes(ctx: RouteContext): Routes {
     paseoProjectId ? store.projectByPaseoId(paseoProjectId) : null;
   return {
     status: () => ctx.status(),
+    "usage-record": (input) => store.usage.record("paseo_host", input),
+    "context-admit": (input) => store.admitContext(input),
+    "context-settle": (input) => store.usage.settleContext(input),
+    feedback: (input) => store.feedback.record(ownerMutation(OWNER), input),
     ...lifecycleRoutes(store),
     configure: (input) => {
       store.configure(input);
       return { ok: true };
     },
     "agent-context": (input, signal) => agentContext(ctx, input, signal),
-    "context-admit": (input) => store.admitContext(input),
     "link-agent": (input) => {
       store.audit.link(input);
       return { ok: true };
@@ -178,7 +181,7 @@ function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-
         };
       const nonce = store.audit.toolNonceFor(input.agentId);
       if (!nonce) return { ok: false, reason: "This agent has no memory tools.", cap };
-      store.reviews.open({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
+      store.openReviewWindow({ agentId: input.agentId, nonce, trigger: input.trigger, cap });
       return { ok: true, reason: null, cap };
     },
     "review-end": (input) => finishReview(store, input),
