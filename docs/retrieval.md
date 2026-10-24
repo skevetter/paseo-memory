@@ -82,3 +82,8 @@ The native agent-create hook settles a prepared fragment as attached to its know
 
 Native turn-end accounting records observed terminal events with unavailable usage rather than inventing token or monetary values from model text or ambiguously scoped `lastUsage`. Coverage is incomplete: missing turn IDs are omitted, and IDs repeated after a provider reopen can coalesce. The locked SDK does not supply an event-correlated provider-session epoch or defensible per-turn billing source. These counts are not a complete model-attempt or billing ledger; the optional Bridge/session ownership gates remain separate.
 
+## Validation dependency
+
+The service requires Zod 4.6.6 or later to address [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), excessive resource use when validating malformed collections. This is a runtime dependency, not only a build tool. Loopback binding, browser-Origin rejection and credentials restrict access; they do not make hostile authenticated input safe. MCP also rejects bodies over its existing length limit before tool-argument validation.
+
+The patch does not change schema8, retrieval policy, model/runtime pins or namespace authority. Paseo-supplied client/runtime modules are separate host dependencies; updating this plugin does not upgrade the host's own Zod instance.
