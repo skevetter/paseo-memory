@@ -41,10 +41,10 @@ Document embeddings, query embeddings and reranking share a bounded queue: two a
 Install a release tag from GitHub:
 
 ```bash
-paseo plugin install git:skevetter/paseo-memory --ref v1.4.1
+paseo plugin install git:skevetter/paseo-memory --ref v1.5.0
 ```
 
-Replace `v1.4.1` with a tag from [Releases](https://github.com/skevetter/paseo-memory/releases). On first start the plugin installs its dependencies with Bun.
+Replace `v1.5.0` with a tag from [Releases](https://github.com/skevetter/paseo-memory/releases). On first start the plugin installs its dependencies with Bun.
 
 ## Develop
 
