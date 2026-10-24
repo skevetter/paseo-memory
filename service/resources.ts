@@ -12,7 +12,10 @@ interface SnapshotInput {
   inference: InferenceQueueSnapshot;
   retrieval: InferenceStageSnapshot;
   usage: ResourceUsage;
-  currentFeedbackHints?: Pick<ResourceStatus["feedback"], "applications" | "validatedHelpful" | "validatedHarmful">;
+  currentFeedbackHints?: Pick<
+    ResourceStatus["feedback"],
+    "applications" | "validatedHelpful" | "validatedHarmful"
+  >;
 }
 const DescriptorSchema = z.object({
   identity: z.object({
@@ -140,7 +143,10 @@ function indexPageSizes(db: Database, indexes: ModelIndexRow[]): Map<string, num
   }
   return sizes;
 }
-function feedbackStatus(db: Database, currentHints: SnapshotInput["currentFeedbackHints"]): ResourceStatus["feedback"] {
+function feedbackStatus(
+  db: Database,
+  currentHints: SnapshotInput["currentFeedbackHints"],
+): ResourceStatus["feedback"] {
   const activity = db
     .query<
       {

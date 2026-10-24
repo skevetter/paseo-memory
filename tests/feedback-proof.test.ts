@@ -1,15 +1,15 @@
-import { afterEach, beforeEach, expect, it, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, expect, it, setSystemTime, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { type RunningService, serviceKey, startService } from "../service/app";
-import { ownerMutation } from "../service/mutations";
 import { signCaller } from "../service/mcp";
+import { ownerMutation } from "../service/mutations";
 import { openDatabase } from "../service/sqlite";
 import { type MemoryRef, MutationResultSchema } from "../shared/lifecycle";
 import { silentLogger } from "../shared/log";
 import type { FeedbackInput } from "../shared/resources";
-import { hashEmbedder, owner, tempDir } from "./helpers";
+import { fixtureModelIdentity, hashEmbedder, owner, tempDir } from "./helpers";
 
 let service: RunningService;
 let dataDir: string;
@@ -251,38 +251,196 @@ it("withholds deep-source validation hints before queued propagation while retai
   const second = await create("chain-two", first.memoryRef);
   const proof = await create("chain-collector", second.memoryRef);
   const target = await create("eligible ranking alpha");
-  const unrelatedSource = await create("unrelated-proof-root");
+  const unrelatedRoot = await create("unrelated-proof-root");
+  const unrelatedSource = await mutation({
+    requestId: "unrelated-derived-proof",
+    operation: "create",
+    change: {
+      scope: "global",
+      recordKind: "derived_summary",
+      title: "Unrelated derived proof",
+      content: "A separate supported observation.",
+    },
+    evidence: [
+      {
+        sourceKind: "memory",
+        sourceRef: `memory:${unrelatedRoot.memoryRef.id}@${unrelatedRoot.memoryRef.revision}`,
+      },
+    ],
+  });
   const unrelatedProof = await create("unrelated-collector", unrelatedSource.memoryRef);
   const unrelated = await create("eligible ranking beta");
   const targetRetrieval = await delivered(target.memoryRef);
   const unrelatedRetrieval = await delivered(unrelated.memoryRef);
-  const before = await service.store.search({ query: "eligible ranking", mode: "lexical", rerankMode: "off", access: owner });
+  const before = await service.store.search({
+    query: "eligible ranking",
+    mode: "lexical",
+    rerankMode: "off",
+    access: owner,
+  });
   const originalTarget = before.find((hit) => hit.id === String(target.memoryRef.id));
   const originalUnrelated = before.find((hit) => hit.id === String(unrelated.memoryRef.id));
   if (!originalTarget || !originalUnrelated) throw new Error("The independent ranking targets are missing.");
   for (const [record, evidence, retrievalId] of [
-    [target, proof, targetRetrieval], [unrelated, unrelatedProof, unrelatedRetrieval],
+    [target, proof, targetRetrieval],
+    [unrelated, unrelatedProof, unrelatedRetrieval],
   ] as const) {
     const input: FeedbackInput = {
-      eventId: `validated-${record.memoryRef.id}`, retrievalId,
-      memoryRef: record.memoryRef, basis: "validator", signal: "helpful",
-      evidenceRefs: evidence.evidenceRefs, verifierId: "fixture/chain-validator", verifierVersion: "1",
+      eventId: `validated-${record.memoryRef.id}`,
+      retrievalId,
+      memoryRef: record.memoryRef,
+      basis: "validator",
+      signal: "helpful",
+      evidenceRefs: evidence.evidenceRefs,
+      verifierId: "fixture/chain-validator",
+      verifierVersion: "1",
     };
     expect((await post("feedback", input)).status).toBe(200);
   }
   service.store.mutations.mutate(ownerMutation(owner), {
-    requestId: "correct-chain-root", operation: "update",
-    id: source.memoryRef.id, expectedRevision: source.memoryRef.revision,
+    requestId: "correct-chain-root",
+    operation: "update",
+    id: source.memoryRef.id,
+    expectedRevision: source.memoryRef.revision,
     change: { content: "The source correction invalidates the old proof chain" },
   });
   // No await: inspect the bounded-propagation window before its scheduled continuation.
   const current = service.store.getVisible(owner, [target.memoryRef.id, unrelated.memoryRef.id]);
   expect(Object.fromEntries(current.map((entry) => [entry.id, entry.validated_helpful_count]))).toEqual({
-    [target.memoryRef.id]: 0, [unrelated.memoryRef.id]: 1,
+    [target.memoryRef.id]: 0,
+    [unrelated.memoryRef.id]: 1,
   });
   expect(service.store.resourceStatus().feedback.validatedHelpful).toBe(1);
-  const ranked = await service.store.search({ query: "eligible ranking", mode: "lexical", rerankMode: "off", access: owner });
-  expect(ranked.map((hit) => Number(hit.id)).toSorted()).toEqual([target.memoryRef.id, unrelated.memoryRef.id].toSorted());
+  const ranked = await service.store.search({
+    query: "eligible ranking",
+    mode: "lexical",
+    rerankMode: "off",
+    access: owner,
+  });
+  expect(ranked.map((hit) => Number(hit.id)).toSorted()).toEqual(
+    [target.memoryRef.id, unrelated.memoryRef.id].toSorted(),
+  );
   expect(ranked.find((hit) => hit.id === String(target.memoryRef.id))?.score).toBe(originalTarget.score);
-  expect(ranked.find((hit) => hit.id === String(unrelated.memoryRef.id))?.score).toBeGreaterThan(originalUnrelated.score);
+  expect(ranked.find((hit) => hit.id === String(unrelated.memoryRef.id))?.score).toBeGreaterThan(
+    originalUnrelated.score,
+  );
+});
+
+async function validatedRankingTarget(label: string, source: MemoryRef) {
+  const target = await mutation({
+    requestId: `ranking-target-${label}`,
+    operation: "create",
+    change: {
+      scope: "global",
+      type: "decision",
+      title: `ranking stance ${label}`,
+      content: `Independent ranking stance for ${label}.`,
+    },
+  });
+  const proof = await create(`ranking-proof-${label}`, source);
+  const retrievalId = await delivered(target.memoryRef);
+  const feedback: FeedbackInput = {
+    eventId: `ranking-assessment-${label}`,
+    retrievalId,
+    memoryRef: target.memoryRef,
+    basis: "validator",
+    signal: "helpful",
+    evidenceRefs: proof.evidenceRefs,
+    verifierId: "fixture/ranking-validator",
+    verifierVersion: "1",
+  };
+  expect((await post("feedback", feedback)).status).toBe(200);
+  return target.memoryRef;
+}
+
+it.each(["correction", "expiry"] as const)(
+  "recomputes current validation hints before final rerank selection after held proof %s",
+  async (change) => {
+    service.store.configure({ ...service.store.config, usageRanking: true });
+    const source = await mutation({
+      requestId: "held-ranking-source",
+      operation: "create",
+      change: {
+        scope: "global",
+        title: "Held ranking validation source",
+        content: "Original independently observed proof.",
+        validUntil: change === "expiry" ? "2026-09-01T09:00:00.000Z" : null,
+      },
+    });
+    const target = await validatedRankingTarget("alpha", source.memoryRef);
+    const peerSource = await create("stable-ranking-source");
+    const peer = await validatedRankingTarget("beta", peerSource.memoryRef);
+    await service.store.indexPending();
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    service.store.setReranker({
+      model: "fixture/held-validation",
+      identity: fixtureModelIdentity("fixture/held-validation", 1, "reranking"),
+      async score(_query, documents) {
+        started.resolve();
+        await release.promise;
+        return documents.map(() => 0.5);
+      },
+    });
+    const pending = service.store.search({
+      query: "ranking stance",
+      type: "decision",
+      limit: 1,
+      rerankMode: "on",
+      access: owner,
+    });
+    await started.promise;
+    try {
+      if (change === "correction") {
+        service.store.mutations.mutate(ownerMutation(owner), {
+          requestId: "correct-held-ranking-proof",
+          operation: "update",
+          id: source.memoryRef.id,
+          expectedRevision: source.memoryRef.revision,
+          change: { content: "The old validation support was corrected." },
+        });
+      } else setSystemTime(new Date("2026-09-01T09:00:00.000Z"));
+      release.resolve();
+      const hits = await pending;
+      expect(hits.map((hit) => hit.id)).toEqual([String(peer.id)]);
+      expect(service.store.getVisible(owner, [target.id])[0]?.record_revision).toBe(target.revision);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  },
+);
+
+it("reweights exact-title results when proof expires between candidate and final reads", async () => {
+  service.store.configure({ ...service.store.config, usageRanking: true });
+  const source = await mutation({
+    requestId: "exact-proof-source",
+    operation: "create",
+    change: {
+      scope: "global",
+      title: "Exact-title validation proof",
+      content: "A time-bounded independent observation.",
+      validUntil: "2026-09-01T09:00:00.000Z",
+    },
+  });
+  const target = await validatedRankingTarget("exact", source.memoryRef);
+  await service.store.indexPending();
+  const original = service.store.feedback.expire.bind(service.store.feedback);
+  let reads = 0;
+  const boundary = spyOn(service.store.feedback, "expire").mockImplementation(() => {
+    reads++;
+    if (reads === 2) setSystemTime(new Date("2026-09-01T09:00:00.000Z"));
+    return original();
+  });
+  const input = { query: "ranking stance exact", access: owner, track: false, limit: 1 };
+  let during: Awaited<ReturnType<typeof service.store.search>>;
+  try {
+    during = await service.store.search(input);
+  } finally {
+    boundary.mockRestore();
+  }
+  expect(row(target).validated_helpful_count).toBe(0);
+  expect(during.map((hit) => hit.id)).toEqual([String(target.id)]);
+  const after = await service.store.search(input);
+  expect(during.map((hit) => hit.score)).toEqual(after.map((hit) => hit.score));
 });

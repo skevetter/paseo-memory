@@ -162,7 +162,6 @@ export const serviceInputs = {
   "source-invalidate": z.strictObject({ sourceRef: z.string().min(1).max(1000) }),
   "source-forget": z.strictObject({ sourceRef: z.string().min(1).max(1000), requestId: RequestIdInput }),
   configure: RuntimeConfigSchema,
-  "context-admit": ContextAdmissionSchema,
   "agent-context": z.object({
     project: ProjectRefSchema.nullable(),
     projectUnresolved: z.enum(PROJECT_UNRESOLVED_REASONS).nullable().default(null),
@@ -515,7 +514,6 @@ export interface ServiceOutputs {
   "source-invalidate": { affected: number };
   "source-forget": { forgotten: number };
   configure: { ok: true };
-  "context-admit": { admitted: true };
   "agent-context": {
     context: RetrievalResult | null;
     mcpServer: { url: string; headers: Record<string, string> } | null;

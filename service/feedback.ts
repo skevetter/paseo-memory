@@ -23,8 +23,14 @@ interface PriorFeedback {
   result: string;
 }
 type FeedbackCounter = "application_count" | "validated_helpful_count" | "validated_harmful_count";
-interface HintCounts { applications: number; validatedHelpful: number; validatedHarmful: number }
-interface HintRow extends HintCounts { memory_id: number }
+interface HintCounts {
+  applications: number;
+  validatedHelpful: number;
+  validatedHarmful: number;
+}
+interface HintRow extends HintCounts {
+  memory_id: number;
+}
 
 export class MemoryFeedback {
   constructor(
@@ -60,7 +66,8 @@ export class MemoryFeedback {
   projectCurrentHints(rows: MemoryRow[]): void {
     if (rows.length === 0 || !this.supportPropagationPending()) return;
     const ids = JSON.stringify(rows.map((row) => row.id));
-    const current = this.db.query<HintRow, [string, string]>(hintCountsSql(true))
+    const current = this.db
+      .query<HintRow, [string, string]>(hintCountsSql(true))
       .all(this.options.now(), ids);
     const counts = new Map<number, HintCounts>();
     for (const row of current) counts.set(row.memory_id, row);
@@ -74,7 +81,8 @@ export class MemoryFeedback {
 
   currentHintTotals(): HintCounts | undefined {
     if (!this.supportPropagationPending()) return undefined;
-    const totals = this.db.query<HintCounts, [string]>(`SELECT
+    const totals = this.db
+      .query<HintCounts, [string]>(`SELECT
       coalesce(sum(applications),0) AS applications,
       coalesce(sum(validatedHelpful),0) AS validatedHelpful,
       coalesce(sum(validatedHarmful),0) AS validatedHarmful FROM (${hintCountsSql()})`)
@@ -303,7 +311,7 @@ function hintCountsSql(selected = false): string {
             SELECT 1 FROM memories proof
             WHERE proof.id=CAST(substr(e.source_ref,8,instr(e.source_ref,'@')-8) AS INTEGER)
               AND e.source_ref=('memory:' || proof.id || '@' || proof.record_revision)
-              AND proof.deleted_at IS NULL AND ${currentLifecycleSql("proof", "hint_clock.at")}
+              AND proof.deleted_at IS NULL AND ${currentLifecycleSql("proof", "hint_clock.at", "ancestry")}
           ))
       )))
     GROUP BY f.memory_id`;

@@ -12,13 +12,26 @@ const DISCLOSURES_SQL = `WITH RECURSIVE disclosed(nonce,memory_id) AS (
 )`;
 
 /** SQL predicates also gate candidates before inference, not just the final response. */
-export function currentLifecycleSql(alias = "m", at = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"): string {
+export function currentLifecycleSql(
+  alias = "m",
+  at = "strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+  quarantine: "global" | "ancestry" = "global",
+): string {
+  const pending =
+    quarantine === "global"
+      ? `(NOT EXISTS (SELECT 1 FROM lifecycle_invalidations) OR (${alias}.record_kind!='derived_summary'
+      AND NOT EXISTS (SELECT 1 FROM memory_relations lr WHERE lr.to_id=${alias}.id AND lr.kind='derived_from')))`
+      : `NOT EXISTS (SELECT 1 FROM lifecycle_invalidations pending
+      WHERE pending.memory_id=${alias}.id AND pending.revision=${alias}.record_revision)`;
+  const pendingSource =
+    quarantine === "ancestry"
+      ? "OR EXISTS (SELECT 1 FROM lifecycle_invalidations pending WHERE pending.memory_id=s.id AND pending.revision=s.revision)"
+      : "";
   return `EXISTS (SELECT 1 FROM (SELECT ${at} AS at) lifecycle_clock WHERE
     ${alias}.state='active'
     AND (${alias}.valid_from IS NULL OR julianday(${alias}.valid_from)<=julianday(lifecycle_clock.at))
     AND (${alias}.valid_until IS NULL OR julianday(${alias}.valid_until)>julianday(lifecycle_clock.at))
-    AND (NOT EXISTS (SELECT 1 FROM lifecycle_invalidations) OR (${alias}.record_kind!='derived_summary'
-      AND NOT EXISTS (SELECT 1 FROM memory_relations lr WHERE lr.to_id=${alias}.id AND lr.kind='derived_from')))
+    AND ${pending}
     AND NOT EXISTS (
       ${sourceRevisionsSql(`${alias}.id`, `${alias}.record_revision`)}
       SELECT 1 FROM sources s LEFT JOIN memories dependency ON dependency.id=s.id
@@ -27,6 +40,7 @@ export function currentLifecycleSql(alias = "m", at = "strftime('%Y-%m-%dT%H:%M:
         OR (dependency.valid_from IS NOT NULL AND julianday(dependency.valid_from)>julianday(lifecycle_clock.at))
         OR (dependency.valid_until IS NOT NULL AND julianday(dependency.valid_until)<=julianday(lifecycle_clock.at))
         OR (SELECT count(*) FROM sources)>=1025
+        ${pendingSource}
     ))`;
 }
 

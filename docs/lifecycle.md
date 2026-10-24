@@ -47,6 +47,8 @@ Supplying new evidence replaces the current revision's support set. Promotion al
 
 Exposure and explicit-read counters do not update factual age, verification or canonical revisions. Schema v8 retains `use_count` and `last_used_at` as legacy activity, adds retrieval time separately, and resets application/validated-assessment hints when the target receives a new authoritative revision. Validator feedback must name an actually delivered canonical reference and current authorized supporting evidence. Normal source correction/archive, explicit invalidation and forget retract affected current validation hints; historical assessments remain recorded unless erased.
 
+Pending transitive invalidation suppresses affected current hints immediately without deleting historical assessments or unrelated valid hints. Ranking re-evaluates current support at its final read boundary, including proof expiry during inference; activity and assessment changes still do not freshen the fact.
+
 The owner historical RPC `memory.historical` accepts `{id, asOf}`. It checks current access, the historical namespace, the historical state/validity and the source revisions valid at that instant. Partial legacy snapshots remain available as explicitly unknown history, not fabricated active historical facts.
 
 ## Archive, source invalidation and forget

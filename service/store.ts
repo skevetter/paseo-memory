@@ -420,38 +420,49 @@ export class MemoryStore {
     });
   }
   admitContext(input: ServiceParsedInput<"context-admit">): { admitted: true } {
-    const current = this.db.transaction(() => {
-      const issued = this.audit.issuedContext(input);
-      if (!issued || this.lifecycle.contextInvalidated({ nonce: input.nonce }))
-        throw new MutationError("context_invalidated", "The issued context is unavailable or revoked.");
-      const access = Access.agent(issued.projectKey);
-      const memories = new Map(
-        this.getVisible(access, issued.selection.memoryRefs.map((ref) => ref.id))
-          .map((row) => [row.id, row.record_revision]),
-      );
-      return {
-        issued,
-        memories,
-        evidenceCount: this.provenance.getVisible(access, issued.selection.evidenceRefs).length,
-        sessions: new Map(
-          this.visibleSessions(access, issued.injection.sessions).map((row) => [row.id, sessionVersion(row)]),
-        ),
-        policyRevision: Number(this.getMeta("retrieval_policy_revision")),
-        indexGeneration: this.retrievalGeneration,
-      };
-    }).immediate();
+    const current = this.db
+      .transaction(() => {
+        const issued = this.audit.issuedContext(input);
+        if (!issued || this.lifecycle.contextInvalidated({ nonce: input.nonce }))
+          throw new MutationError("context_invalidated", "The issued context is unavailable or revoked.");
+        const access = Access.agent(issued.projectKey);
+        const memories = new Map(
+          this.getVisible(
+            access,
+            issued.selection.memoryRefs.map((ref) => ref.id),
+          ).map((row) => [row.id, row.record_revision]),
+        );
+        return {
+          issued,
+          memories,
+          evidenceCount: this.provenance.getVisible(access, issued.selection.evidenceRefs).length,
+          sessions: new Map(
+            this.visibleSessions(access, issued.injection.sessions).map((row) => [
+              row.id,
+              sessionVersion(row),
+            ]),
+          ),
+          policyRevision: Number(this.getMeta("retrieval_policy_revision")),
+          indexGeneration: this.retrievalGeneration,
+        };
+      })
+      .immediate();
     const { injection, selection } = current.issued;
     const snapshot = injection.admission;
     if (
       snapshot.policyRevision !== current.policyRevision ||
       snapshot.indexGeneration !== current.indexGeneration
-    ) throw new MutationError("context_invalidated", "The context policy or source generation changed.");
+    )
+      throw new MutationError("context_invalidated", "The context policy or source generation changed.");
     if (selection.memoryRefs.some((ref) => current.memories.get(ref.id) !== ref.revision))
       throw new MutationError("context_invalidated", "A selected memory is no longer current or authorized.");
     if (current.evidenceCount !== selection.evidenceRefs.length)
       throw new MutationError("context_invalidated", "Selected evidence is no longer authorized.");
     if (snapshot.sessionVersions.some((ref) => current.sessions.get(ref.id) !== ref.version))
-      throw new MutationError("context_invalidated", "A selected session is no longer current or authorized.");
+      throw new MutationError(
+        "context_invalidated",
+        "A selected session is no longer current or authorized.",
+      );
     return { admitted: true };
   }
   openReviewWindow(input: Parameters<ReviewLedger["open"]>[0]): void {
@@ -520,53 +531,6 @@ export class MemoryStore {
 
   private reviewAttemptId(agentId: string, windowId: string): string {
     return `review:${sha256(canonicalBody([agentId, windowId]))}`;
-  }
-
-  admitContext(input: ServiceParsedInput<"context-admit">): { admitted: true } {
-    const current = this.db
-      .transaction(() => {
-        const issued = this.audit.issuedContext(input);
-        if (!issued || this.lifecycle.contextInvalidated({ nonce: input.nonce }))
-          throw new MutationError("context_invalidated", "The issued context is unavailable or revoked.");
-        const access = Access.agent(issued.projectKey);
-        const memories = new Map(
-          this.getVisible(
-            access,
-            issued.selection.memoryRefs.map((ref) => ref.id),
-          ).map((row) => [row.id, row.record_revision]),
-        );
-        return {
-          issued,
-          memories,
-          evidenceCount: this.provenance.getVisible(access, issued.selection.evidenceRefs).length,
-          sessions: new Map(
-            this.visibleSessions(access, issued.injection.sessions).map((row) => [
-              row.id,
-              sessionVersion(row),
-            ]),
-          ),
-          policyRevision: Number(this.getMeta("retrieval_policy_revision")),
-          indexGeneration: this.retrievalGeneration,
-        };
-      })
-      .immediate();
-    const { injection, selection } = current.issued;
-    const snapshot = injection.admission;
-    if (
-      snapshot.policyRevision !== current.policyRevision ||
-      snapshot.indexGeneration !== current.indexGeneration
-    )
-      throw new MutationError("context_invalidated", "The context policy or source generation changed.");
-    if (selection.memoryRefs.some((ref) => current.memories.get(ref.id) !== ref.revision))
-      throw new MutationError("context_invalidated", "A selected memory is no longer current or authorized.");
-    if (current.evidenceCount !== selection.evidenceRefs.length)
-      throw new MutationError("context_invalidated", "Selected evidence is no longer authorized.");
-    if (snapshot.sessionVersions.some((ref) => current.sessions.get(ref.id) !== ref.version))
-      throw new MutationError(
-        "context_invalidated",
-        "A selected session is no longer current or authorized.",
-      );
-    return { admitted: true };
   }
 
   private readDataVersion(): number {
@@ -1136,7 +1100,12 @@ export class MemoryStore {
     if (!scoped.query) return this.list(scoped);
     const exact = this.exactCandidates(scoped);
     if (exact !== null)
-      return this.finishSearch(exact.map((candidate) => candidate.hit).slice(0, scoped.limit), scoped);
+      return this.finishSearch(
+        exact.candidates.map((candidate) => candidate.hit),
+        scoped,
+        new Map(exact.refs.map((ref) => [ref.id, ref.revision])),
+        new Map(exact.refs.map((ref) => [ref.id, ref.rank])),
+      );
     const inferenceEpoch = this.inferenceEpoch;
     const refs = await this.searchRefs(scoped);
     if (refs === ABORTED) return [];
@@ -1214,7 +1183,12 @@ export class MemoryStore {
     }
     if (!this.searchPolicyCurrent(input)) return [];
     if (ranked === ABORTED || input.signal?.aborted || this.closed) return [];
-    return this.finishSearch(ranked, input, new Map(refs.map((ref) => [ref.id, ref.revision])));
+    return this.finishSearch(
+      ranked,
+      input,
+      new Map(refs.map((ref) => [ref.id, ref.revision])),
+      new Map(refs.map((ref) => [ref.id, ref.rank])),
+    );
   }
 
   private searchPolicyCurrent(input: SearchInput): boolean {
@@ -1235,11 +1209,12 @@ export class MemoryStore {
 
   private finishSearch(
     hits: SearchHit[],
-    input: SearchInput & { scope: SearchScope },
+    input: ResolvedSearchInput,
     revisions?: Map<number, number>,
+    ranks?: Map<number, number>,
   ): SearchHit[] {
     if (input.signal?.aborted || this.closed) return [];
-    const current = this.currentHits(hits, input, revisions);
+    const current = this.currentHits(hits, input, revisions, ranks).sort(compareHits).slice(0, input.limit);
     if (input.track) {
       this.markShown(current.flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : [])));
     }
@@ -1248,7 +1223,7 @@ export class MemoryStore {
 
   private exactCandidates(
     input: SearchInput & { scope: SearchScope; maxCandidates: number },
-  ): Candidate[] | null {
+  ): { refs: CandidateRef[]; candidates: Candidate[] } | null {
     const filter = input.access.memoryFilter(input.scope, input.type, this.ts(), input.recordKinds);
     const id = /^#?([1-9]\d*)$/.exec(input.query);
     const exactLimit = Math.min(EXACT_MATCH_LIMIT, input.maxCandidates);
@@ -1261,15 +1236,13 @@ export class MemoryStore {
       )
       .all(...filter.params, ...values, exactLimit + 1);
     if (!id && (refs.length === 0 || refs.length > exactLimit)) return null;
-    return this.materializeCandidates(
-      refs.slice(0, exactLimit).map((row, index) => ({
-        id: row.id,
-        revision: row.record_revision,
-        rank: 1 / (index + 1),
-        similarity: null,
-      })),
-      input,
-    );
+    const selected = refs.slice(0, exactLimit).map((row, index) => ({
+      id: row.id,
+      revision: row.record_revision,
+      rank: 1 / (index + 1),
+      similarity: null,
+    }));
+    return { refs: selected, candidates: this.materializeCandidates(selected, input) };
   }
 
   private candidateKey(input: SearchInput & { scope: SearchScope; maxCandidates: number }): string {
@@ -1358,10 +1331,12 @@ export class MemoryStore {
     hits: SearchHit[],
     input: { access: Access; scope: SearchScope; type?: string; recordKinds?: RecordKind[] },
     revisions?: Map<number, number>,
+    ranks?: Map<number, number>,
   ): SearchHit[] {
+    this.feedback.expire();
     const filter = input.access.memoryFilter(input.scope, input.type, this.ts(), input.recordKinds);
     const memoryIds = hits.flatMap((h) => (h.kind === "memory" ? [Number(h.id)] : []));
-    const memories = new Map(
+    const rows =
       memoryIds.length === 0
         ? []
         : this.db
@@ -1369,21 +1344,22 @@ export class MemoryStore {
               `SELECT m.*, p.name AS project_name FROM memories m LEFT JOIN projects p ON p.key = m.project_key
                WHERE ${filter.where} AND m.id IN (${memoryIds.map(() => "?").join(",")})`,
             )
-            .all(...filter.params, ...memoryIds)
-            .map((row) => [row.id, row]),
-    );
+            .all(...filter.params, ...memoryIds);
+    this.feedback.projectCurrentHints(rows);
+    const memories = new Map(rows.map((row) => [row.id, row]));
+    const nowMs = this.now().getTime();
     const sessionIds = hits.flatMap((h) => (h.kind === "session" ? [h.id] : []));
     const sessions = currentSessionHits(this.db, input.access.sessionFilter(input.scope), sessionIds);
     return hits.flatMap((hit): SearchHit[] => {
-      if (hit.kind === "session") {
-        const fresh = sessions.get(hit.id);
-        return fresh && fresh.version === hit.version ? [{ ...fresh, score: hit.score }] : [];
-      }
+      if (hit.kind === "session") return currentSessionHit(hit, sessions);
       const row = memories.get(Number(hit.id));
       if (!row || (revisions && revisions.get(row.id) !== row.record_revision)) return [];
-      return [
-        { ...memoryHit(row, { score: hit.score, similarity: hit.similarity }), relevance: hit.relevance },
-      ];
+      const rank = ranks?.get(row.id);
+      const score =
+        rank === undefined
+          ? hit.score
+          : (hit.relevance ?? rank) * boost(row, nowMs, this.config.usageRanking);
+      return [{ ...memoryHit(row, { score, similarity: hit.similarity }), relevance: hit.relevance }];
     });
   }
 
@@ -1771,14 +1747,14 @@ export class MemoryStore {
     candidates: Candidate[],
     input: ResolvedSearchInput,
   ): Promise<SearchHit[]> {
-    const { limit, onFallback } = input;
+    const { onFallback } = input;
     const disabled = input.mode === "lexical" || input.rerankMode === "off";
     const fused = candidates.sort(compareCandidates);
     const reranker = this.reranker;
-    if (disabled || fused.length < 2) return fused.slice(0, limit).map((c) => c.hit);
+    if (disabled || fused.length < 2) return fused.map((c) => c.hit);
     if (!reranker) {
       onFallback?.("reranker_unavailable");
-      return fused.slice(0, limit).map((c) => c.hit);
+      return fused.map((c) => c.hit);
     }
     const head = fused.slice(0, RERANK_CANDIDATES);
     const epoch = this.inferenceEpoch;
@@ -1814,18 +1790,16 @@ export class MemoryStore {
         { signal: input.signal },
       );
       const { selected, scores } = result;
-      return selected
-        .map((c, i): SearchHit => {
-          const relevance = scores[i] ?? 0;
-          const score = relevance * c.weight;
-          return c.hit.kind === "memory" ? { ...c.hit, score, relevance } : { ...c.hit, score };
-        })
-        .sort(compareHits)
-        .slice(0, limit);
+      return selected.map((c, i): SearchHit => {
+        const relevance = scores[i] ?? 0;
+        return c.hit.kind === "memory"
+          ? { ...c.hit, score: relevance, relevance }
+          : { ...c.hit, score: relevance * c.weight };
+      });
     } catch (error) {
       this.log.warn(`re-ranking failed, using fused order: ${errorText(error)}`);
       onFallback?.(error instanceof InferenceQueueError ? error.code : "rerank_failed");
-      return fused.slice(0, limit).map((c) => c.hit);
+      return fused.map((c) => c.hit);
     }
   }
 
@@ -2195,6 +2169,11 @@ function compareHits(a: SearchHit, b: SearchHit): number {
 
 function compareCandidates(a: Candidate, b: Candidate): number {
   return compareHits(a.hit, b.hit);
+}
+
+function currentSessionHit(hit: SessionHit, sessions: ReadonlyMap<string, SessionHit>): SessionHit[] {
+  const fresh = sessions.get(hit.id);
+  return fresh && fresh.version === hit.version ? [{ ...fresh, score: hit.score }] : [];
 }
 
 const ABORTED = Symbol("aborted");

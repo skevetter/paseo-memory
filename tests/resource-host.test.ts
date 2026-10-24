@@ -631,7 +631,9 @@ it("records native completed, failed, canceled and review turns with billing unk
     unavailableBillingAttempts: 6,
   });
   expect(totals.stages.review).toMatchObject({ attempts: 1, completed: 1 });
-  expect((await post("sessions", { query: "", paseoProjectId: null, limit: 50 })).body).toEqual({ items: [] });
+  expect((await post("sessions", { query: "", paseoProjectId: null, limit: 50 })).body).toEqual({
+    items: [],
+  });
 });
 
 it("keeps durable native accounting across plugin/service restart and failed capture", async () => {
@@ -697,7 +699,7 @@ it("rejects forgotten context held before native output selection and never leav
   const host = await nativeHost({ injectMcp: true });
   host.transport.hold();
   manualDeadlines();
-  const request: CreateRequest = {
+  const request = {
     config: {
       provider: "omp",
       cwd: dataDir,
@@ -705,7 +707,7 @@ it("rejects forgotten context held before native output selection and never leav
       mcpServers: { caller: { type: "http", url: "https://caller.invalid/mcp" } },
     },
     env: { CALLER_FLAG: "preserved" },
-  };
+  } satisfies CreateRequest;
   const output = host.invoke("agent.create", { request });
   const issued = await host.transport.ready;
   expect(issued.context?.contextText).toContain("independently observed rollout verification");
@@ -750,7 +752,8 @@ it("admits only the current issued injection identity without acknowledging cons
   for (const forged of [
     { ...input, policyRevision: issued.context.policyRevision },
     { ...input, memoryRefs: issued.context.memoryRefs },
-  ]) expect((await post("context-admit", forged)).status).toBe(400);
+  ])
+    expect((await post("context-admit", forged)).status).toBe(400);
   for (const unknown of [
     { ...input, retrievalId: "unissued-retrieval" },
     { ...input, nonce: "foreign-issuance" },
@@ -784,7 +787,12 @@ it("admits genuine tools-only issuance without a fabricated fragment and rejects
   expect(admitted.status).toBe(200);
   expect(admitted.body).toEqual({ admitted: true });
   expect((await usage()).memoryInput.attempts).toBe(0);
-  live().store.audit.open({ nonce: "legacy-without-snapshot", projectKey: null, provider: "omp", tools: true });
+  live().store.audit.open({
+    nonce: "legacy-without-snapshot",
+    projectKey: null,
+    provider: "omp",
+    tools: true,
+  });
   live().store.audit.record("legacy-without-snapshot", {
     kind: "inject",
     memories: [],
@@ -818,10 +826,14 @@ it("rejects old native issuance after source generation or owner disclosure poli
   });
   expect(sourceDenied.status).toBe(409);
   const current = await issuedContext();
-  expect((await post("context-admit", {
-    retrievalId: current.context.retrievalId,
-    nonce: current.nonce,
-  })).body).toEqual({ admitted: true });
+  expect(
+    (
+      await post("context-admit", {
+        retrievalId: current.context.retrievalId,
+        nonce: current.nonce,
+      })
+    ).body,
+  ).toEqual({ admitted: true });
   const configured = await post("configure", {
     ...live().store.config,
     extraInstructions: "Use the owner's newly configured disclosure instructions.",
@@ -833,10 +845,14 @@ it("rejects old native issuance after source generation or owner disclosure poli
   });
   expect(policyDenied.status).toBe(409);
   const fresh = await issuedContext();
-  expect((await post("context-admit", {
-    retrievalId: fresh.context.retrievalId,
-    nonce: fresh.nonce,
-  })).body).toEqual({ admitted: true });
+  expect(
+    (
+      await post("context-admit", {
+        retrievalId: fresh.context.retrievalId,
+        nonce: fresh.nonce,
+      })
+    ).body,
+  ).toEqual({ admitted: true });
 });
 
 it("rechecks selected session versions and scope instead of reusing an old session digest", async () => {
@@ -867,21 +883,29 @@ it("rechecks selected session versions and scope instead of reusing an old sessi
   expect(issued.context.sessionIds).toEqual([turn.agentId]);
   const input = { retrievalId: issued.context.retrievalId, nonce: issued.nonce };
   expect((await post("context-admit", input)).body).toEqual({ admitted: true });
-  expect((await post("record-turn", {
-    ...turn,
-    userText: "Correct the session outcome.",
-    assistantText: "Corrected session outcome from a newer actual turn.",
-  })).status).toBe(200);
+  expect(
+    (
+      await post("record-turn", {
+        ...turn,
+        userText: "Correct the session outcome.",
+        assistantText: "Corrected session outcome from a newer actual turn.",
+      })
+    ).status,
+  ).toBe(200);
   const denied = await post("context-admit", input);
   expect(denied.status).toBe(409);
   expect(denied.body).toMatchObject({ error: { code: "context_invalidated" } });
   const fresh = AgentContextSchema.parse((await post("agent-context", request)).body);
   if (!fresh.context || !fresh.nonce) throw new Error("Expected current session context");
   expect(fresh.context.sessionIds).toEqual([turn.agentId]);
-  expect((await post("context-admit", {
-    retrievalId: fresh.context.retrievalId,
-    nonce: fresh.nonce,
-  })).body).toEqual({ admitted: true });
+  expect(
+    (
+      await post("context-admit", {
+        retrievalId: fresh.context.retrievalId,
+        nonce: fresh.nonce,
+      })
+    ).body,
+  ).toEqual({ admitted: true });
 });
 
 it("rejects a selected canonical record whose validity expires after preparation without a new write", async () => {
@@ -953,14 +977,16 @@ it("never selects or links output when final native admission arrives after the 
       title: "Fresh selected output",
     },
   });
-  expect(live().store.audit.nonceFor("fresh-after-late-admission")).toBe(fresh.env?.[NONCE_ENV]);
+  expect(live().store.audit.nonceFor("fresh-after-late-admission")).toBe(
+    z.string().min(1).parse(fresh.env?.[NONCE_ENV]),
+  );
   await host.transport.drain();
 });
 
 it("keeps native tools-only creation prompt-free and supplies actually authorized MCP credentials", async () => {
   const memory = await seed();
   const host = await nativeHost({ injectContext: false, injectMcp: true });
-  const request: CreateRequest = {
+  const request = {
     config: {
       provider: "omp",
       cwd: dataDir,
@@ -968,14 +994,16 @@ it("keeps native tools-only creation prompt-free and supplies actually authorize
       mcpServers: { caller: { type: "http", url: "https://caller.invalid/mcp" } },
     },
     env: { CALLER_FLAG: "preserved" },
-  };
+  } satisfies CreateRequest;
   const output = HookOutputSchema.parse(await host.invoke("agent.create", { request }));
   expect(output.config.systemPrompt).toBe(request.config.systemPrompt);
   expect(output.env).toMatchObject(request.env);
-  const servers = z.object({
-    memory: z.object({ url: z.string(), headers: z.record(z.string(), z.string()) }),
-    caller: z.object({ type: z.literal("http"), url: z.literal("https://caller.invalid/mcp") }),
-  }).parse(output.config.mcpServers);
+  const servers = z
+    .object({
+      memory: z.object({ url: z.string(), headers: z.record(z.string(), z.string()) }),
+      caller: z.object({ type: z.literal("http"), url: z.literal("https://caller.invalid/mcp") }),
+    })
+    .parse(output.config.mcpServers);
   await host.transport.drain();
   expect((await usage()).memoryInput.attempts).toBe(0);
   const response = await fetch(servers.memory.url, {

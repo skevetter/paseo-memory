@@ -17,7 +17,6 @@ import { signCaller } from "./mcp";
 import { MutationError, mutationRequestId, ownerMutation } from "./mutations";
 import { redact } from "./redact";
 import { finishReview } from "./review";
-import { sessionVersion } from "./sessions";
 import type { MemoryStore, SearchHit, SessionRow } from "./store";
 import type { TaskInput } from "./task";
 import { clip } from "./text";
@@ -57,7 +56,6 @@ export function createRoutes(ctx: RouteContext): Routes {
       return { ok: true };
     },
     "agent-context": (input, signal) => agentContext(ctx, input, signal),
-    "context-admit": (input) => store.admitContext(input),
     "link-agent": (input) => {
       store.audit.link(input);
       return { ok: true };
