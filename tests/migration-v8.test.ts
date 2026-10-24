@@ -308,11 +308,23 @@ interface RevisionSnapshot {
   legacy_metadata_unknown: number;
 }
 
+// Published v7 columns; v8 adds nullable columns, asserted separately.
+const RETAINED_COLUMNS: Record<string, string> = {
+  memory_evidence:
+    "evidence_id, source_kind, source_ref, source_hash, observed_at, source_event_at, stored_at, actor_id, agent_id, bot_id, run_id, cycle_id, excerpt, sensitivity, status, reason, scope, project_key",
+  source_artifacts:
+    "source_ref, content, source_hash, scope, project_key, allow_excerpt, source_event_at, created_at",
+};
+
 function readTables(db: Database, tables: readonly string[]): RowsByTable {
   return Object.fromEntries(
     tables.map((table) => [
       table,
-      db.query<Record<string, unknown>, []>(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+      db
+        .query<Record<string, unknown>, []>(
+          `SELECT ${RETAINED_COLUMNS[table] ?? "*"} FROM ${table} ORDER BY rowid`,
+        )
+        .all(),
     ]),
   );
 }
@@ -379,6 +391,10 @@ it("preserves published v7 records, timestamps, counters and immutable canonical
       Object.entries(before).filter(([name]) => PRESERVED_TABLES.some((table) => table === name)),
     ),
   );
+  expect(db.query("SELECT bot_id FROM source_artifacts").all()).toEqual([{ bot_id: null }]);
+  expect(db.query("SELECT namespace_bot_id FROM memory_evidence").all()).toEqual([
+    { namespace_bot_id: null },
+  ]);
   const records = db.query<Record<string, unknown>, []>("SELECT * FROM memories ORDER BY id").all();
   expect(records.map((record) => record.id)).toEqual([41, 83, 120]);
   for (const record of records) {

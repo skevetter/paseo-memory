@@ -1,26 +1,23 @@
+import { type MemoryNamespace, namespaceKey } from "../shared/namespaces";
 import type { RecordKind } from "../shared/retrieval";
 import type { SearchScope } from "../shared/service-api";
 import { currentLifecycleSql } from "./lifecycle";
 
-export type Scope = "global" | "project";
 export type Operation = "read" | "write" | "delete" | "restore" | "merge";
-
-export interface Namespace {
-  scope: Scope;
-  projectKey: string | null;
-}
+export type NamespaceGrants = Partial<Readonly<Record<Operation, readonly MemoryNamespace[]>>>;
 
 export interface SqlFilter {
   where: string;
   params: (string | number)[];
 }
 
-// Which project partitions a request may touch. "every" exists only for the owner UI.
-export type ProjectReach = { kind: "none" } | { kind: "one"; key: string } | { kind: "every" };
+// Unbounded reach belongs to the owner UI; registered consumers receive explicit namespace sets.
+export type NamespaceReach = { kind: "none" } | { kind: "some"; keys: readonly string[] } | { kind: "every" };
 
 export interface Reach {
   global: boolean;
-  projects: ProjectReach;
+  projects: NamespaceReach;
+  bots: NamespaceReach;
 }
 
 const AGENT_MAY: Record<Operation, boolean> = {
@@ -31,57 +28,68 @@ const AGENT_MAY: Record<Operation, boolean> = {
   merge: false,
 };
 
-/**
- * Who is asking and what they may reach. The owner UI is a separate principal and cannot be built from
- * MCP tool arguments; an agent is limited to global memory plus the project in its signed token.
- */
+/** Owner UI, standalone agents and registered scoped callers share the same namespace boundary. */
 export class Access {
   readonly kind: "owner" | "agent";
   private readonly projectKey: string | null;
+  private readonly operationKeys: ReadonlyMap<Operation, ReadonlySet<string>> | null;
+  private readonly granted: Reach;
 
-  private constructor(kind: "owner" | "agent", projectKey: string | null) {
+  private constructor(kind: "owner" | "agent", projectKey: string | null, grants: NamespaceGrants | null) {
     this.kind = kind;
     this.projectKey = projectKey;
+    this.operationKeys = grants === null ? null : grantKeys(grants);
+    this.granted = grants === null ? standaloneReach(kind, projectKey) : namespaceReach(grants.read ?? []);
   }
 
-  /** The owner sees every namespace. `focusProjectKey` narrows `scope: "all"` to that project plus global. */
+  /** A focused owner query reaches that project and global, not unrelated bot namespaces. */
   static owner(focusProjectKey: string | null = null): Access {
-    return new Access("owner", focusProjectKey);
+    return new Access("owner", focusProjectKey, null);
   }
 
-  /** `projectKey` null means the project could not be resolved: only global memory is granted. */
+  /** Standalone agents retain global plus their signed project, never an implicit bot grant. */
   static agent(projectKey: string | null): Access {
-    return new Access("agent", projectKey);
+    return new Access("agent", projectKey, null);
   }
 
-  allows(operation: Operation, namespace: Namespace): boolean {
+  /** Caller authentication must supply these grants; tool arguments cannot construct them. */
+  static scoped(grants: NamespaceGrants): Access {
+    return new Access("agent", null, grants);
+  }
+
+  get isScoped(): boolean {
+    return this.operationKeys !== null;
+  }
+
+  allows(operation: Operation, namespace: MemoryNamespace | null): boolean {
+    if (namespace === null) return false;
     if (this.kind === "owner") return true;
+    if (this.operationKeys !== null)
+      return this.operationKeys.get(operation)?.has(namespaceKey(namespace)) ?? false;
     if (!AGENT_MAY[operation]) return false;
-    if (namespace.scope === "global") return true;
-    return this.projectKey !== null && namespace.projectKey === this.projectKey;
+    if (namespace.kind === "global") return true;
+    return (
+      namespace.kind === "project" && this.projectKey !== null && namespace.projectKey === this.projectKey
+    );
   }
 
   reach(scope: SearchScope): Reach {
-    const granted: ProjectReach = this.projectKey ? { kind: "one", key: this.projectKey } : { kind: "none" };
-    if (scope === "global") return { global: true, projects: { kind: "none" } };
-    if (scope === "project") return { global: false, projects: granted };
-    if (this.kind === "owner" && !this.projectKey) return { global: true, projects: { kind: "every" } };
-    return { global: true, projects: granted };
+    if (scope === "all") return this.granted;
+    return {
+      global: scope === "global" && this.granted.global,
+      projects: scope === "project" ? this.granted.projects : { kind: "none" },
+      bots: scope === "bot" ? this.granted.bots : { kind: "none" },
+    };
   }
 
-  /** SQL over `memories m` for the namespaces `scope` resolves to. */
+  /** SQL over memories m: namespace and lifecycle filtering precede materialization and inference. */
   memoryFilter(scope: SearchScope, type?: string, at?: string, recordKinds?: RecordKind[]): SqlFilter {
     const where = ["m.deleted_at IS NULL", currentLifecycleSql("m", at ? "?" : undefined)];
     const params: (string | number)[] = [];
     if (at) params.push(at);
-    const { global, projects } = this.reach(scope);
-    const parts: string[] = [];
-    if (global) parts.push("m.scope = 'global'");
-    if (projects.kind === "one") {
-      parts.push("(m.scope = 'project' AND m.project_key = ?)");
-      params.push(projects.key);
-    } else if (projects.kind === "every") parts.push("m.scope = 'project'");
-    where.push(parts.length > 0 ? `(${parts.join(" OR ")})` : "0");
+    const namespace = this.namespaceFilter(scope);
+    where.push(namespace.where);
+    params.push(...namespace.params);
     if (type) {
       where.push("m.type = ?");
       params.push(type);
@@ -93,16 +101,64 @@ export class Access {
     return { where: where.join(" AND "), params };
   }
 
-  /** SQL over `sessions s`; sessions are always project-scoped, so `global` reaches none. */
+  /** Namespace-only filtering also applies to explicitly requested historical snapshots. */
+  namespaceFilter(scope: SearchScope, alias: "m" | "h" = "m"): SqlFilter {
+    const { global, projects, bots } = this.reach(scope);
+    const parts: string[] = [];
+    const params: (string | number)[] = [];
+    if (global) parts.push(`${alias}.scope = 'global'`);
+    const project = partitionFilter(projects, `${alias}.project_key`);
+    const bot = partitionFilter(bots, `${alias}.bot_id`);
+    if (project) {
+      parts.push(`(${alias}.scope = 'project' AND ${project.where})`);
+      params.push(...project.params);
+    }
+    if (bot) {
+      parts.push(`(${alias}.scope = 'bot' AND ${bot.where})`);
+      params.push(...bot.params);
+    }
+    return { where: parts.length ? `(${parts.join(" OR ")})` : "0", params };
+  }
+
+  /** Session digests are project-scoped; bot grants do not imply their producing project. */
   sessionFilter(scope: SearchScope): SqlFilter | null {
-    const { projects } = this.reach(scope);
-    if (projects.kind === "none") return null;
+    const project = partitionFilter(this.reach(scope).projects, "s.project_key");
+    if (!project) return null;
     const current = `NOT EXISTS (SELECT 1 FROM memory_tombstones t WHERE
       (t.kind='session' AND t.identifier=s.agent_id)
       OR (t.kind='caller' AND t.identifier IN (SELECT nonce FROM agent_links WHERE agent_id=s.agent_id)))`;
-    if (projects.kind === "every") return { where: current, params: [] };
-    return { where: `s.project_key = ? AND ${current}`, params: [projects.key] };
+    return { where: `${project.where} AND ${current}`, params: project.params };
   }
+}
+
+function grantKeys(grants: NamespaceGrants): ReadonlyMap<Operation, ReadonlySet<string>> {
+  const result = new Map<Operation, ReadonlySet<string>>();
+  const operations: Operation[] = ["read", "write", "delete", "restore", "merge"];
+  for (const operation of operations)
+    result.set(operation, new Set((grants[operation] ?? []).map(namespaceKey)));
+  return result;
+}
+
+function namespaceReach(namespaces: readonly MemoryNamespace[]): Reach {
+  let global = false;
+  const projects = new Set<string>();
+  const bots = new Set<string>();
+  for (const namespace of namespaces) {
+    if (namespace.kind === "global") global = true;
+    else if (namespace.kind === "project") projects.add(namespace.projectKey);
+    else bots.add(namespace.botId);
+  }
+  return { global, projects: explicitReach(projects), bots: explicitReach(bots) };
+}
+
+function explicitReach(keys: ReadonlySet<string>): NamespaceReach {
+  return keys.size ? { kind: "some", keys: Object.freeze([...keys].sort()) } : { kind: "none" };
+}
+
+function partitionFilter(reach: NamespaceReach, column: string): SqlFilter | null {
+  if (reach.kind === "none") return null;
+  if (reach.kind === "every") return { where: "1", params: [] };
+  return { where: `${column} IN (${reach.keys.map(() => "?").join(",")})`, params: [...reach.keys] };
 }
 
 // "unchanged" means the request was allowed but would not have altered the memory.
@@ -122,4 +178,17 @@ export interface MergeResult {
   mergeId?: number;
   /** True when a memory changed after the caller read it; the merge was not applied. */
   conflict?: boolean;
+}
+
+function standaloneReach(kind: "owner" | "agent", projectKey: string | null): Reach {
+  const unfocusedOwner = kind === "owner" && projectKey === null;
+  return {
+    global: true,
+    projects: projectKey
+      ? { kind: "some", keys: [projectKey] }
+      : kind === "owner"
+        ? { kind: "every" }
+        : { kind: "none" },
+    bots: unfocusedOwner ? { kind: "every" } : { kind: "none" },
+  };
 }

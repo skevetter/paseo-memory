@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { Access } from "../service/access";
@@ -7,15 +8,8 @@ import { migrate, SCHEMA_VERSION, SchemaTooNewError } from "../service/schema";
 import { openDatabase } from "../service/sqlite";
 import { MemoryStore, type StoreOptions } from "../service/store";
 import { scopeKey } from "../service/vectors";
-import {
-  dataRepo,
-  fixtureModelIdentity,
-  hashEmbedder,
-  otherRepo,
-  owner,
-  removePostV6Schema,
-  tempDir,
-} from "./helpers";
+import { createPublishedSchema } from "./fixtures/published-schemas";
+import { dataRepo, fixtureModelIdentity, hashEmbedder, otherRepo, owner, tempDir } from "./helpers";
 
 const stores: MemoryStore[] = [];
 afterEach(() => {
@@ -100,7 +94,7 @@ const patchFor = (place: Place) =>
     : { scope: "project" as const, project: place.project };
 
 const partitionOf = (place: Place) =>
-  scopeKey(place.scope, place.scope === "project" ? place.project.key : null);
+  scopeKey(place.scope, place.scope === "project" ? place.project.key : null, null);
 
 // Reads the vector partition and freshness metadata through a second connection.
 function inspect(path: string, store: MemoryStore, id: number) {
@@ -423,29 +417,86 @@ describe("search after async work", () => {
   });
 });
 
-async function v5Database() {
+interface SeedMemory {
+  id: number;
+  scope: "global" | "project";
+  projectKey: string | null;
+  title: string;
+  content: string;
+  revisions: number;
+}
+
+// Rows a published v5 release held after an edit and an index pass.
+const PUBLISHED_V5_ROWS: SeedMemory[] = [
+  {
+    id: 1,
+    scope: "project",
+    projectKey: dataRepo.key,
+    title: "kept alpha",
+    content: "marmot burrow kept alpha edited",
+    revisions: 2,
+  },
+  {
+    id: 2,
+    scope: "project",
+    projectKey: otherRepo.key,
+    title: "kept beta",
+    content: "marmot burrow kept beta",
+    revisions: 1,
+  },
+  {
+    id: 3,
+    scope: "global",
+    projectKey: null,
+    title: "kept global",
+    content: "marmot burrow kept global",
+    revisions: 1,
+  },
+];
+
+function seedPublishedV5(db: Database): void {
+  const ts = "2026-10-01T00:00:00Z";
+  const insertProject = db.query(
+    `INSERT INTO projects (key, name, root_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (const project of [dataRepo, otherRepo]) {
+    insertProject.run(project.key, project.name, project.rootPath, ts, ts);
+  }
+  const insertMemory = db.query(
+    `INSERT INTO memories (id, scope, project_key, type, title, content, content_hash, revision_count, created_at, updated_at)
+     VALUES (?, ?, ?, 'note', ?, ?, ?, ?, ?, ?)`,
+  );
+  const insertEmbedding = db.query(
+    `INSERT INTO memory_embeddings (memory_id, model, dims, content_hash, embedded_at) VALUES (?, 'test/mig', 64, ?, ?)`,
+  );
+  for (const row of PUBLISHED_V5_ROWS) {
+    const hash = `hash-${row.id}`;
+    insertMemory.run(row.id, row.scope, row.projectKey, row.title, row.content, hash, row.revisions, ts, ts);
+    insertEmbedding.run(row.id, hash, ts);
+  }
+}
+
+interface BeforeRow {
+  id: number;
+  scope: string;
+  project_key: string | null;
+  revision_count: number;
+}
+
+// Builds the schema a published v5 release left behind; no migrate, no downgrade.
+function v5Database(): { path: string; before: BeforeRow[] } {
   const path = newPath();
-  const store = new MemoryStore({ path });
-  store.setEmbedder(hashEmbedder("test/mig"));
-  const alpha = await seed(store, "kept alpha", inProject(dataRepo));
-  await seed(store, "kept beta", inProject(otherRepo));
-  await seed(store, "kept global", everywhere);
-  store.updateAuthorized(owner, alpha, { content: "marmot burrow kept alpha edited" });
-  await store.indexPending();
-  store.close();
   const { db } = openDatabase(path);
-  removePostV6Schema(db);
-  db.run(`ALTER TABLE memories DROP COLUMN index_generation; ALTER TABLE memories DROP COLUMN record_revision;
-    ALTER TABLE memory_embeddings DROP COLUMN index_generation;
-    ALTER TABLE memory_embeddings DROP COLUMN model_fingerprint;
-    PRAGMA user_version = 5;`);
-  const before = db
-    .query<{ id: number; scope: string; project_key: string | null; revision_count: number }, []>(
-      `SELECT id, scope, project_key, revision_count FROM memories ORDER BY id`,
-    )
-    .all();
-  db.close();
-  return { path, before };
+  try {
+    createPublishedSchema(db, 5);
+    seedPublishedV5(db);
+    const before = db
+      .query<BeforeRow, []>(`SELECT id, scope, project_key, revision_count FROM memories ORDER BY id`)
+      .all();
+    return { path, before };
+  } finally {
+    db.close();
+  }
 }
 
 interface Migrated {
@@ -458,8 +509,8 @@ interface Migrated {
 }
 
 describe("schema v6 migration", () => {
-  it("keeps every id and namespace, passes foreign_key_check and seeds revisions from revision_count", async () => {
-    const { path, before } = await v5Database();
+  it("keeps every id and namespace, passes foreign_key_check and seeds revisions from revision_count", () => {
+    const { path, before } = v5Database();
     openStore(path);
     const { db } = openDatabase(path);
     try {
@@ -488,7 +539,7 @@ describe("schema v6 migration", () => {
   });
 
   it("marks existing vectors stale, serves lexical search meanwhile and rebuilds in the background", async () => {
-    const { path } = await v5Database();
+    const { path } = v5Database();
     const store = openStore(path);
     store.setEmbedder(hashEmbedder("test/mig"));
     expect(store.pendingEmbeddings()).toBe(3);
@@ -500,8 +551,8 @@ describe("schema v6 migration", () => {
     expect(store.pendingEmbeddings()).toBe(0);
   });
 
-  it("writes a consistent backup before migrating", async () => {
-    const { path, before } = await v5Database();
+  it("writes a consistent backup before migrating", () => {
+    const { path, before } = v5Database();
     openStore(path);
     const { db } = openDatabase(`${path}.pre-v${SCHEMA_VERSION}-from-v5.bak`);
     try {

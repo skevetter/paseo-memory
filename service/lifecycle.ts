@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { ForgetPreview, MemoryRef } from "../shared/lifecycle";
+import { namespaceOf } from "../shared/namespaces";
 import type { Access } from "./access";
 import { retractFeedbackEvidence } from "./feedback";
 import { dropVectors } from "./vectors";
@@ -9,6 +10,9 @@ const DISCLOSURES_SQL = `WITH RECURSIVE disclosed(nonce,memory_id) AS (
   UNION SELECT e.nonce,CAST(j.value AS INTEGER) FROM audit_events e,json_each(e.detail,'$.found') j WHERE e.kind='get'
   UNION SELECT e.nonce,CAST(json_extract(j.value,'$.id') AS INTEGER) FROM audit_events e,json_each(e.detail,'$.results') j WHERE e.kind='search'
   UNION SELECT e.nonce,CAST(json_extract(e.detail,'$.id') AS INTEGER) FROM audit_events e WHERE e.kind IN ('save','update','delete')
+  UNION SELECT 'bridge:' || e.session_id || ':' || e.session_epoch,s.memory_id
+    FROM bridge_event_sources s JOIN bridge_events e ON e.id=s.event_id
+    WHERE s.memory_id IS NOT NULL AND e.processing_state<>'invalidated'
 )`;
 
 /** SQL predicates also gate candidates before inference, not just the final response. */
@@ -80,10 +84,13 @@ export class Lifecycle {
     );
   }
 
-  private exposedContexts(ids: number[]): { agents: string[]; nonces: string[] } {
-    const placeholders = ids.map(() => "?").join(",");
+  private exposedContexts(
+    ids: number[],
+    agentSeeds: readonly string[] = [],
+  ): { agents: string[]; nonces: string[] } {
+    const placeholders = ids.length ? ids.map(() => "?").join(",") : "NULL";
     const nodes = this.db
-      .prepare<{ kind: string; identifier: string }, number[]>(`${DISCLOSURES_SQL},
+      .prepare<{ kind: string; identifier: string }, (number | string)[]>(`${DISCLOSURES_SQL},
       session_disclosed(nonce,session_id) AS (
         SELECT e.nonce,CAST(j.value AS TEXT) FROM audit_events e,json_each(e.detail,'$.sessions') j
           WHERE e.kind IN ('inject','context')
@@ -93,6 +100,7 @@ export class Lifecycle {
       ), exposed(kind,identifier) AS (
         SELECT 'caller',nonce FROM disclosed WHERE memory_id IN (${placeholders}) AND nonce IS NOT NULL
         UNION SELECT 'agent',agent_id FROM memories WHERE id IN (${placeholders}) AND agent_id IS NOT NULL
+        UNION SELECT 'agent',CAST(value AS TEXT) FROM json_each(?)
         UNION SELECT 'agent',a.agent_id FROM exposed x JOIN agent_links a
           ON x.kind='caller' AND a.nonce=x.identifier WHERE a.agent_id IS NOT NULL
         UNION SELECT 'caller',a.nonce FROM exposed x JOIN agent_links a
@@ -104,13 +112,17 @@ export class Lifecycle {
           ON x.kind='session' AND d.session_id=x.identifier WHERE d.nonce IS NOT NULL
         LIMIT 10001
       ) SELECT kind,identifier FROM exposed`)
-      .all(...ids, ...ids);
+      .all(...ids, ...ids, JSON.stringify(agentSeeds));
     if (nodes.length > 10000)
       throw new Error("Forget affects more than 10000 context graph nodes; maintenance is required.");
     return {
       agents: nodes.filter((node) => node.kind === "agent").map((node) => node.identifier),
       nonces: nodes.filter((node) => node.kind === "caller").map((node) => node.identifier),
     };
+  }
+
+  contextClosure(agentSeeds: readonly string[]): { agents: string[]; nonces: string[] } {
+    return this.exposedContexts([], agentSeeds);
   }
 
   historicalSourcesValid(ref: MemoryRef, asOf: string): boolean {
@@ -234,11 +246,14 @@ export class Lifecycle {
   erasurePlan(access: Access, id: number): { preview: ForgetPreview; nonces: string[] } {
     if (access.kind !== "owner") throw new Error("Only the owner can preview source erasure.");
     const root = this.db
-      .query<{ scope: "global" | "project"; project_key: string | null }, [number]>(
-        "SELECT scope, project_key FROM memories WHERE id = ?",
-      )
+      .query<
+        { scope: "global" | "project" | "bot"; project_key: string | null; bot_id: string | null },
+        [number]
+      >("SELECT scope, project_key, bot_id FROM memories WHERE id = ?")
       .get(id);
-    if (!root || !access.allows("delete", { scope: root.scope, projectKey: root.project_key }))
+    // Unknown legacy namespace stays owner-only, so it can still be forgotten or repaired.
+    const namespace = root ? namespaceOf(root) : null;
+    if (!root || (namespace !== null && !access.allows("delete", namespace)))
       throw new Error("Memory is unavailable.");
     // UNION deduplicates cycles. A bounded preview fails rather than silently claiming partial erasure.
     const records = this.db

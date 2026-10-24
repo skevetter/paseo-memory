@@ -8,6 +8,8 @@ Ordinary agent saves and corrections become **candidates**, excluded from search
 
 The internal `POST /v1/mutate` route and owner `memory.mutate` RPC use the same domain as the signed `memory_mutate` MCP tool. A model never supplies its authenticated principal. Existing save/update/delete tools use this domain too; delete means archive, not erasure. Automatic exact merges and owner undo use the same mutation ledger.
 
+Namespaces are global, project or bot. Ordinary signed agents receive global plus their resolved project, never implicit bot access. Managed Bridge callers use separately registered read/write grants; a write-only grant does not authorize conflict diagnostics to disclose current or historical text. A stale compare-and-swap returns content differences only when both snapshots are readable. Proposed imports remain unverified even when their source artifact resolves. See [Bridge v1](bridge-v1.md) for credentials, ownership and qualification limits.
+
 ```json
 {
   "requestId": "deployment-region-correction-1",
@@ -73,6 +75,8 @@ Migration preserves existing IDs, timestamps, namespace assignments, usage metad
 
 The v8 migration preserves existing v7 canonical snapshots byte-for-byte and retains old vector rows, generations and opaque fingerprints. Their model identity remains unknown rather than inventing a verified descriptor. New model/runtime fingerprints build separate indexes; legacy and retired indexes are not writable targets. Previously stored feedback gains no inferred validation authority or verifier.
 
-Before a write migration, Memory checks free space, writes a WAL-consistent `VACUUM INTO` backup, verifies its integrity, schema and foreign keys, and writes a private JSON report beside it. For a v7 database these are `memory.db.pre-v8-from-v7.bak` and its `.json` report; a unique suffix avoids overwriting an existing backup. Older pre-v7 backups remain separate recovery points. Backup and report failures refuse migration. The migration itself is transactional. Reopening the current v8 schema does not rewrite history or create another migration backup.
+Schema v9 adds canonical bot namespaces and authenticated Bridge persistence. Existing global/project rows retain their IDs and field values; new bot authority fields are null for those records. Canonical historical snapshots are not rewritten to manufacture bot metadata. The namespace-table replacement preserves FTS, retained vector metadata, evidence relationships and foreign keys; an invalid namespace or migration collision rolls back rather than silently widening access.
+
+Before a write migration, Memory checks free space, writes a WAL-consistent `VACUUM INTO` backup, verifies its integrity, schema and foreign keys, and writes a private JSON report beside it. For a v8 database upgrading to v9 these are `memory.db.pre-v9-from-v8.bak` and its `.json` report; a unique suffix avoids overwriting an existing backup. Older backups remain separate recovery points. Backup and report failures refuse migration. The migration itself is transactional. Reopening the current v9 schema does not rewrite history or create another migration backup.
 
 Keep the verified backup independently. An older binary refuses a newer schema. Disabling a feature does not reverse migration: rollback requires a compatible binary or restoring a verified database backup while its service is stopped. Do not replace only the main SQLite file while WAL transactions are live.

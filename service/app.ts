@@ -15,6 +15,7 @@ import {
   type ServiceStatus,
   serviceInputs,
 } from "../shared/service-api";
+import { BridgeFailure } from "./bridge-errors";
 import type { ContextTokenizer } from "./context-budget";
 import { type Embedder, loadEmbedder, TIERS } from "./embedder";
 import type { InferenceQueueOptions } from "./inference-queue";
@@ -85,6 +86,12 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     log,
     inference: options.inference,
   });
+  const bridge = store.startBridge({
+    secret,
+    dataDir: options.dataDir,
+    log,
+    tokenizers: options.contextTokenizers,
+  });
   const models = initialStates(options);
 
   let mcpUrl = "";
@@ -95,22 +102,32 @@ export async function startService(options: ServiceOptions): Promise<RunningServ
     status,
     mcpUrl: () => mcpUrl,
     tokenizers: options.contextTokenizers,
+    bridge,
   });
   const mcp = createMcpHandler({
     secret,
     instructions: MCP_INSTRUCTIONS,
     serverVersion: SERVICE_VERSION,
+    authorizeCaller: (caller) => bridge.authorizeMcp(caller),
     resolveCaller: (caller) => resolveCaller(store, caller),
     tools: createTools({
       store,
       resolveProject: (caller) => callerProject(store, caller.projectKey),
       tokenizers: options.contextTokenizers,
+      bridge,
     }),
   });
   const internal = createInternalHandler(routes, serviceKey(secret), log);
-  const server = serve(options.port, { mcp, internal, log });
+  const server = serve(options.port, { mcp, internal, bridge: (request) => bridge.handle(request), log });
   const port = server.port ?? options.port;
   mcpUrl = `http://127.0.0.1:${port}/mcp`;
+  try {
+    bridge.endpoint(mcpUrl);
+  } catch (error) {
+    await server.stop(true);
+    store.close();
+    throw error;
+  }
 
   const pruneTimer = startPruning(store, options.sessionRetentionDays ?? 30, log);
   // Models load after the server is listening so keyword search serves requests meanwhile.
@@ -197,7 +214,10 @@ function resolveCaller(store: MemoryStore, caller: Caller): Caller {
 type Handler = (req: Request) => Promise<Response>;
 
 // A port held by another program needs a settings change, so it is fatal rather than a crash loop.
-function serve(port: number, handlers: { mcp: Handler; internal: Handler; log: Logger }): Server<undefined> {
+function serve(
+  port: number,
+  handlers: { mcp: Handler; internal: Handler; bridge: Handler; log: Logger },
+): Server<undefined> {
   try {
     return Bun.serve({
       hostname: "127.0.0.1",
@@ -206,6 +226,7 @@ function serve(port: number, handlers: { mcp: Handler; internal: Handler; log: L
         const path = new URL(req.url).pathname;
         if (path === "/health") return Response.json({ ok: true });
         if (path === "/mcp") return handlers.mcp(req);
+        if (path.startsWith("/bridge/")) return handlers.bridge(req);
         if (path.startsWith("/v1/")) return handlers.internal(req);
         return Response.json({ error: "not found" }, { status: 404 });
       },
@@ -240,6 +261,11 @@ function createInternalHandler(routes: Routes, key: string, log: Logger): Handle
 }
 
 function internalErrorResponse(error: unknown, route: ServiceRoute, log: Logger): Response {
+  if (error instanceof BridgeFailure)
+    return Response.json(
+      { error: { code: error.bridgeCode, message: error.message, retryable: error.retryable } },
+      { status: error.status },
+    );
   if (!(error instanceof MutationError)) {
     log.error(`${route} failed: ${errorText(error)}`);
     return Response.json({ error: errorText(error) }, { status: 500 });

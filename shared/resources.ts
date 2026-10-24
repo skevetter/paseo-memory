@@ -100,7 +100,7 @@ export const FeedbackInputSchema = z
     memoryRef: MemoryRefSchema,
     signal: z.enum(["applied", "helpful", "harmful", "irrelevant"]),
     basis: z.enum(["validator", "human", "agent_report"]),
-    evidenceRefs: z.array(identifier).max(16).default([]),
+    evidenceRefs: z.array(identifier).max(32).default([]),
     verifierId: optionalIdentifier,
     verifierVersion: optionalIdentifier,
     runId: optionalIdentifier,

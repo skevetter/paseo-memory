@@ -2,7 +2,14 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { type Evidence, type EvidenceInput, EvidenceInputSchema } from "../shared/lifecycle";
-import type { Access, Namespace } from "./access";
+import {
+  type MemoryNamespace,
+  namespaceColumns,
+  namespaceOf,
+  type Scope,
+  sameNamespace,
+} from "../shared/namespaces";
+import type { Access } from "./access";
 import { currentLifecycleSql, sourceRevisionsSql } from "./lifecycle";
 import { MutationError } from "./mutations";
 import { redact } from "./redact";
@@ -14,8 +21,9 @@ const EXCERPT_MAX_CHARS = 500;
 const RevisionSnapshotSchema = z.object({
   title: z.string(),
   content: z.string(),
-  scope: z.enum(["global", "project"]).optional(),
+  scope: z.enum(["global", "project", "bot"]).optional(),
   project_key: z.string().nullable().optional(),
+  bot_id: z.string().nullable().optional(),
   updated_at: z.string().optional(),
 });
 
@@ -25,7 +33,8 @@ interface EvidenceSupport {
 const UNBOUNDED_SUPPORT: EvidenceSupport = Object.freeze({ validUntil: null });
 
 type MemorySource = { id: number; revision: number };
-type Source = Namespace & {
+type Source = {
+  namespace: MemoryNamespace | null;
   hash: string;
   content: string;
   allowExcerpt: boolean;
@@ -42,14 +51,16 @@ type EvidenceRow = {
   status: "resolved" | "unresolved";
   reason: string | null;
   excerpt: string | null;
-  scope: "global" | "project";
+  scope: Scope;
   project_key: string | null;
+  namespace_bot_id: string | null;
 };
 type ArtifactRow = {
   content: string;
   source_hash: string;
-  scope: "global" | "project";
+  scope: Scope;
   project_key: string | null;
+  bot_id: string | null;
   allow_excerpt: number;
   source_event_at: string | null;
 };
@@ -72,12 +83,14 @@ export class Provenance {
       tombstoned ? "source_forgotten" : "source_unavailable",
     );
     if (source) resolveSource(evidence, source, parsed, storedAt);
+    const stored = storedNamespace(source?.namespace ?? null);
     this.db
       .query(
         `INSERT INTO memory_evidence
           (evidence_id, source_kind, source_ref, source_hash, observed_at, source_event_at, stored_at,
-           actor_id, agent_id, bot_id, run_id, cycle_id, excerpt, sensitivity, status, reason, scope, project_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'private', ?, ?, ?, ?)`,
+           actor_id, agent_id, bot_id, run_id, cycle_id, excerpt, sensitivity, status, reason, scope, project_key,
+           namespace_bot_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'private', ?, ?, ?, ?, ?)`,
       )
       .run(
         evidence.evidenceId,
@@ -91,8 +104,9 @@ export class Provenance {
         evidence.excerpt,
         evidence.status,
         evidence.reason,
-        source?.scope ?? "project",
-        source?.projectKey ?? null,
+        stored.scope,
+        stored.project_key,
+        stored.namespace_bot_id,
       );
     return evidence;
   }
@@ -116,7 +130,27 @@ export class Provenance {
   currentSupport(evidence: Evidence): EvidenceSupport | null {
     if (evidence.status !== "resolved") return null;
     if (evidence.sourceKind !== "memory") return UNBOUNDED_SUPPORT;
-    const match = /^memory:(\d+)@(\d+)$/.exec(evidence.sourceRef);
+    return this.memorySupport(evidence.sourceRef);
+  }
+
+  currentSource(
+    access: Access,
+    kind: EvidenceInput["sourceKind"],
+    ref: string,
+  ): (EvidenceSupport & { readonly sourceHash: string }) | null {
+    if (this.sourceTombstoned(ref)) return null;
+    if (kind === "artifact" && !ARTIFACT_REF.test(ref)) return null;
+    const source = this.readSource(access, kind, ref);
+    if (!source) return null;
+    const support = kind === "memory" ? this.memorySupport(ref) : UNBOUNDED_SUPPORT;
+    return support ? { ...support, sourceHash: source.hash } : null;
+  }
+  sourceReadable(access: Access, kind: EvidenceInput["sourceKind"], ref: string): boolean {
+    return !this.sourceTombstoned(ref) && this.readSource(access, kind, ref) !== null;
+  }
+
+  private memorySupport(ref: string): EvidenceSupport | null {
+    const match = /^memory:(\d+)@(\d+)$/.exec(ref);
     if (!match) return null;
     const id = Number(match[1]);
     const revision = Number(match[2]);
@@ -144,8 +178,9 @@ export class Provenance {
     input: {
       sourceRef: string;
       content: string;
-      scope: "global" | "project";
+      scope: Scope;
       projectKey: string | null;
+      botId?: string | null;
       allowExcerpt: boolean;
       sourceEventAt?: string;
     },
@@ -156,15 +191,13 @@ export class Provenance {
       throw new MutationError("invalid_input", "Invalid artifact source reference");
     if (Buffer.byteLength(input.content, "utf8") > ARTIFACT_MAX_BYTES)
       throw new MutationError("invalid_input", "Artifact exceeds 16 KiB");
-    if (
-      (input.scope !== "global" && input.scope !== "project") ||
-      (input.scope === "global" && input.projectKey !== null) ||
-      (input.scope === "project" && (!input.projectKey || typeof input.projectKey !== "string")) ||
-      typeof input.allowExcerpt !== "boolean"
-    ) {
+    const botId = input.botId ?? null;
+    const namespace = namespaceOf({ scope: input.scope, project_key: input.projectKey, bot_id: botId });
+    if (namespace === null || typeof input.allowExcerpt !== "boolean") {
       throw new MutationError("invalid_input", "Invalid artifact namespace or excerpt policy");
     }
     if (input.sourceEventAt !== undefined) EvidenceInputSchema.shape.sourceEventAt.parse(input.sourceEventAt);
+    const columns = namespaceColumns(namespace);
     const sourceHash = sha256(input.content);
     this.db.transaction(() => {
       if (this.sourceTombstoned(input.sourceRef))
@@ -173,11 +206,12 @@ export class Provenance {
         .query<ArtifactRow, [string]>(`SELECT * FROM source_artifacts WHERE source_ref = ?`)
         .get(input.sourceRef);
       if (prior) {
+        const priorNamespace = namespaceOf(prior);
         if (
           prior.content !== input.content ||
           prior.source_hash !== sourceHash ||
-          prior.scope !== input.scope ||
-          prior.project_key !== input.projectKey ||
+          priorNamespace === null ||
+          !sameNamespace(priorNamespace, namespace) ||
           prior.allow_excerpt !== Number(input.allowExcerpt) ||
           prior.source_event_at !== (input.sourceEventAt ?? null)
         ) {
@@ -191,15 +225,16 @@ export class Provenance {
       this.db
         .query(
           `INSERT INTO source_artifacts
-            (source_ref, content, source_hash, scope, project_key, allow_excerpt, source_event_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (source_ref, content, source_hash, scope, project_key, bot_id, allow_excerpt, source_event_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.sourceRef,
           input.content,
           sourceHash,
-          input.scope,
-          input.projectKey,
+          columns.scope,
+          columns.project_key,
+          columns.bot_id,
           Number(input.allowExcerpt),
           input.sourceEventAt ?? null,
           this.now(),
@@ -226,12 +261,13 @@ export class Provenance {
     const row = this.db
       .query<ArtifactRow, [string]>(`SELECT * FROM source_artifacts WHERE source_ref = ?`)
       .get(sourceRef);
-    if (!row || !access.allows("read", { scope: row.scope, projectKey: row.project_key })) return null;
+    if (!row) return null;
+    const namespace = namespaceOf(row);
+    if (!canRead(access, namespace)) return null;
     const hash = sha256(row.content);
     if (hash !== row.source_hash) return null;
     return {
-      scope: row.scope,
-      projectKey: row.project_key,
+      namespace,
       hash,
       content: row.content,
       allowExcerpt: row.allow_excerpt === 1,
@@ -241,7 +277,7 @@ export class Provenance {
 
   private visibleEvidence(access: Access, row: EvidenceRow): Evidence | null {
     if (this.sourceTombstoned(row.source_ref)) return null;
-    if (!access.allows("read", { scope: row.scope, projectKey: row.project_key })) return null;
+    if (!canRead(access, evidenceNamespace(row))) return null;
     const source = this.readSource(access, row.source_kind, row.source_ref);
     const evidence = fromRow(row);
     // Owners can inspect failed citations, but old excerpts never survive loss of their source.
@@ -267,13 +303,13 @@ export class Provenance {
     if (!ref) return null;
     const current = this.db
       .query<
-        { scope: "global" | "project"; project_key: string | null; deleted_at: string | null },
+        { scope: Scope; project_key: string | null; bot_id: string | null; deleted_at: string | null },
         [number]
-      >(`SELECT scope, project_key, deleted_at FROM memories WHERE id = ?`)
+      >(`SELECT scope, project_key, bot_id, deleted_at FROM memories WHERE id = ?`)
       .get(ref.id);
     if (!current || current.deleted_at !== null) return null;
-    const namespace = { scope: current.scope, projectKey: current.project_key };
-    if (!access.allows("read", namespace)) return null;
+    const namespace = namespaceOf(current);
+    if (!canRead(access, namespace)) return null;
     const revision = this.db
       .query<{ snapshot: string; legacy_metadata_unknown: number }, [number, number]>(
         `SELECT snapshot, legacy_metadata_unknown FROM memory_revisions WHERE memory_id = ? AND revision = ?`,
@@ -284,7 +320,7 @@ export class Provenance {
     if (!record || !historicalSourceAllowed(access, record, revision.legacy_metadata_unknown)) return null;
     const content = `${record.title}\n${record.content}`;
     return {
-      ...namespace,
+      namespace,
       hash: sha256(content),
       content,
       allowExcerpt: true,
@@ -325,17 +361,37 @@ function memorySource(sourceRef: string): MemorySource | null {
   return Number.isSafeInteger(id) && Number.isSafeInteger(revision) ? { id, revision } : null;
 }
 
-function snapshotNamespace(record: Record<string, unknown>): Namespace | null {
-  if (record.scope === "global" && record.project_key === null) return { scope: "global", projectKey: null };
-  if (record.scope === "project" && typeof record.project_key === "string" && record.project_key.length > 0) {
-    return { scope: "project", projectKey: record.project_key };
-  }
-  return null;
+function snapshotNamespace(record: z.infer<typeof RevisionSnapshotSchema>): MemoryNamespace | null {
+  // Absent scope or project_key is unknown legacy metadata, never an implicit global.
+  if (record.scope === undefined || record.project_key === undefined) return null;
+  return namespaceOf({ scope: record.scope, project_key: record.project_key, bot_id: record.bot_id ?? null });
+}
+
+// Unknown namespaces stay owner-only: repair and inspection remain possible without a scoped grant.
+function canRead(access: Access, namespace: MemoryNamespace | null): boolean {
+  if (namespace === null) return access.kind === "owner";
+  return access.allows("read", namespace);
+}
+
+// Evidence namespace comes from canonical namespace_bot_id; the producer bot_id is provenance only.
+function evidenceNamespace(row: EvidenceRow): MemoryNamespace | null {
+  return namespaceOf({ scope: row.scope, project_key: row.project_key, bot_id: row.namespace_bot_id });
+}
+
+// Unresolved or inaccessible sources store the project/null/null sentinel so no namespace is inferred.
+function storedNamespace(namespace: MemoryNamespace | null): {
+  scope: Scope;
+  project_key: string | null;
+  namespace_bot_id: string | null;
+} {
+  if (namespace === null) return { scope: "project", project_key: null, namespace_bot_id: null };
+  const columns = namespaceColumns(namespace);
+  return { scope: columns.scope, project_key: columns.project_key, namespace_bot_id: columns.bot_id };
 }
 
 function historicalSourceAllowed(
   access: Access,
-  record: Record<string, unknown>,
+  record: z.infer<typeof RevisionSnapshotSchema>,
   legacyUnknown: number,
 ): boolean {
   const historical = snapshotNamespace(record);

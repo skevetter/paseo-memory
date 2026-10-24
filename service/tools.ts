@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { type MutationRequest, MutationRequestSchema } from "../shared/lifecycle";
+import { type MemoryNamespace, MemoryScopeSchema, namespaceOf, type Scope } from "../shared/namespaces";
 import { RetrievalRequestSchema, type RetrievalResult } from "../shared/retrieval";
-import { MAX_CONTENT_CHARS, MEMORY_TYPES } from "../shared/service-api";
+import { MAX_CONTENT_CHARS, MEMORY_TYPES, SearchScopeSchema } from "../shared/service-api";
 import { Access } from "./access";
 import { retrievalAudit, retrievalScore } from "./audit";
+import type { MemoryBridge } from "./bridge";
 import { candidateContextEntry, retrieveContext } from "./context";
 import type { ContextTokenizer } from "./context-budget";
 import { type Caller, type ToolDefinition, ToolError, type ToolOutput, type ToolRequest } from "./mcp";
@@ -27,6 +29,7 @@ export interface ToolContext {
   store: MemoryStore;
   resolveProject(caller: Caller): ProjectRef | null;
   tokenizers?: ReadonlyMap<string, ContextTokenizer>;
+  bridge?: MemoryBridge;
 }
 
 const MAX_TITLE_CHARS = 200;
@@ -44,7 +47,7 @@ const retrievalOptions = RetrievalRequestSchema.omit({ ids: true, query: true })
 
 const searchInput = z.strictObject({
   query: z.string().max(MAX_QUERY_CHARS).describe("What to look for."),
-  scope: z.enum(["all", "project", "global"]).optional(),
+  scope: SearchScopeSchema.optional(),
   type: memoryType.optional(),
   limit: z.number().int().min(1).max(25).optional(),
   include_sessions: z.boolean().optional().describe("Also search recent agent session digests."),
@@ -60,7 +63,8 @@ const saveInput = z.strictObject({
   title: title.describe("Short, searchable title."),
   content: content.describe("What / Why / Where / Learned, under 800 characters."),
   type: memoryType.optional(),
-  scope: z.enum(["project", "global"]).optional(),
+  scope: MemoryScopeSchema.optional(),
+  bot_id: z.string().min(1).max(200).optional(),
   topic_key: topicKey.optional().describe("Stable key, e.g. 'auth/token-refresh'."),
   pinned: z.boolean().optional().describe("Pinned memories are injected into every new agent."),
   force: z.boolean().optional().describe("Save even when a similar memory exists."),
@@ -104,6 +108,7 @@ interface InvocationRequest extends ToolRequest {
   admissionAttempted: boolean;
   principalId: string;
   auditNonce: string;
+  principal: MutationPrincipal;
 }
 
 interface ToolSpec<S extends z.ZodType> {
@@ -126,28 +131,61 @@ function defineTool<S extends z.ZodType>(ctx: ToolContext, spec: ToolSpec<S>): T
     description: spec.description,
     inputSchema,
     async handler(raw, caller, request) {
-      const principalId = callerPrincipalId(caller);
-      const invocation = {
-        ...request,
-        admissionAttempted: false,
-        principalId,
-        auditNonce: caller.nonce ?? principalId,
-      };
+      const fallbackId = callerPrincipalId(caller);
+      let invocation: InvocationRequest | undefined;
       try {
+        if (caller.bridge && !ctx.bridge)
+          throw new ToolError("unavailable", "Bridge authority is unavailable.");
+        const principal =
+          ctx.bridge?.principal(caller, spec.name, fallbackId) ??
+          agentPrincipal(caller, Access.agent(caller.projectKey), fallbackId);
+        invocation = {
+          ...request,
+          admissionAttempted: false,
+          principalId: principal.id,
+          principal,
+          auditNonce: caller.nonce ?? principal.id,
+        };
         authorizeInvocation(ctx, caller, invocation);
         const args = parseArguments(ctx, spec, raw, invocation.auditNonce);
-        return await spec.run(args, caller, Access.agent(caller.projectKey), invocation);
+        return await spec.run(args, caller, principal.access, invocation);
       } catch (error) {
-        const failure = MUTATION_TOOLS[spec.name]
-          ? mutationFailure(ctx, caller, { tool: spec.name, raw, request: invocation, error })
-          : error;
-        throw toolError(failure);
+        throw invocationFailure(ctx, {
+          tool: spec.name,
+          raw,
+          caller,
+          request: invocation,
+          fallbackId,
+          error,
+        });
       }
     },
   };
 }
 
+function invocationFailure(
+  ctx: ToolContext,
+  input: {
+    tool: string;
+    raw: unknown;
+    caller: Caller;
+    request: InvocationRequest | undefined;
+    fallbackId: string;
+    error: unknown;
+  },
+): unknown {
+  const { tool, raw, caller, request, fallbackId, error } = input;
+  if (!request) {
+    if (MUTATION_TOOLS[tool] && error instanceof ToolError && error.code === "scope_denied")
+      auditDeniedMutation(ctx, caller.nonce ?? fallbackId, tool, raw);
+    return toolError(error);
+  }
+  const failure = MUTATION_TOOLS[tool] ? mutationFailure(ctx, caller, { tool, raw, request, error }) : error;
+  return toolError(failure);
+}
+
 function authorizeInvocation(ctx: ToolContext, caller: Caller, invocation: InvocationRequest): void {
+  invocation.principal.assertCurrent?.();
   if (
     ctx.store.lifecycle.contextInvalidated({
       nonce: invocation.auditNonce,
@@ -186,8 +224,9 @@ function mutationFailure(
   input: { tool: string; raw: unknown; request: InvocationRequest; error: unknown },
 ): unknown {
   const { tool, raw, request, error } = input;
-  if (error instanceof MutationError && error.code === "context_invalidated") return error;
-  if (error instanceof MutationError && error.code === "scope_denied") {
+  if ((error instanceof MutationError || error instanceof ToolError) && error.code === "context_invalidated")
+    return error;
+  if ((error instanceof MutationError || error instanceof ToolError) && error.code === "scope_denied") {
     auditDeniedMutation(ctx, request.auditNonce, tool, raw);
   }
   if (request.admissionAttempted) return error;
@@ -335,10 +374,11 @@ function searchTool(ctx: ToolContext): ToolDefinition {
     description:
       "Search authorized current memory within owner budgets. Compact references and structured retrieval diagnostics are returned; request an owner-allowed richer profile for more detail.",
     schema: searchInput,
-    async run(args, caller, _access, request) {
+    async run(args, caller, access, request) {
       const scope = args.scope ?? "all";
       const result = await retrieveContext({
         store: ctx.store,
+        access,
         project: ctx.resolveProject(caller),
         mode: "search",
         scope,
@@ -400,9 +440,10 @@ function getTool(ctx: ToolContext): ToolDefinition {
         ids: ctx.store.deniedIds(access, args.ids),
       });
       const candidates = new Map<number, CandidateRead>();
-      const principal = agentPrincipal(caller, access, request.principalId);
+      const principal = request.principal;
       const result = await retrieveContext({
         store: ctx.store,
+        access,
         project: ctx.resolveProject(caller),
         mode: "get",
         signal: request.signal,
@@ -476,7 +517,6 @@ function legacyRequestId(tool: string, args: unknown, request: ToolRequest, expl
 
 interface MutationCall {
   caller: Caller;
-  access: Access;
   request: InvocationRequest;
   tool: string;
   kind: ReviewOpKind;
@@ -484,8 +524,8 @@ interface MutationCall {
 }
 
 function runMutation(ctx: ToolContext, call: MutationCall): Promise<string> | string {
-  const { caller, access, request, tool, kind, mutation } = call;
-  const principal = agentPrincipal(caller, access, request.principalId);
+  const { caller, request, tool, kind, mutation } = call;
+  const principal = request.principal;
   const parsed = MutationRequestSchema.parse(mutation);
   // Replays remain readable even when a new review has no capacity.
   const prior = ctx.store.mutations.replay(principal, parsed);
@@ -532,7 +572,7 @@ function legacySaveTarget(
   ctx: ToolContext,
   args: z.output<typeof saveInput>,
   principal: MutationPrincipal,
-  input: { requestId: string; scope: "global" | "project"; project: ProjectRef | null },
+  input: { requestId: string; scope: Scope; project: ProjectRef | null; botId: string | null },
 ): Pick<MutationRequest, "operation" | "id" | "expectedRevision"> {
   const previous = ctx.store.mutations.compatibilityRequest(principal, input.requestId);
   if (previous)
@@ -544,12 +584,13 @@ function legacySaveTarget(
         }
       : { operation: "create" };
   if (!args.topic_key) return { operation: "create" };
-  const holder = ctx.store.authorizedTopic(
-    principal.access,
-    input.scope,
-    input.scope === "project" ? (input.project?.key ?? null) : null,
-    args.topic_key,
-  );
+  const namespace = namespaceOf({
+    scope: input.scope,
+    project_key: input.project?.key ?? null,
+    bot_id: input.botId,
+  });
+  if (!namespace) throw new MutationError("scope_denied", "Memory namespace is unavailable.");
+  const holder = ctx.store.authorizedTopic(principal.access, namespace, args.topic_key);
   if (!holder) return { operation: "create" };
   return {
     operation: "update",
@@ -566,20 +607,15 @@ function saveTool(ctx: ToolContext): ToolDefinition {
       "Use topic_key to correct an existing topic with expected_revision; request_id makes retries idempotent. " +
       "User preferences require owner approval.",
     schema: saveInput,
-    run(args, caller, access, request) {
+    run(args, caller, _access, request) {
       assertContentLimit(args.content);
-      const project = ctx.resolveProject(caller);
-      const scope = args.scope === "global" ? "global" : "project";
-      if (scope === "project" && !project)
-        throw new MutationError(
-          "scope_denied",
-          "This agent has no resolved project. Use scope=global or skip.",
-        );
+      const { scope, project, botId } = saveNamespace(ctx, caller, args, request.principal.defaultNamespace);
       const requestId = legacyRequestId("memory_save", args, request, args.request_id);
-      const target = legacySaveTarget(ctx, args, agentPrincipal(caller, access, request.principalId), {
+      const target = legacySaveTarget(ctx, args, request.principal, {
         requestId,
         scope,
         project,
+        botId,
       });
       const mutation: MutationRequest = {
         requestId,
@@ -590,13 +626,28 @@ function saveTool(ctx: ToolContext): ToolDefinition {
           type: args.type ?? "note",
           scope,
           project,
+          botId,
           topicKey: args.topic_key,
           pinned: args.pinned ?? false,
         },
       };
-      return runMutation(ctx, { caller, access, request, tool: "memory_save", kind: "save", mutation });
+      return runMutation(ctx, { caller, request, tool: "memory_save", kind: "save", mutation });
     },
   });
+}
+
+function saveNamespace(
+  ctx: ToolContext,
+  caller: Caller,
+  args: z.output<typeof saveInput>,
+  trusted: MemoryNamespace | undefined,
+) {
+  const scope = args.scope ?? trusted?.kind ?? "project";
+  const project = scope === "project" ? ctx.resolveProject(caller) : null;
+  const botId = args.bot_id ?? (scope === "bot" && trusted?.kind === "bot" ? trusted.botId : null);
+  if (scope === "project" && !project)
+    throw new MutationError("scope_denied", "This agent has no resolved project. Use scope=global or skip.");
+  return { scope, project, botId };
 }
 
 function updateTool(ctx: ToolContext): ToolDefinition {
@@ -609,13 +660,9 @@ function updateTool(ctx: ToolContext): ToolDefinition {
     run(args, caller, access, request) {
       assertContentLimit(args.content);
       const requestId = legacyRequestId("memory_update", args, request, args.request_id);
-      const previous = ctx.store.mutations.compatibilityRequest(
-        agentPrincipal(caller, access, request.principalId),
-        requestId,
-      );
+      const previous = ctx.store.mutations.compatibilityRequest(request.principal, requestId);
       return runMutation(ctx, {
         caller,
-        access,
         request,
         tool: "memory_update",
         kind: "update",
@@ -645,13 +692,9 @@ function deleteTool(ctx: ToolContext): ToolDefinition {
     schema: deleteInput,
     run(args, caller, access, request) {
       const requestId = legacyRequestId("memory_delete", args, request, args.request_id);
-      const previous = ctx.store.mutations.compatibilityRequest(
-        agentPrincipal(caller, access, request.principalId),
-        requestId,
-      );
+      const previous = ctx.store.mutations.compatibilityRequest(request.principal, requestId);
       return runMutation(ctx, {
         caller,
-        access,
         request,
         tool: "memory_delete",
         kind: "delete",
@@ -674,14 +717,14 @@ function mutateTool(ctx: ToolContext): ToolDefinition {
       "Apply an evidence-backed lifecycle mutation. Supply a stable requestId and expectedRevision " +
       "for an existing record. Unsupported assertions remain candidates; promotion and preferences require owner authority.",
     schema: MutationRequestSchema,
-    run(args, caller, access, request) {
+    run(args, caller, _access, request) {
       const kind =
         args.operation === "create" || args.operation === "propose"
           ? "save"
           : args.operation === "archive" || args.operation === "forget"
             ? "delete"
             : "update";
-      return runMutation(ctx, { caller, access, request, tool: "memory_mutate", kind, mutation: args });
+      return runMutation(ctx, { caller, request, tool: "memory_mutate", kind, mutation: args });
     },
   });
 }
@@ -692,9 +735,10 @@ function contextTool(ctx: ToolContext): ToolDefinition {
     description:
       "Retrieve an owner-budgeted project/global context bundle. Query or explicit IDs take bounded fast paths; request only an owner-allowed profile. Metadata reports references, counts, omissions and fallback.",
     schema: contextInput,
-    async run(args, caller, _access, request) {
+    async run(args, caller, access, request) {
       const context = await retrieveContext({
         store: ctx.store,
+        access,
         project: ctx.resolveProject(caller),
         request: args,
         excludeAgentId: caller.agentId,

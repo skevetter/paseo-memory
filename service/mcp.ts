@@ -1,4 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import { type BridgeToolClaim, BridgeToolClaimSchema } from "../shared/bridge";
 import { SERVICE_VERSION } from "./version";
 
 /** A failure the model can act on: a stable machine-readable code plus a short message. */
@@ -37,6 +39,7 @@ export interface Caller {
   agentId: string | null;
   provider: string | null;
   nonce: string | null;
+  bridge?: BridgeToolClaim;
 }
 
 export interface McpOptions {
@@ -46,6 +49,7 @@ export interface McpOptions {
   serverName?: string;
   serverVersion?: string;
   resolveCaller?: (caller: Caller) => Caller;
+  authorizeCaller?: (caller: Caller) => void;
 }
 
 interface JsonRpcRequest {
@@ -84,14 +88,18 @@ export function verifyCaller(secret: string, header: string | null | undefined):
 function parseCaller(payload: string): Caller | null {
   try {
     const parsed: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    const fields: Partial<Record<keyof Caller, unknown>> = parsed;
+    const record = z.record(z.string(), z.unknown()).safeParse(parsed);
+    if (!record.success) return null;
+    const fields = record.data;
+    const bridge = fields.bridge === undefined ? null : BridgeToolClaimSchema.safeParse(fields.bridge);
+    if (bridge && !bridge.success) return null;
     const text = (value: unknown) => (typeof value === "string" ? value : null);
     return {
       projectKey: text(fields.projectKey),
       agentId: text(fields.agentId),
       provider: text(fields.provider),
       nonce: text(fields.nonce),
+      ...(bridge?.success ? { bridge: bridge.data } : {}),
     };
   } catch {
     return null;
@@ -244,9 +252,21 @@ export function createMcpHandler(options: McpOptions): (req: Request) => Promise
     const verified = preflight(req, options.secret);
     if (verified instanceof Response) return verified;
     const caller = options.resolveCaller ? options.resolveCaller(verified) : verified;
+    const unauthorized = authorizeCaller(options, caller);
+    if (unauthorized) return unauthorized;
     const message = parseBody(await req.text());
     if (message instanceof Response) return message;
     const batch = Array.isArray(message) ? message : [message];
     return respond(message, await collectResponses(methods, batch, caller, req.signal));
   };
+}
+
+function authorizeCaller(options: McpOptions, caller: Caller): Response | null {
+  try {
+    options.authorizeCaller?.(caller);
+    return null;
+  } catch (error) {
+    if (!(error instanceof ToolError)) throw error;
+    return Response.json({ error: { code: error.code, message: error.message } }, { status: 403 });
+  }
 }

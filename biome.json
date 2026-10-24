@@ -18,6 +18,12 @@
     }
   },
   "assist": { "enabled": true, "actions": { "source": { "organizeImports": "on" } } },
+  "overrides": [
+    {
+      "includes": ["tests/fixtures/bridge-v1/contract.json"],
+      "formatter": { "enabled": false }
+    }
+  ],
   "linter": {
     "enabled": true,
     "rules": {

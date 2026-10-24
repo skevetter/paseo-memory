@@ -6,12 +6,13 @@ import { MAX_CONTENT_CHARS, type MemoryItem, saveMemoryRpc, searchMemoriesRpc } 
 import { formatDate, plural, QUERY_ROOT, type Styles, useRefresh } from "./panel-styles";
 import { Chip, QueryState } from "./panel-ui";
 
-type Scope = "all" | "project" | "global";
+type Scope = "all" | "project" | "global" | "bot";
 
 const SCOPES: readonly { value: Scope; label: string }[] = [
   { value: "all", label: "All" },
   { value: "project", label: "Project" },
   { value: "global", label: "Global" },
+  { value: "bot", label: "Bot" },
 ];
 
 const SHOW_REMAINING_WITHIN = 500;
@@ -74,12 +75,18 @@ export function MemoriesTab({ projectId, projectName, onOpenMemory, s }: Memorie
 }
 
 export function cardMeta(item: MemoryItem): string {
-  const where = item.scope === "global" ? "global" : (item.projectName ?? "project");
+  const where = cardWhere(item);
   const label = item.kind === "session" ? "session" : `#${item.id} · ${item.type}`;
   const parts = [label, where, formatDate(item.updatedAt)];
   if (item.pinned) parts.push("pinned");
   if (item.useCount > 0) parts.push(`legacy activity ${item.useCount}`);
   return parts.join(" · ");
+}
+
+function cardWhere(item: MemoryItem): string {
+  if (item.scope === "global") return "global";
+  if (item.scope === "bot") return item.botId ? `bot ${item.botId}` : "bot";
+  return item.projectName ?? "project";
 }
 
 interface MemoryCardProps {

@@ -26,6 +26,8 @@ Examples:
 
 Use this shape directly with `memory_context`. Search takes `query` at the top level and these profile/detail/budget options under `retrieval`; get takes `ids` at the top level and options under `retrieval`. Search's optional scope/type filters only narrow the signed caller's namespace. Unknown authority fields are rejected. Requesting `evidence` without the owner grant returns `scope_denied`.
 
+Bot namespaces require explicit [Bridge v1](bridge-v1.md) read grants. Ordinary global/project callers cannot retrieve bot rows, evidence or session-derived copies through scope filters or ID guesses. Owner bot filters may list all bot namespaces; a scoped controller's filters never widen its registered namespaces. Bridge context supports explicit historical `asOf` reads with both current and historical authorization, not a claim that old content is currently true.
+
 ## Measurement and assembly
 
 The budget measures the actual serialized context: headings, delimiters, escaped source text, canonical references, evidence citations, tool instructions, owner instructions and omitted-pin notices. Compact content is clipped at Unicode-safe boundaries; whole entries are then selected within all applicable token, character, byte and item limits. No evidence produces an empty fragment, not filler.

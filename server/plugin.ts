@@ -41,6 +41,7 @@ import { createLogger, type Logger } from "../shared/log";
 import { reviewPrompt, reviewPromptDisplay } from "../shared/review";
 import { NONCE_ENV, type ProjectRef, type ServiceOutputs } from "../shared/service-api";
 import { isUsableReply } from "../shared/turns";
+import { NativeBridgeHooks } from "./bridge";
 import { digestLatestTurn, type TurnDigest } from "./capture";
 import { FirstPrompts } from "./first-prompts";
 import type { PaseoAgent, PaseoApi } from "./host-types";
@@ -110,6 +111,7 @@ interface PluginState {
   links: AgentLinks;
   firstPrompts: FirstPrompts;
   reviews: ReviewScheduler;
+  bridge: NativeBridgeHooks;
   // Paseo gives plugins one API client per process, so a handle from any hook stays valid for timers.
   paseo: PaseoApi | null;
   log: Logger;
@@ -149,6 +151,13 @@ function createState(): PluginState {
     paseo: null,
     links: new AgentLinks(),
     firstPrompts: new FirstPrompts(),
+    bridge: new NativeBridgeHooks({
+      dataDir: dataDir(),
+      supervisor: () => state.supervisor,
+      enabled: () => state.settings.bridge.enabled,
+      injectTools: () => state.settings.injectMcp,
+      deniedProviders: () => state.settings.mcpDenyProviders,
+    }),
     supervisor: new ServiceSupervisor({
       dataDir: dataDir(),
       paseoHome: paseoHome(),
@@ -196,6 +205,8 @@ function registerHooks(server: PluginServerContext, state: PluginState): void {
 
   server.before("agent.create", async ({ request }, { paseo }) => {
     state.paseo = paseo;
+    // Managed creation is deliberately outside the standalone fail-open injection path.
+    if (state.bridge.bootstrap(request)) return state.bridge.create(request, CREATE_HOOK_BUDGET_MS);
     const delivery: InjectionDelivery = {
       expired: false,
       deadline: Date.now() + CREATE_HOOK_BUDGET_MS,
@@ -213,7 +224,12 @@ function registerHooks(server: PluginServerContext, state: PluginState): void {
     }
   });
 
-  server.before("agent.session_open", ({ request }) => {
+  server.before("agent.session_open", async ({ request }) => {
+    if (request.purpose === "history") return state.bridge.history(request);
+    if (state.bridge.managed(request.agentId)) {
+      state.reviews.forget(request.agentId);
+      return state.bridge.open(request, CREATE_HOOK_BUDGET_MS);
+    }
     const nonce = request.reason === "create" ? request.env[NONCE_ENV] : undefined;
     if (!nonce) return;
     state.links.claim(nonce, request.agentId);
@@ -227,6 +243,7 @@ function registerHooks(server: PluginServerContext, state: PluginState): void {
 
   server.on("agent.archived", async (event) => {
     state.reviews.forget(event.agent.id);
+    if (state.bridge.managed(event.agent.id)) return;
     await state.supervisor
       .call("end-session", { agentId: event.agent.id }, RPC_TIMEOUT_MS)
       .catch((error: unknown) => state.log.warn(`session end failed: ${String(error)}`));
@@ -245,14 +262,19 @@ function registerTurnHooks(server: PluginServerContext, state: PluginState): voi
   server.on("agent.turn_started", (event, { paseo }) => {
     state.paseo = paseo;
     state.reviews.turnStarted(event.agent.id);
+    if (state.bridge.managed(event.agent.id)) state.reviews.forget(event.agent.id);
   });
   server.on("agent.turn_ended", async (event, { paseo }) => {
     state.paseo = paseo;
     const turnKey = await recordNativeTurn(state, event);
+    if (state.bridge.managed(event.agent.id)) {
+      state.reviews.forget(event.agent.id);
+      return;
+    }
     await linkByMatch(state, event.agent);
     if (turnKey && !firstSighting(seenTurns, turnKey)) return;
     const digest = digestLatestTurn(event.timeline);
-    if (digest.userText !== null && reviewPromptDisplay(digest.userText) !== null) {
+    if (isReviewReply(digest)) {
       await endReview(state, event, digest);
       return;
     }
@@ -262,6 +284,10 @@ function registerTurnHooks(server: PluginServerContext, state: PluginState): voi
       state.log.warn(`turn capture failed: ${String(error)}`),
     );
   });
+}
+
+function isReviewReply(digest: TurnDigest): boolean {
+  return digest.userText !== null && reviewPromptDisplay(digest.userText) !== null;
 }
 
 async function recordNativeTurn(state: PluginState, event: TurnEnded): Promise<string | null> {
@@ -337,9 +363,17 @@ async function runReview(state: PluginState, agentId: string, trigger: ReviewTri
     await supervisor.call("review-skip", { agentId, trigger, reason }, RPC_TIMEOUT_MS).catch(() => undefined);
   };
   try {
+    if (state.bridge.managed(agentId)) {
+      state.reviews.forget(agentId);
+      return;
+    }
     const handle = state.paseo?.agents.ref(agentId);
     if (!handle) return await skip("The Paseo API is not ready.");
     await handle.refresh();
+    if (state.bridge.managed(agentId)) {
+      state.reviews.forget(agentId);
+      return;
+    }
     const busy = busyReason(handle.current());
     if (busy) return await skip(busy);
     const started = await supervisor.call("review-start", { agentId, trigger }, RPC_TIMEOUT_MS);
@@ -356,6 +390,15 @@ async function sendReview(
   cap: number,
 ): Promise<void> {
   try {
+    if (state.bridge.managed(handle.id)) {
+      state.reviews.forget(handle.id);
+      await state.supervisor.call(
+        "review-end",
+        { agentId: handle.id, reply: null, outcome: "cancelled", turnId: null },
+        RPC_TIMEOUT_MS,
+      );
+      return;
+    }
     state.reviews.reviewStarted(handle.id);
     await handle.send(reviewPrompt({ cap, display: state.settings.reviewDisplay }));
     state.log.info(`memory review sent to agent ${handle.id}`);
@@ -397,6 +440,7 @@ async function linkAgent(
 }
 
 async function linkByMatch(state: PluginState, agent: HookAgent): Promise<void> {
+  if (state.bridge.managed(agent.id)) return;
   const nonce = state.links.match(agent.id, agent.cwd, agent.provider);
   if (nonce) await linkAgent(state, nonce, agent, "cwd match");
 }
@@ -407,11 +451,13 @@ async function captureTurn(
   ctx: { paseo: PaseoApi; state: PluginState },
 ): Promise<void> {
   if (!isUsableReply(digest.assistantText)) return;
+  if (ctx.state.bridge.managed(event.agent.id)) return;
   const { agent } = event;
   const { project } = await ctx.state.projects.resolve(ctx.paseo, {
     cwd: agent.cwd,
     workspaceId: agent.workspaceId,
   });
+  if (ctx.state.bridge.managed(agent.id)) return;
   const turn = {
     agentId: agent.id,
     project,
@@ -580,7 +626,8 @@ function registerRpcs(server: PluginServerContext, state: PluginState): void {
   server.handle(invalidateSourceRpc, (input) => call("source-invalidate", input, RPC_TIMEOUT_MS));
   server.handle(forgetSourceRpc, (input) => call("source-forget", input, RPC_TIMEOUT_MS));
   server.handle(saveMemoryRpc, async (input, { paseo }) => {
-    const project = await projectForSave(paseo, input.paseoProjectId, state);
+    const project =
+      input.scope === "project" ? await projectForSave(paseo, input.paseoProjectId, state) : null;
     return call("save", { ...input, project }, RPC_TIMEOUT_MS);
   });
   server.handle(updateMemoryRpc, async (input, { paseo }) => {

@@ -1,6 +1,21 @@
 import type { Database } from "bun:sqlite";
-import type { Evidence, LifecycleDetail, MemoryRef } from "../shared/lifecycle";
+import { z } from "zod";
+import {
+  type Evidence,
+  type LifecycleDetail,
+  type MemoryRef,
+  RecordKindSchema,
+  RecordStateSchema,
+  VerificationSchema,
+} from "../shared/lifecycle";
 import { type Logger, silentLogger } from "../shared/log";
+import {
+  type MemoryNamespace,
+  MemoryScopeSchema,
+  namespaceColumns,
+  namespaceOf,
+  type Scope,
+} from "../shared/namespaces";
 import type { ResourceStatus } from "../shared/resources";
 import { RETRIEVAL_ABSOLUTE_LIMITS, type RecordKind, type RerankMode } from "../shared/retrieval";
 import {
@@ -12,16 +27,11 @@ import {
   type SearchScope,
   type ServiceParsedInput,
 } from "../shared/service-api";
-import {
-  Access,
-  type MergeRequest,
-  type MergeResult,
-  type MutationOutcome,
-  type Namespace,
-  type Scope,
-  type SqlFilter,
-} from "./access";
+import { Access, type MergeRequest, type MergeResult, type MutationOutcome, type SqlFilter } from "./access";
 import { AuditLog } from "./audit";
+import { type BridgeOptions, MemoryBridge } from "./bridge";
+import { eraseBridgeCopies } from "./bridge-privacy";
+import { isManagedBridgeAgent } from "./bridge-sessions";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { MemoryFeedback, retractFeedbackEvidence } from "./feedback";
 import { type IndexHealth, IndexRetry, type IndexRetryOptions } from "./index-retry";
@@ -69,7 +79,7 @@ import {
   vecTables,
 } from "./vectors";
 
-export type { IndexHealth, ProjectRef, Scope, SearchScope, SessionRow };
+export type { IndexHealth, ProjectRef, SearchScope, SessionRow };
 export { clip, ftsQuery, scopeKey };
 
 const PINNED_BOOST = 0.1;
@@ -100,6 +110,7 @@ export interface MemoryRow {
   id: number;
   scope: Scope;
   project_key: string | null;
+  bot_id: string | null;
   type: string;
   title: string;
   content: string;
@@ -138,6 +149,29 @@ export interface MemoryRow {
   verified_at: string | null;
 }
 
+const HistoricalRowSchema = z.object({
+  id: z.number().int().positive(),
+  record_revision: z.number().int().positive(),
+  scope: MemoryScopeSchema,
+  project_key: z.string().nullable(),
+  bot_id: z.string().nullable().default(null),
+  title: z.string(),
+  content: z.string(),
+  type: z.string(),
+  topic_key: z.string().nullable(),
+  pinned: z.number().int(),
+  record_kind: RecordKindSchema,
+  state: RecordStateSchema,
+  verification_status: VerificationSchema,
+  verified_at: z.string().nullable(),
+  valid_from: z.string().nullable(),
+  valid_until: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  deleted_at: z.string().nullable(),
+});
+export type HistoricalMemoryRow = z.infer<typeof HistoricalRowSchema>;
+
 export type MemoryWithProject = MemoryRow & { project_name: string | null };
 
 export interface SaveInput {
@@ -146,6 +180,7 @@ export interface SaveInput {
   type: string;
   scope: Scope;
   project: ProjectRef | null;
+  botId?: string | null;
   topicKey?: string | null;
   pinned?: boolean;
   force?: boolean;
@@ -173,6 +208,7 @@ export interface MemoryHit {
   scope: Scope;
   projectKey: string | null;
   projectName: string | null;
+  botId: string | null;
   preview: string;
   pinned: boolean;
   updatedAt: string;
@@ -231,6 +267,7 @@ export interface MemoryPatch {
   topicKey?: string | null;
   scope?: Scope;
   project?: ProjectRef | null;
+  botId?: string | null;
 }
 
 interface Candidate {
@@ -278,6 +315,7 @@ interface SaveDraft {
   content: string;
   scope: Scope;
   projectKey: string | null;
+  botId: string | null;
   hash: string;
   topicKey: string | null;
   vector: Float32Array | null;
@@ -285,9 +323,9 @@ interface SaveDraft {
 
 type IndexRow = Pick<
   MemoryRow,
-  "id" | "title" | "content" | "scope" | "project_key" | "content_hash" | "index_generation"
+  "id" | "title" | "content" | "scope" | "project_key" | "bot_id" | "content_hash" | "index_generation"
 >;
-type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "merged_into" | "archived_at">;
+type RemovedRow = Pick<MemoryRow, "scope" | "project_key" | "bot_id" | "merged_into" | "archived_at">;
 interface MergeRevisions {
   sourceRevision: number;
   targetRevision: number;
@@ -325,6 +363,7 @@ export class MemoryStore {
   private readonly db: Database;
   private readonly now: () => Date;
   private readonly log: Logger;
+  private bridgeRuntime: MemoryBridge | null = null;
   private embedder: Embedder | null = null;
   private vectors: VectorIndex | null = null;
   private reranker: Reranker | null = null;
@@ -380,10 +419,13 @@ export class MemoryStore {
       provenance: this.provenance,
       lifecycle: this.lifecycle,
       reviews: this.reviews,
-      cancelReviews: (agentIds) => this.cancelReviewWindows(agentIds),
+      cancelReviews: (agentIds) => this.cancelStandaloneReviews(agentIds),
       now: () => this.ts(),
       changed: (operation) => {
-        if (operation === "forget") this.clearQueryCache();
+        if (operation === "forget") {
+          this.clearQueryCache();
+          this.bridgeRuntime?.invalidatePending();
+        }
         this.advanceRetrieval();
         this.scheduleIndex();
       },
@@ -391,8 +433,15 @@ export class MemoryStore {
     this.lifecycle.resume();
   }
 
+  startBridge(options: Omit<BridgeOptions, "db" | "store" | "now">): MemoryBridge {
+    if (this.bridgeRuntime) throw new Error("Memory Bridge is already initialized.");
+    this.bridgeRuntime = new MemoryBridge({ ...options, db: this.db, store: this, now: this.now });
+    return this.bridgeRuntime;
+  }
+
   close(): void {
     this.closed = true;
+    this.bridgeRuntime?.close();
     this.inference.close();
     this.clearQueryCache();
     this.candidateIds.clear();
@@ -468,6 +517,8 @@ export class MemoryStore {
   openReviewWindow(input: Parameters<ReviewLedger["open"]>[0]): void {
     this.db
       .transaction(() => {
+        if (isManagedBridgeAgent(this.db, input.agentId))
+          throw new MutationError("scope_denied", "Standalone review is disabled for this managed agent.");
         if (this.sessionInvalidated(input.agentId))
           throw new MutationError("context_invalidated", "The review context was invalidated.");
         const windowId = this.reviews.open(input);
@@ -508,7 +559,7 @@ export class MemoryStore {
       .immediate();
   }
 
-  private cancelReviewWindows(agentIds: string[]): void {
+  cancelStandaloneReviews(agentIds: string[]): void {
     for (const agentId of agentIds) {
       const windows = this.db
         .query<{ window_id: string }, [string]>(
@@ -638,8 +689,11 @@ export class MemoryStore {
 
   configure(config: RuntimeConfig): void {
     const previous = this.retrievalPolicies.revision;
+    const previousBridge = canonicalBody(this.config.bridge);
     this.retrievalPolicies.configure(config);
     this.config = this.retrievalPolicies.runtime;
+    if (previousBridge !== canonicalBody(this.config.bridge))
+      this.bridgeRuntime?.configure(this.config.bridge);
     if (previous !== this.retrievalPolicies.revision) {
       this.candidateIds.clear();
       this.inference.cancelPending("policy_changed");
@@ -692,14 +746,19 @@ export class MemoryStore {
     const title = redact(input.title).trim().slice(0, 200);
     const content = redact(input.content).trim();
     if (!title || !content) throw new Error("title and content are required");
+    const scope = input.scope;
+    const projectKey = scope === "project" ? (input.project?.key ?? null) : null;
+    const botId = input.botId ?? null;
+    if (!namespaceOf({ scope, project_key: projectKey, bot_id: botId }))
+      throw new Error("Saving a memory requires a canonical resolved namespace.");
     const vector = await this.embedOne(`${title}\n${content}`, "document");
-    const scope: Scope = input.scope === "project" && input.project ? "project" : "global";
     const draft: SaveDraft = {
       input,
       title,
       content,
       scope,
-      projectKey: scope === "project" ? (input.project?.key ?? null) : null,
+      projectKey,
+      botId,
       hash: sha256(`${input.type}\n${title}\n${content}`),
       topicKey: input.topicKey?.trim() || null,
       vector,
@@ -740,14 +799,13 @@ export class MemoryStore {
   readCandidate(access: Access, actorId: string, id: number): CandidateRead | null {
     const metadata = this.db
       .query<
-        Pick<MemoryRow, "id" | "scope" | "project_key" | "record_revision">,
+        Pick<MemoryRow, "id" | "scope" | "project_key" | "bot_id" | "record_revision">,
         [number, string]
-      >(`SELECT m.id,m.scope,m.project_key,m.record_revision
+      >(`SELECT m.id,m.scope,m.project_key,m.bot_id,m.record_revision
       FROM memories m JOIN memory_revisions r ON r.memory_id=m.id AND r.revision=1
       WHERE m.id=? AND m.state='candidate' AND m.deleted_at IS NULL AND r.actor_id=?`)
       .get(id, actorId);
-    if (!metadata || !access.allows("read", { scope: metadata.scope, projectKey: metadata.project_key }))
-      return null;
+    if (!metadata || !access.allows("read", namespaceOf(metadata))) return null;
     const memory = this.rowsById([id])[0];
     if (
       memory?.state !== "candidate" ||
@@ -848,7 +906,13 @@ export class MemoryStore {
         if (!existing) return "not_found";
         if (!access.allows("write", namespaceOf(existing))) return "denied";
         const next = patched(existing, patch);
-        if (!access.allows("write", { scope: next.scope, projectKey: next.projectKey })) return "denied";
+        if (
+          !access.allows(
+            "write",
+            namespaceOf({ scope: next.scope, project_key: next.projectKey, bot_id: next.botId }),
+          )
+        )
+          return "denied";
         return this.applyUpdate(existing, patch) ? "ok" : "unchanged";
       },
       (outcome) => ({
@@ -877,7 +941,7 @@ export class MemoryStore {
     this.db
       .query(
         `UPDATE memories SET title = ?, content = ?, type = ?, pinned = ?, topic_key = ?, content_hash = ?,
-         scope = ?, project_key = ?, revision_count = revision_count + ?, record_revision = record_revision + 1,
+         scope = ?, project_key = ?, bot_id = ?, revision_count = revision_count + ?, record_revision = record_revision + 1,
          index_generation = index_generation + ?, updated_at = ? WHERE id = ?`,
       )
       .run(
@@ -889,6 +953,7 @@ export class MemoryStore {
         next.hash,
         next.scope,
         next.projectKey,
+        next.botId,
         textChanged ? 1 : 0,
         reindex ? 1 : 0,
         this.ts(),
@@ -1364,6 +1429,7 @@ export class MemoryStore {
   }
 
   recordTurn(input: TurnInput): boolean {
+    if (isManagedBridgeAgent(this.db, input.agentId)) return false;
     if (this.sessionInvalidated(input.agentId)) return false;
     if (input.project) this.upsertProject(input.project);
     this.audit.retitle(input.agentId, input.title);
@@ -1479,9 +1545,9 @@ export class MemoryStore {
     if (!draft.topicKey) return null;
     const existing = this.db
       .query<MemoryRow, [string, string, string]>(
-        `SELECT * FROM memories WHERE scope = ? AND ifnull(project_key, '') = ? AND topic_key = ? AND deleted_at IS NULL`,
+        `SELECT * FROM memories WHERE scope = ? AND coalesce(project_key,bot_id,'') = ? AND topic_key = ? AND deleted_at IS NULL`,
       )
-      .get(draft.scope, draft.projectKey ?? "", draft.topicKey);
+      .get(draft.scope, draft.projectKey ?? draft.botId ?? "", draft.topicKey);
     if (!existing) return null;
     // Saving the same text to a topic again is a duplicate, not a revision.
     if (existing.content_hash === draft.hash && (!draft.input.pinned || existing.pinned === 1)) return null;
@@ -1514,9 +1580,9 @@ export class MemoryStore {
   private countExactDuplicate(draft: SaveDraft): SaveResult | null {
     const same = this.db
       .query<{ id: number }, [string, string, string]>(
-        `SELECT id FROM memories WHERE content_hash = ? AND scope = ? AND ifnull(project_key, '') = ? AND deleted_at IS NULL`,
+        `SELECT id FROM memories WHERE content_hash = ? AND scope = ? AND coalesce(project_key,bot_id,'') = ? AND deleted_at IS NULL`,
       )
-      .get(draft.hash, draft.scope, draft.projectKey ?? "");
+      .get(draft.hash, draft.scope, draft.projectKey ?? draft.botId ?? "");
     if (!same) return null;
     this.db
       .query(`UPDATE memories SET duplicate_count = duplicate_count + 1, last_seen_at = ? WHERE id = ?`)
@@ -1526,7 +1592,7 @@ export class MemoryStore {
 
   private nearDuplicates(draft: SaveDraft): SaveResult | null {
     if (!draft.vector || !this.vectors || draft.input.force || draft.topicKey) return null;
-    const candidates = this.closeMatches(draft.vector, scopeKey(draft.scope, draft.projectKey));
+    const candidates = this.closeMatches(draft.vector, scopeKey(draft.scope, draft.projectKey, draft.botId));
     const same = candidates.find((c) => c.type === draft.input.type);
     if (same)
       return { status: "near_duplicate", id: same.id, title: same.title, similarity: same.similarity };
@@ -1565,7 +1631,7 @@ export class MemoryStore {
   }
 
   private similarTo(row: MemoryRow, access: Access): MemoryDetail["duplicates"] {
-    const partition = scopeKey(row.scope, row.project_key);
+    const partition = scopeKey(row.scope, row.project_key, row.bot_id);
     const vector = this.vectors?.vector(row.id, row.content_hash, row.index_generation);
     if (!vector) return [];
     return this.closeMatches(vector, partition, { excludeId: row.id, access }).map(
@@ -1591,7 +1657,7 @@ export class MemoryStore {
     if (!vector || !this.vectors) return [];
     const threshold = this.vectors.spec.duplicateThreshold;
     return this.vectors
-      .knn(vector, scopeKey(row.scope, row.project_key), 6)
+      .knn(vector, scopeKey(row.scope, row.project_key, row.bot_id), 6)
       .filter((n) => n.id !== row.id && n.similarity >= threshold);
   }
 
@@ -1620,13 +1686,14 @@ export class MemoryStore {
     const ts = this.ts();
     const result = this.db
       .query(
-        `INSERT INTO memories (scope, project_key, type, title, content, topic_key, content_hash, pinned,
+        `INSERT INTO memories (scope, project_key, bot_id, type, title, content, topic_key, content_hash, pinned,
           source, agent_id, provider, workspace_dir, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         draft.scope,
         draft.projectKey,
+        draft.botId,
         input.type,
         draft.title,
         draft.content,
@@ -1647,7 +1714,12 @@ export class MemoryStore {
   }
 
   private target(id: number, draft: SaveDraft, generation: number): VectorTarget {
-    return { id, partition: scopeKey(draft.scope, draft.projectKey), hash: draft.hash, generation };
+    return {
+      id,
+      partition: scopeKey(draft.scope, draft.projectKey, draft.botId),
+      hash: draft.hash,
+      generation,
+    };
   }
 
   private storeVector(target: VectorTarget, vector: Float32Array | null): void {
@@ -1866,7 +1938,7 @@ export class MemoryStore {
         if (signal.aborted || this.closed || this.embedder !== embedder)
           throw new InferenceQueueError("inference_cancelled");
         const current = this.db.query<IndexRow & { deleted_at: string | null }, [number]>(
-          `SELECT id,title,content,scope,project_key,content_hash,index_generation,deleted_at
+          `SELECT id,title,content,scope,project_key,bot_id,content_hash,index_generation,deleted_at
            FROM memories m WHERE id=? AND ${currentLifecycleSql()}`,
         );
         const texts = rows.map((row) => {
@@ -1889,7 +1961,7 @@ export class MemoryStore {
   private pendingBatch(vectors: VectorIndex, afterId: number): IndexRow[] {
     return this.db
       .query<IndexRow, [string, number, number]>(
-        `SELECT m.id, m.title, m.content, m.scope, m.project_key, m.content_hash, m.index_generation FROM memories m
+        `SELECT m.id, m.title, m.content, m.scope, m.project_key, m.bot_id, m.content_hash, m.index_generation FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.index_fingerprint = ?
          WHERE m.deleted_at IS NULL AND ${currentLifecycleSql()} AND m.id > ? AND ${STALE_VECTOR_SQL}
          ORDER BY m.id LIMIT ?`,
@@ -1901,7 +1973,7 @@ export class MemoryStore {
   // from; otherwise the row is still pending and the next pass embeds its current state.
   private writeBatch(vectors: VectorIndex, rows: IndexRow[], results: Float32Array[]): number {
     const current = this.db.query<IndexRow & { deleted_at: string | null }, [number]>(
-      `SELECT id, title, content, scope, project_key, content_hash, index_generation, deleted_at
+      `SELECT id, title, content, scope, project_key, bot_id, content_hash, index_generation, deleted_at
        FROM memories m WHERE id = ? AND ${currentLifecycleSql()}`,
     );
     const outcomes = this.db.transaction(() =>
@@ -1923,7 +1995,7 @@ export class MemoryStore {
       return "missing";
     }
     if (!now || !sameIndexState(now, row)) return "stale";
-    const partition = scopeKey(now.scope, now.project_key);
+    const partition = scopeKey(now.scope, now.project_key, now.bot_id);
     vectors.write(
       { id: row.id, partition, hash: now.content_hash, generation: now.index_generation },
       vector,
@@ -1945,7 +2017,7 @@ export class MemoryStore {
   private removed(id: number): RemovedRow | null {
     return this.db
       .query<RemovedRow, [number]>(
-        `SELECT scope, project_key, merged_into, archived_at FROM memories WHERE id = ?`,
+        `SELECT scope, project_key, bot_id, merged_into, archived_at FROM memories WHERE id = ?`,
       )
       .get(id);
   }
@@ -1975,16 +2047,14 @@ export class MemoryStore {
       >("SELECT * FROM memory_revisions WHERE memory_id=? ORDER BY revision DESC LIMIT 100")
       .all(id)
       .flatMap((revision) => {
-        const snapshot = JSON.parse(revision.snapshot) as Record<string, unknown>;
-        if (!snapshot.scope && access.kind !== "owner") return [];
-        if (
-          snapshot.scope &&
-          !access.allows("read", {
-            scope: snapshot.scope as Scope,
-            projectKey: snapshot.project_key as string | null,
-          })
-        )
-          return [];
+        const snapshot = z.record(z.string(), z.unknown()).parse(JSON.parse(revision.snapshot));
+        const historical = namespaceOf({
+          scope: snapshot.scope,
+          project_key: snapshot.project_key,
+          bot_id: snapshot.bot_id,
+        });
+        if (!historical && (access.kind !== "owner" || !revision.legacy_metadata_unknown)) return [];
+        if (historical && !access.allows("read", historical)) return [];
         return [
           {
             revision: revision.revision,
@@ -2015,7 +2085,7 @@ export class MemoryStore {
     };
   }
 
-  historical(access: Access, id: number, asOf: string): MemoryRow | null {
+  historical(access: Access, id: number, asOf: string): HistoricalMemoryRow | null {
     const current = this.db.query<MemoryRow, [number]>("SELECT * FROM memories WHERE id=?").get(id);
     if (!current || !access.allows("read", namespaceOf(current))) return null;
     const revision = this.db
@@ -2024,8 +2094,9 @@ export class MemoryStore {
       )
       .get(id, asOf);
     if (!revision) return null;
-    const row = JSON.parse(revision.snapshot) as MemoryRow;
-    if (!row.scope) return null;
+    const parsed = HistoricalRowSchema.safeParse(JSON.parse(revision.snapshot));
+    if (!parsed.success || parsed.data.id !== id) return null;
+    const row = parsed.data;
     if (
       !access.allows("read", namespaceOf(row)) ||
       row.state !== "active" ||
@@ -2039,18 +2110,14 @@ export class MemoryStore {
     return row;
   }
 
-  authorizedTopic(
-    access: Access,
-    scope: Scope,
-    projectKey: string | null,
-    topicKey: string,
-  ): MemoryRow | null {
-    if (!access.allows("write", { scope, projectKey })) return null;
+  authorizedTopic(access: Access, namespace: MemoryNamespace, topicKey: string): MemoryRow | null {
+    if (!access.allows("write", namespace)) return null;
+    const columns = namespaceColumns(namespace);
     return this.db
       .query<MemoryRow, [string, string, string]>(
-        "SELECT * FROM memories WHERE scope=? AND ifnull(project_key,'')=? AND topic_key=? AND deleted_at IS NULL",
+        "SELECT * FROM memories WHERE scope=? AND coalesce(project_key,bot_id,'')=? AND topic_key=? AND deleted_at IS NULL",
       )
-      .get(scope, projectKey ?? "", topicKey);
+      .get(namespace.kind, columns.project_key ?? columns.bot_id ?? "", topicKey);
   }
 
   invalidateSource(access: Access, sourceRef: string): { affected: number } {
@@ -2103,7 +2170,7 @@ export class MemoryStore {
             "request_conflict",
             "This source-forget request ID was already used for another source.",
           );
-        return JSON.parse(prior.result) as { forgotten: number };
+        return z.strictObject({ forgotten: z.number().int().min(0) }).parse(JSON.parse(prior.result));
       }
       const rows = this.db
         .query<{ id: number; record_revision: number }, [string]>(`SELECT DISTINCT m.id,m.record_revision
@@ -2140,11 +2207,15 @@ export class MemoryStore {
         )
         .run(sourceRef);
       this.db.query("DELETE FROM memory_evidence WHERE source_ref=?").run(sourceRef);
+      eraseBridgeCopies(this.db, this.ts(), (agents) =>
+        this.mutations.invalidateContexts(ownerMutation(access), agents),
+      );
       this.db
         .query(`INSERT INTO memory_mutations
         (principal_id,request_id,request_body_hash,operation,memory_id,resulting_revision,result,created_at,actor_id,reason)
         VALUES ('owner',?,?,'source_forget',0,0,?,?,'owner','Owner source forget')`)
         .run(key, hash, JSON.stringify({ forgotten }), this.ts());
+      this.bridgeRuntime?.invalidatePending();
       this.clearQueryCache();
       this.advanceRetrieval();
       return { forgotten };
@@ -2227,7 +2298,8 @@ function sameIndexState(now: IndexRow & { deleted_at: string | null }, batch: In
     now.index_generation === batch.index_generation &&
     now.content_hash === batch.content_hash &&
     now.scope === batch.scope &&
-    now.project_key === batch.project_key
+    now.project_key === batch.project_key &&
+    now.bot_id === batch.bot_id
   );
 }
 
@@ -2237,13 +2309,10 @@ function classifyChange(existing: MemoryRow, next: ReturnType<typeof patched>) {
   const reindex =
     next.hash !== existing.content_hash ||
     next.scope !== existing.scope ||
-    next.projectKey !== existing.project_key;
+    next.projectKey !== existing.project_key ||
+    next.botId !== existing.bot_id;
   const changed = reindex || next.pinned !== existing.pinned || next.topicKey !== existing.topic_key;
   return { textChanged, reindex, changed };
-}
-
-function namespaceOf(row: { scope: Scope; project_key: string | null }): Namespace {
-  return { scope: row.scope, projectKey: row.project_key };
 }
 
 function patched(existing: MemoryRow, patch: MemoryPatch) {
@@ -2265,14 +2334,18 @@ function patched(existing: MemoryRow, patch: MemoryPatch) {
 function patchedScope(
   existing: MemoryRow,
   patch: MemoryPatch,
-): { scope: Scope; projectKey: string | null; project: ProjectRef | null } {
-  if (patch.scope === undefined)
-    return { scope: existing.scope, projectKey: existing.project_key, project: null };
-  if (patch.scope === "global") return { scope: "global", projectKey: null, project: null };
-  const project = patch.project ?? null;
-  const projectKey = project?.key ?? (existing.scope === "project" ? existing.project_key : null);
-  if (!projectKey) throw new Error("Moving a memory to project scope needs a project.");
-  return { scope: "project", projectKey, project };
+): { scope: Scope; projectKey: string | null; botId: string | null; project: ProjectRef | null } {
+  const scope = patch.scope ?? existing.scope;
+  const project = scope === "project" ? (patch.project ?? null) : null;
+  const projectKey = scope === "project" ? projectKeyForPatch(existing, project) : null;
+  const botId = scope === "bot" ? (patch.botId ?? (existing.scope === "bot" ? existing.bot_id : null)) : null;
+  if (!namespaceOf({ scope, project_key: projectKey, bot_id: botId }))
+    throw new Error("Moving a memory requires a canonical resolved namespace.");
+  return { scope, projectKey, botId, project };
+}
+
+function projectKeyForPatch(existing: MemoryRow, project: ProjectRef | null): string | null {
+  return project?.key ?? (existing.scope === "project" ? existing.project_key : null);
 }
 
 function addRanks(ranks: Map<number, number>, ids: number[]): void {
@@ -2289,8 +2362,7 @@ function boost(row: MemoryRow, nowMs: number, usageRanking: boolean): number {
   );
   const usageShare = Math.log2(1 + assessedActivity) / Math.log2(1 + FULL_USAGE_BOOST_USES);
   const usage = usageRanking ? MAX_USAGE_BOOST * Math.min(1, usageShare) : 0;
-  const base =
-    1 + PINNED_BOOST * row.pinned + recency + (row.scope === "project" ? PROJECT_BOOST : 0) + usage;
+  const base = 1 + PINNED_BOOST * row.pinned + recency + (row.scope !== "global" ? PROJECT_BOOST : 0) + usage;
   return usageRanking ? base * usageFactor({ shown: row.shown_count, opened: row.opened_count }) : base;
 }
 
@@ -2307,6 +2379,7 @@ function memoryHit(
     scope: row.scope,
     projectKey: row.project_key,
     projectName: row.project_name,
+    botId: row.bot_id,
     preview: clip(row.content, 240),
     pinned: row.pinned === 1,
     updatedAt: row.updated_at,
@@ -2329,6 +2402,7 @@ function memoryDetail(row: MemoryWithProject): NonNullable<MemoryDetail["memory"
     type: row.type,
     scope: row.scope,
     projectName: row.project_name,
+    botId: row.bot_id,
     topicKey: row.topic_key,
     pinned: row.pinned === 1,
     source: row.source,

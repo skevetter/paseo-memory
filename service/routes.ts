@@ -11,6 +11,7 @@ import type {
 } from "../shared/service-api";
 import { Access } from "./access";
 import { retrievalAudit, retrievalScore } from "./audit";
+import type { MemoryBridge } from "./bridge";
 import { retrieveContext } from "./context";
 import type { ContextTokenizer } from "./context-budget";
 import { signCaller } from "./mcp";
@@ -31,6 +32,7 @@ export interface RouteContext {
   mcpUrl(): string;
   status(): ServiceStatus;
   tokenizers?: ReadonlyMap<string, ContextTokenizer>;
+  bridge: MemoryBridge;
 }
 
 export type Routes = {
@@ -49,6 +51,7 @@ export function createRoutes(ctx: RouteContext): Routes {
     "usage-record": (input) => store.usage.record("paseo_host", input),
     "context-admit": (input) => store.admitContext(input),
     "context-settle": (input) => store.usage.settleContext(input),
+    ...bridgeRoutes(ctx),
     feedback: (input) => store.feedback.record(ownerMutation(OWNER), input),
     ...lifecycleRoutes(store),
     configure: (input) => {
@@ -133,6 +136,26 @@ export function createRoutes(ctx: RouteContext): Routes {
   };
 }
 
+type BridgeRoutes =
+  | "bridge-create"
+  | "bridge-open"
+  | "bridge-managed"
+  | "bridge-status"
+  | "bridge-rotate"
+  | "bridge-import-preview"
+  | "bridge-import";
+function bridgeRoutes(ctx: RouteContext): Pick<Routes, BridgeRoutes> {
+  return {
+    "bridge-create": (input) => ctx.bridge.prepareCreate(input),
+    "bridge-open": (input) => ctx.bridge.open(input),
+    "bridge-managed": (input) => ({ agentIds: ctx.bridge.managed(input.agentIds) }),
+    "bridge-status": () => ctx.bridge.sessions.ownerStatus(),
+    "bridge-rotate": (input) => ctx.bridge.rotate(input),
+    "bridge-import-preview": (input) => ctx.bridge.imports.preview(input),
+    "bridge-import": (input) => ctx.bridge.imports.import(input),
+  };
+}
+
 type LifecycleRoutes =
   | "mutate"
   | "lifecycle-detail"
@@ -173,6 +196,8 @@ function reviewRoutes(ctx: RouteContext): Pick<Routes, "review-start" | "review-
   return {
     "review-start": (input) => {
       const cap = store.config.reviewMaxMemories;
+      if (ctx.bridge.managed([input.agentId]).length)
+        return { ok: false, reason: "Standalone review is delegated to the registered controller.", cap };
       if (store.sessionInvalidated(input.agentId))
         return {
           ok: false,
@@ -323,6 +348,7 @@ function saveFromUi(store: MemoryStore, input: ServiceParsedInput<"save">): Serv
       type: input.type,
       scope: input.scope,
       project,
+      botId: input.botId,
       pinned: input.pinned,
     },
   });
@@ -342,6 +368,7 @@ function updateFromUi(store: MemoryStore, input: ServiceParsedInput<"update">): 
       type: input.type,
       pinned: input.pinned,
       scope: input.scope,
+      botId: input.botId,
       ...(input.scope === "project" ? { project: known ?? input.project ?? null } : {}),
     },
   });
@@ -353,7 +380,7 @@ async function attachments(store: MemoryStore, query: string): Promise<ServiceOu
   const items = hits
     .filter((h) => h.kind === "memory")
     .map((h) => {
-      const where = h.projectName ?? "global";
+      const where = h.scope === "bot" ? `bot ${h.botId}` : (h.projectName ?? "global");
       const content = store.getVisible(OWNER, [Number(h.id)])[0]?.content ?? h.preview;
       return {
         id: h.id,
@@ -376,6 +403,7 @@ function toItem(h: SearchHit): MemoryItem {
     type: h.type,
     scope: h.scope,
     projectName: h.projectName,
+    botId: h.kind === "memory" ? h.botId : null,
     preview: h.preview,
     pinned: h.pinned,
     updatedAt: h.updatedAt,

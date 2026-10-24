@@ -137,8 +137,11 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
   const [type, setType] = useState<MemoryType | null>(MEMORY_TYPES.find((t) => t === memory.type) ?? null);
   const [pinned, setPinned] = useState(memory.pinned);
   const [scope, setScope] = useState<Scope>(memory.scope);
+  const [botId, setBotId] = useState(memory.botId ?? "");
   const remove = useRpc(deleteMemoryRpc);
   const refresh = useRefresh();
+  const bot = botId.trim();
+  const namespaceChanged = namespaceEdited(memory, scope, bot);
   const submit = () =>
     save.mutate({
       id: memory.id,
@@ -147,7 +150,7 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
       content: content.trim(),
       type: type ?? undefined,
       pinned,
-      ...(scope === memory.scope ? {} : { scope, paseoProjectId: scope === "project" ? projectId : null }),
+      ...(namespaceChanged ? namespacePayload(scope, projectId, bot) : {}),
     });
   const del = useMutation({
     mutationFn: () => remove({ id: memory.id, expectedRevision: memory.recordRevision }),
@@ -156,7 +159,7 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
       onBack();
     },
   });
-  const invalid = !title.trim() || !content.trim();
+  const invalid = editorInvalid(title, content, scope, bot);
   return (
     <View style={s.card}>
       <TextInput
@@ -181,6 +184,8 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
         pinned={pinned}
         onPinned={setPinned}
         projectId={projectId}
+        botId={botId}
+        onBotId={setBotId}
         s={s}
       />
       <View style={s.row}>
@@ -199,6 +204,20 @@ function MemoryEditor({ memory, props }: { memory: Memory; props: BodyProps }) {
       {del.error ? <Text style={s.danger}>{String(del.error)}</Text> : null}
     </View>
   );
+}
+
+function namespaceEdited(memory: Memory, scope: Scope, bot: string): boolean {
+  return scope !== memory.scope || (scope === "bot" && bot !== memory.botId);
+}
+
+function editorInvalid(title: string, content: string, scope: Scope, bot: string): boolean {
+  return !title.trim() || !content.trim() || (scope === "bot" && bot.length === 0);
+}
+
+function namespacePayload(scope: Scope, projectId: string | null, botId: string) {
+  if (scope === "project") return { scope, paseoProjectId: projectId, botId: null };
+  if (scope === "bot") return { scope, paseoProjectId: null, botId };
+  return { scope, paseoProjectId: null, botId: null };
 }
 
 interface TypeChipsProps {
@@ -230,40 +249,70 @@ interface ScopeChipsProps {
   pinned: boolean;
   onPinned: (pinned: boolean) => void;
   projectId: string | null;
+  botId: string;
+  onBotId: (botId: string) => void;
   s: Styles;
 }
 
-function ScopeChips({ scope, onScope, pinned, onPinned, projectId, s }: ScopeChipsProps) {
+function ScopeChips({ scope, onScope, pinned, onPinned, projectId, botId, onBotId, s }: ScopeChipsProps) {
   return (
-    <View style={s.row}>
-      <Chip
-        label="Project"
-        active={scope === "project"}
-        disabled={projectId === null}
-        onPress={() => onScope("project")}
-        accessibilityLabel="Move to this project"
-        s={s}
-      />
-      <Chip
-        label="Global"
-        active={scope === "global"}
-        onPress={() => onScope("global")}
-        accessibilityLabel="Make global"
-        s={s}
-      />
-      <Chip
-        label="Pinned"
-        active={pinned}
-        onPress={() => onPinned(!pinned)}
-        accessibilityLabel={pinned ? "Unpin memory" : "Pin memory"}
-        s={s}
-      />
-    </View>
+    <>
+      <View style={s.row}>
+        <Chip
+          label="Project"
+          active={scope === "project"}
+          disabled={projectId === null}
+          onPress={() => onScope("project")}
+          accessibilityLabel="Move to this project"
+          s={s}
+        />
+        <Chip
+          label="Global"
+          active={scope === "global"}
+          onPress={() => onScope("global")}
+          accessibilityLabel="Make global"
+          s={s}
+        />
+        <Chip
+          label="Bot"
+          active={scope === "bot"}
+          onPress={() => onScope("bot")}
+          accessibilityLabel="Move to bot memory"
+          s={s}
+        />
+        <Chip
+          label="Pinned"
+          active={pinned}
+          onPress={() => onPinned(!pinned)}
+          accessibilityLabel={pinned ? "Unpin memory" : "Pin memory"}
+          s={s}
+        />
+      </View>
+      {scope === "bot" ? (
+        <TextInput
+          style={s.input}
+          placeholder="Bot ID"
+          placeholderTextColor={s.placeholder}
+          value={botId}
+          onChangeText={onBotId}
+          maxLength={200}
+          autoCapitalize="none"
+          autoCorrect={false}
+          accessibilityLabel="Bot ID"
+        />
+      ) : null}
+    </>
   );
 }
 
+function memoryWhere(memory: Memory): string {
+  if (memory.scope === "global") return "Global";
+  if (memory.scope === "bot") return memory.botId ? `Bot ${memory.botId}` : "Bot";
+  return `Project ${memory.projectName ?? ""}`.trim();
+}
+
 function memoryFacts(memory: Memory): string[] {
-  const where = memory.scope === "global" ? "Global" : `Project ${memory.projectName ?? ""}`.trim();
+  const where = memoryWhere(memory);
   const origin = [memory.source, memory.agentId, memory.provider].filter(Boolean).join(" · ");
   const lastUsed = memory.lastUsedAt ? `, last on ${formatDateTime(memory.lastUsedAt)}` : "";
   return [

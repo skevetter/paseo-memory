@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { existsSync, statfsSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { getLoadablePath } from "sqlite-vec";
+import { migrateBridgeSchema } from "./bridge-schema";
 import { FatalError } from "./sqlite";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export class SchemaTooNewError extends FatalError {
   constructor(found: number, supported: number) {
@@ -21,18 +22,30 @@ export function migrate(db: Database): void {
   if (current > SCHEMA_VERSION) throw new SchemaTooNewError(current, SCHEMA_VERSION);
   if (current === SCHEMA_VERSION) return;
   backupBeforeMigration(db, current);
-  db.transaction(() => {
-    if (current < 6) migratePreV6(db, current);
-    if (current < 7) migrateLifecycle(db);
-    migrateResources(db, current);
-    if (current < 7) importLegacyRevisions(db);
-    if (db.query(`PRAGMA foreign_key_check`).all().length !== 0) {
+  const foreignKeys = db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()?.foreign_keys ?? 0;
+  // Disable actions before BEGIN: DROP of the replaced parent must not cascade into retained evidence/indexes.
+  db.run("PRAGMA foreign_keys=OFF");
+  try {
+    if (db.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()?.foreign_keys !== 0)
       throw new FatalError(
-        "Memory migration failed foreign-key verification; the migration was rolled back.",
+        "A memory migration requires an outermost transaction; the database was not modified.",
       );
-    }
-    db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  })();
+    db.transaction(() => {
+      if (current < 6) migratePreV6(db, current);
+      if (current < 7) migrateLifecycle(db);
+      if (current < 8) migrateResources(db, current);
+      migrateBridgeSchema(db);
+      createRevisionTriggers(db);
+      if (current < 7) importLegacyRevisions(db);
+      if (db.query(`PRAGMA foreign_key_check`).all().length !== 0)
+        throw new FatalError(
+          "Memory migration failed foreign-key verification; the migration was rolled back.",
+        );
+      db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    }).immediate();
+  } finally {
+    db.run(`PRAGMA foreign_keys=${foreignKeys === 1 ? 1 : 0}`);
+  }
 }
 
 function migratePreV6(db: Database, from: number): void {
