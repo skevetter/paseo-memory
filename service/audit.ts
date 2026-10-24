@@ -1,6 +1,14 @@
 import type { Database } from "bun:sqlite";
-import type { RetrievalResult } from "../shared/retrieval";
-import type { AgentAudit, AuditEvent, AuditKind, TaskSource, WorkspaceAgent } from "../shared/service-api";
+import { z } from "zod";
+import { type RetrievalResult, RetrievalResultSchema } from "../shared/retrieval";
+import type {
+  AgentAudit,
+  AuditEvent,
+  AuditKind,
+  ContextAdmission,
+  TaskSource,
+  WorkspaceAgent,
+} from "../shared/service-api";
 import { redact } from "./redact";
 import { clip } from "./text";
 
@@ -11,6 +19,13 @@ export interface TaskAudit {
   note: string | null;
 }
 
+const ContextAdmissionSnapshotSchema = z.object({
+  policyRevision: RetrievalResultSchema.shape.policyRevision,
+  indexGeneration: RetrievalResultSchema.shape.indexGeneration,
+  sessionVersions: z.array(z.object({ id: z.string().min(1), version: z.string().min(1) })),
+});
+type ContextAdmissionSnapshot = z.infer<typeof ContextAdmissionSnapshotSchema>;
+
 export interface Injection {
   memories: number[];
   sessions: string[];
@@ -18,6 +33,7 @@ export interface Injection {
   budget: number;
   task?: TaskAudit | null;
   retrieval?: RetrievalAudit;
+  admission?: ContextAdmissionSnapshot;
 }
 
 export interface ReviewAudit {
@@ -48,19 +64,44 @@ export type AuditDetail =
   | { kind: "denied"; tool: string; operation: string; ids: number[] }
   | { kind: "invalid"; tool: string; fields: string[] };
 
-export type RetrievalAudit = Pick<
-  RetrievalResult,
-  | "retrievalId"
-  | "memoryRefs"
-  | "evidenceRefs"
-  | "usage"
-  | "truncated"
-  | "omittedCount"
-  | "omittedPins"
-  | "fallbackReason"
-  | "policyRevision"
-  | "indexGeneration"
->;
+const RetrievalAuditSchema = RetrievalResultSchema.omit({
+  contextText: true,
+  sessionIds: true,
+  taskIds: true,
+});
+export type RetrievalAudit = z.infer<typeof RetrievalAuditSchema>;
+
+const IssuedInjectionSchema = z
+  .object({
+    memories: z.array(z.number().int().positive()),
+    sessions: z.array(z.string().min(1)),
+    admission: ContextAdmissionSnapshotSchema,
+    retrieval: RetrievalAuditSchema.optional(),
+  })
+  .superRefine((injection, ctx) => {
+    const versions = new Set(injection.admission.sessionVersions.map((ref) => ref.id));
+    if (
+      versions.size !== injection.admission.sessionVersions.length ||
+      versions.size !== injection.sessions.length ||
+      injection.sessions.some((id) => !versions.has(id))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["admission", "sessionVersions"],
+        message: "The issued snapshot must cover every selected session exactly once.",
+      });
+    const retrieval = injection.retrieval;
+    if (
+      retrieval &&
+      (retrieval.policyRevision !== injection.admission.policyRevision ||
+        retrieval.indexGeneration !== injection.admission.indexGeneration)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["admission"],
+        message: "The admission snapshot must match the issued retrieval generation.",
+      });
+  });
 export function retrievalAudit(result: RetrievalResult): RetrievalAudit {
   const {
     retrievalId,
@@ -127,6 +168,33 @@ export class AuditLog {
         `INSERT OR IGNORE INTO agent_links (nonce, project_key, provider, tools, created_at) VALUES (?, ?, ?, ?, ?)`,
       )
       .run(input.nonce, input.projectKey, input.provider, input.tools ? 1 : 0, this.now());
+  }
+
+  issuedContext(input: ContextAdmission): {
+    projectKey: string | null;
+    injection: z.infer<typeof IssuedInjectionSchema>;
+    selection: Pick<RetrievalAudit, "memoryRefs" | "evidenceRefs">;
+  } | null {
+    const row = this.db
+      .query<{ project_key: string | null; tools: number; detail: string }, [string]>(
+        `SELECT l.project_key,l.tools,e.detail FROM agent_links l
+         JOIN audit_events e ON e.nonce=l.nonce AND e.kind='inject'
+         WHERE l.nonce=? ORDER BY e.id DESC LIMIT 1`,
+      )
+      .get(input.nonce);
+    if (!row) return null;
+    try {
+      const parsed = IssuedInjectionSchema.safeParse(JSON.parse(row.detail));
+      if (!parsed.success) return null;
+      const injection = parsed.data;
+      const retrieval = injection.retrieval;
+      if ((retrieval?.retrievalId ?? null) !== input.retrievalId) return null;
+      if (!retrieval && row.tools !== 1) return null;
+      const selection = retrieval ?? { memoryRefs: [], evidenceRefs: [] };
+      return { projectKey: row.project_key, injection, selection };
+    } catch {
+      return null;
+    }
   }
 
   link(input: { nonce: string; agentId: string; workspaceId: string | null; title: string | null }): void {

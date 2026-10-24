@@ -57,7 +57,11 @@ Erasure revokes affected signed tool contexts before subsequent reads, writes or
 
 Known context exposure includes transitive session copies: if Alice reads a fact and Bob later receives Alice's digest through injection, `memory_context` or session search, both contexts are included in the forget preview and revoked. Their controlled digests are erased; unrelated and denied-read contexts are not included merely because they share a project. Cycles are deduplicated. Preview and erasure fail closed before changes when the caller/agent/session graph exceeds 10,000 nodes; they never report a partial erasure as complete. This requires retained disclosure and identity records; it cannot reconstruct unrecorded or externally copied content.
 
+Native agent creation re-admits an issued fragment before selecting its hook output. Forget before that admission rejects the stale text and tools, preserves the caller's original request and does not register a stale pending link. Admission checks actual issuance, current source authority and selected session versions; it is independent of accounting telemetry.
+
 Forgetting cannot retract already attached prompts, host chat history or provider requests. Affected sessions need fresh authorized context for subsequent managed execution; deleting host history or restarting a session is a separate host action. External source systems and previously exported backups are separate copies. This is logical service erasure, not a forensic-erasure promise for SQLite pages, filesystem snapshots or copies held outside Memory.
+
+Native admission is current at its service read snapshot. Later revocation or expiry can race the admission response, hook return or provider dispatch because the supported SDK has no atomic handoff lease. This boundary does not provide provider-consumption proof or M07 session ownership.
 
 ## Schema v7 and rollback
 

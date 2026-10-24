@@ -67,6 +67,11 @@ type AgentCreateRequest = PluginBeforeRequests["agent.create"];
 type HookAgent = PluginLifecycleEvents["agent.created"]["agent"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
+interface InjectionDelivery {
+  expired: boolean;
+  deadline: number;
+}
+
 async function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
   const expired = Promise.withResolvers<T>();
   const timer = setTimeout(() => expired.resolve(fallback()), ms);
@@ -190,12 +195,18 @@ function registerHooks(server: PluginServerContext, state: PluginState): void {
 
   server.before("agent.create", async ({ request }, { paseo }) => {
     state.paseo = paseo;
+    const delivery: InjectionDelivery = {
+      expired: false,
+      deadline: Date.now() + CREATE_HOOK_BUDGET_MS,
+    };
     try {
-      return await withDeadline(injectMemory(request, paseo, state), CREATE_HOOK_BUDGET_MS, () => {
+      return await withDeadline(injectMemory(request, paseo, state, delivery), CREATE_HOOK_BUDGET_MS, () => {
+        delivery.expired = true;
         state.log.warn("agent.create injection skipped: memory service did not answer in time");
         return request;
       });
     } catch (error) {
+      delivery.expired = true;
       state.log.warn(`agent.create injection skipped: ${String(error)}`);
       return request;
     }
@@ -378,6 +389,7 @@ async function injectMemory(
   request: AgentCreateRequest,
   paseo: PaseoApi,
   state: PluginState,
+  delivery: InjectionDelivery,
 ): Promise<AgentCreateRequest> {
   const started = Date.now();
   const { settings } = state;
@@ -408,8 +420,32 @@ async function injectMemory(
     },
     remaining,
   );
-  if (injected.nonce) state.links.add(injected.nonce, config.cwd, String(config.provider));
-  return withInjection(request, injected);
+  if (!(await admitInjection(state, injected, delivery))) return request;
+  return withInjection(request, injected, state, delivery);
+}
+
+async function admitInjection(
+  state: PluginState,
+  injected: ServiceOutputs["agent-context"],
+  delivery: InjectionDelivery,
+): Promise<boolean> {
+  if (delivery.expired || !injected.nonce) return false;
+  const remaining = delivery.deadline - Date.now();
+  if (remaining <= 0) return false;
+  try {
+    const result = await state.supervisor.call(
+      "context-admit",
+      {
+        retrievalId: injected.context?.retrievalId ?? null,
+        nonce: injected.nonce,
+      },
+      remaining,
+    );
+    return result.admitted === true && !delivery.expired && Date.now() < delivery.deadline;
+  } catch (error) {
+    state.log.warn(`agent-create context admission failed: ${String(error)}`);
+    return false;
+  }
 }
 
 function agentTask(
@@ -429,7 +465,10 @@ function agentTask(
 function withInjection(
   request: AgentCreateRequest,
   injected: ServiceOutputs["agent-context"],
+  state: PluginState,
+  delivery: InjectionDelivery,
 ): AgentCreateRequest {
+  if (delivery.expired || Date.now() >= delivery.deadline) return request;
   const config = request.config;
   const next = { ...config };
   if (injected.mcpServer) {
@@ -441,7 +480,9 @@ function withInjection(
       : injected.context.contextText;
   }
   const env = injected.nonce ? { ...request.env, [NONCE_ENV]: injected.nonce } : request.env;
-  return { ...request, config: next, ...(env ? { env } : {}) };
+  const output = { ...request, config: next, ...(env ? { env } : {}) };
+  if (injected.nonce) state.links.add(injected.nonce, config.cwd, String(config.provider));
+  return output;
 }
 
 async function projectForSave(

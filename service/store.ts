@@ -9,16 +9,10 @@ import {
   type ProjectRef,
   type RuntimeConfig,
   type SearchScope,
+  type ServiceParsedInput,
 } from "../shared/service-api";
-import type {
-  Access,
-  MergeRequest,
-  MergeResult,
-  MutationOutcome,
-  Namespace,
-  Scope,
-  SqlFilter,
-} from "./access";
+import type { MergeRequest, MergeResult, MutationOutcome, Namespace, Scope, SqlFilter } from "./access";
+import { Access } from "./access";
 import { AuditLog } from "./audit";
 import type { Embedder, EmbedKind, TierSpec } from "./embedder";
 import { type IndexHealth, IndexRetry, type IndexRetryOptions } from "./index-retry";
@@ -40,6 +34,7 @@ import {
   type SessionReview,
   type SessionRow,
   searchSessions,
+  sessionVersion,
   storeReview,
   type TurnInput,
 } from "./sessions";
@@ -360,6 +355,53 @@ export class MemoryStore {
   get retrievalGeneration(): number {
     this.refreshExternalWrites();
     return Number(this.getMeta("retrieval_generation") ?? "0");
+  }
+
+  admitContext(input: ServiceParsedInput<"context-admit">): { admitted: true } {
+    const current = this.db
+      .transaction(() => {
+        const issued = this.audit.issuedContext(input);
+        if (!issued || this.lifecycle.contextInvalidated({ nonce: input.nonce }))
+          throw new MutationError("context_invalidated", "The issued context is unavailable or revoked.");
+        const access = Access.agent(issued.projectKey);
+        const memories = new Map(
+          this.getVisible(
+            access,
+            issued.selection.memoryRefs.map((ref) => ref.id),
+          ).map((row) => [row.id, row.record_revision]),
+        );
+        return {
+          issued,
+          memories,
+          evidenceCount: this.provenance.getVisible(access, issued.selection.evidenceRefs).length,
+          sessions: new Map(
+            this.visibleSessions(access, issued.injection.sessions).map((row) => [
+              row.id,
+              sessionVersion(row),
+            ]),
+          ),
+          policyRevision: Number(this.getMeta("retrieval_policy_revision")),
+          indexGeneration: this.retrievalGeneration,
+        };
+      })
+      .immediate();
+    const { injection, selection } = current.issued;
+    const snapshot = injection.admission;
+    if (
+      snapshot.policyRevision !== current.policyRevision ||
+      snapshot.indexGeneration !== current.indexGeneration
+    )
+      throw new MutationError("context_invalidated", "The context policy or source generation changed.");
+    if (selection.memoryRefs.some((ref) => current.memories.get(ref.id) !== ref.revision))
+      throw new MutationError("context_invalidated", "A selected memory is no longer current or authorized.");
+    if (current.evidenceCount !== selection.evidenceRefs.length)
+      throw new MutationError("context_invalidated", "Selected evidence is no longer authorized.");
+    if (snapshot.sessionVersions.some((ref) => current.sessions.get(ref.id) !== ref.version))
+      throw new MutationError(
+        "context_invalidated",
+        "A selected session is no longer current or authorized.",
+      );
+    return { admitted: true };
   }
 
   private readDataVersion(): number {
